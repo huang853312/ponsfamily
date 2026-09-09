@@ -1,0 +1,37 @@
+{
+  "schema_version": 2,
+  "updated_at": "2026-09-09",
+  "systems": [
+    {
+      "name": "PONS",
+      "mature_launchpad": true,
+      "gmgn_confirmed": true,
+      "addresses": {
+        "factory": ["0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e", "0xA5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB"],
+        "launcher": [],
+        "token_deployer": ["0x3711cea4feade896c913c68f01eda97cb06d1a42"],
+        "router": ["0xe33e9e479df8802cb0866d5d05258bec4cf62948"],
+        "hook": ["0xe5e702641ea86f4ae6cc3cdaed2b886f976be044"],
+        "locker": ["0x267444d099b10fb5ed7c3cc7b7c767adca574952"],
+        "implementation": [], "proxy": [],
+        "other": ["0xd3afeb2a57f70ef218aa82451c51b2fb0416ac9e", "0xc7819b64a1daecd7ec19856d026cb14efbd89046"]
+      }
+    },
+    {
+      "name": "PAIR",
+      "mature_launchpad": true,
+      "gmgn_confirmed": false,
+      "addresses": {
+        "factory": ["0x9d33Ba78389c8772bC114Cba47Dc1985E933e76F", "0x3ea29975a79900179F3e1aEF93347Ba4210c29C1"],
+        "launcher": [],
+        "token_deployer": ["0x916C53ae4738196394C2661c5B0C71B84F40e36C", "0x752b04277c1EDF6C1b3Cc81d4F9216d1aF1CaCE9"],
+        "router": [],
+        "hook": ["0x16D1560630Ce74af4478d9b8AD46548A092A2000"],
+        "locker": ["0xeFcF476E8870fB3eb8680f039414fdcCE6C2a117"],
+        "implementation": ["0x1559f2beDa73C57aB7964Ed1A29d8c4d8370b12c"],
+        "proxy": ["0x8660A7F019C7943b0b0A91B8E39AFf3b6DB6Ae62"],
+        "other": ["0x9d7741776098aFA315e4D576ede4F2c67a21d8Ce", "0xa57472d29CAf87011241249E830c924bf39Bf333"]
+      }
+    }
+  ]
+}
