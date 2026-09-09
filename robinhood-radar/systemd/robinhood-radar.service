@@ -1,0 +1,23 @@
+[Unit]
+Description=Robinhood Chain Early Discovery Radar
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=robinhood-radar
+Group=robinhood-radar
+WorkingDirectory=/opt/robinhood-radar
+EnvironmentFile=/etc/robinhood-radar.env
+ExecStart=/opt/robinhood-radar/.venv/bin/python /opt/robinhood-radar/main.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/robinhood-radar/data
+
+[Install]
+WantedBy=multi-user.target
