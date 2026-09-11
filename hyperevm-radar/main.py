@@ -1,14 +1,14 @@
 import asyncio
 import time
 
-from database import init_db, init_cluster_db, init_relation_db, init_platform_brand_db, init_platform_token_match_db, init_platform_candidate_db, seen, save_contract, add_cluster_member, recent_cluster, save_relation, get_relations_for_child, get_relations_for_parent, save_token_creator, find_confirmed_platform_matches, save_platform_token_match, save_platform_candidate, get_creator_deployment_cluster, list_new_platform_candidates, replace_platform_families, list_platform_families_for_identity, update_platform_family_identity
+from database import DB_PATH, init_db, init_cluster_db, init_relation_db, init_platform_brand_db, init_platform_token_match_db, init_platform_candidate_db, init_platform_family_db, init_platform_family_intelligence_db, save_platform_family_intelligence, save_platform_identity_investigation, list_standalone_identity_seeds, seen, save_contract, add_cluster_member, recent_cluster, save_relation, get_relations_for_child, get_relations_for_parent, save_token_creator, find_confirmed_platform_matches, save_platform_token_match, save_platform_candidate, get_creator_deployment_cluster, list_new_platform_candidates, replace_platform_families, list_platform_families_for_identity, update_platform_family_identity
 from detectors.fingerprint import fingerprint
 from detectors.hyperevm import extract_words, classify
 from detectors.token import detect_erc20
 from detectors.pools import detect_pool_event
 from detectors.rwa_assets import get_rwa_asset
 from monitors.blocks import HyperEVMBlockMonitor
-from notifier import send_telegram
+from notifier import send_telegram, format_family_intelligence_message
 from platform_token_radar import normalize_text, classify_platform_words
 from address_book import load_deployers, save_deployer
 from platform_family import build_platform_families
@@ -40,64 +40,64 @@ def run_platform_identity_pipeline(
     *,
     limit=20,
     dry_run=False,
+    engine=None,
+    protocols=None,
+    standalone_seeds=None,
 ):
     """
-    Family -> Discovery -> Website Verification
-    -> Resolver -> Family writeback -> Brand promotion.
+    Family -> address-first provider discovery -> cross-verification
+    -> structured intelligence persistence -> optional brand promotion.
 
     No Telegram is sent here.
 
     Unknown/unverified families are never promoted.
     """
 
-    from platform_identity_candidates import (
-        get_hyper_protocols,
-        discover_family_identity,
-    )
-
-    from platform_identity_source import (
-        verify_candidate_website,
-    )
-
-    from platform_identity_resolver import (
-        resolve_identity,
-    )
+    from platform_identity_candidates import get_hyper_protocols, find_family_candidates
+    from platform_family_intelligence import FamilyIntelligenceEngine
 
     from platform_brand_promoter import (
         promote_identity_to_brand,
     )
 
-    families = list_platform_families_for_identity(
+    family_rows = list_platform_families_for_identity(
         limit=limit
     )
-
-    if not families:
-        return {
-            "families": 0,
-            "candidates": 0,
-            "confirmed": 0,
-        }
+    if standalone_seeds is None:
+        standalone_seeds=list_standalone_identity_seeds(limit=limit)
+        try:
+            from platform_external_sources import discover_external_links
+            import hashlib
+            for item in discover_external_links()[:limit]:
+                url=str(item.get("url") or "").strip()
+                if not url:continue
+                standalone_seeds.append({"id":None,"subject_key":"website:"+hashlib.sha256(url.encode()).hexdigest(),"creator":"","member_addresses":[],"member_count":0,"platform_types":"","brand_hint":"","token_names":[],"token_symbols":[],"identity_urls":[url]})
+        except Exception as exc:
+            print("Standalone identity source failed:",repr(exc))
+    subjects=list(family_rows)+list(standalone_seeds or [])
+    if not subjects:return {"families":0,"investigations":0,"candidates":0,"confirmed":0,"notifications":[]}
 
     # One DefiLlama request for the whole batch.
-    try:
-        protocols = get_hyper_protocols()
-    except Exception as e:
-        print(
-            "Identity protocols fetch failed:",
-            repr(e),
-        )
-        protocols = []
+    if protocols is None:
+        try:
+            protocols = get_hyper_protocols()
+        except Exception as e:
+            print("Identity protocols fetch failed:", repr(e))
+            protocols = []
 
     total_candidates = 0
     total_confirmed = 0
+    notifications = []
+    engine = engine or FamilyIntelligenceEngine()
 
     import sqlite3
 
-    conn = sqlite3.connect("data/radar.db")
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
 
     try:
-        for family in families:
+        for family in subjects:
+            family.setdefault("identity_urls",[family.get("website_url")] if family.get("website_url") else [])
 
             members = conn.execute(
                 """
@@ -113,9 +113,10 @@ def run_platform_identity_pipeline(
                 ORDER BY m.block_number
                 """,
                 (family["id"],),
-            ).fetchall()
+            ).fetchall() if family.get("id") else []
 
-            family["member_addresses"] = [
+            if family.get("id"):
+                family["member_addresses"] = [
                 str(
                     x["candidate_address"] or ""
                 ).strip()
@@ -123,9 +124,9 @@ def run_platform_identity_pipeline(
                 if str(
                     x["candidate_address"] or ""
                 ).strip()
-            ]
+                ]
 
-            family["token_names"] = [
+                family["token_names"] = [
                 str(
                     x["token_name"] or ""
                 ).strip()
@@ -133,9 +134,9 @@ def run_platform_identity_pipeline(
                 if str(
                     x["token_name"] or ""
                 ).strip()
-            ]
+                ]
 
-            family["token_symbols"] = [
+                family["token_symbols"] = [
                 str(
                     x["token_symbol"] or ""
                 ).strip()
@@ -143,108 +144,60 @@ def run_platform_identity_pipeline(
                 if str(
                     x["token_symbol"] or ""
                 ).strip()
-            ]
+                ]
 
-            discovery = discover_family_identity(
-                family,
-                protocols=protocols,
-            )
-
-            candidates = discovery.get(
-                "candidates",
-                [],
-            )
-
-            total_candidates += len(candidates)
-
-            if not candidates:
-                if dry_run:
-                    print(
-                        "IDENTITY DRY RUN",
-                        "family=",
-                        family["id"],
-                        "candidate=NONE",
-                    )
-                continue
-
-            best_result = None
-
-            for candidate in candidates:
-
-                evidence = verify_candidate_website(
-                    family,
-                    candidate,
-                )
-
-                result = resolve_identity(
-                    evidence
-                )
-
-                if dry_run:
-                    print(
-                        "IDENTITY DRY RUN",
-                        "family=",
-                        family["id"],
-                        "source=",
-                        candidate.get("source"),
-                        "status=",
-                        result.get("status"),
-                        "confirmed=",
-                        result.get("confirmed"),
-                    )
-
-                if not result.get("confirmed"):
-                    continue
-
-                best_result = result
-
-                # STRONG_CONFIRMED wins immediately.
-                if (
-                    result.get("status")
-                    == "STRONG_CONFIRMED"
-                ):
-                    break
-
-            if best_result is None:
-                # Important:
-                # do NOT force NEW -> confirmed.
-                # do NOT write uncertain identity.
-                continue
-
-            total_confirmed += 1
+            # DefiLlama is retained only as an auxiliary URL hint. Empty names do
+            # not prevent the engine's creator/member-address searches.
+            auxiliary = find_family_candidates(family, protocols, limit=10)
+            try:
+                result = engine.enrich(family, auxiliary_candidates=auxiliary)
+            except Exception as exc:
+                result = {"family_id":family.get("id"),"subject_key":family.get("subject_key") or (f"family:{family.get('id')}" if family.get("id") else ""),"project_name":"","official_x":"","official_website":"","description":"","infrastructure_types":["Other"],"official_token_symbol":"","official_token_ca":"","token_status":"NONE","confidence":0,"verification_status":"NO_DATA","discovered_project_addresses":[],"discovered_candidates":0,"evidence":[{"source":"identity_engine","status":"NO_DATA","detail":type(exc).__name__}]}
+            total_candidates += int(result.get("discovered_candidates", 0) or 0)
+            if result["verification_status"] == "VERIFIED":total_confirmed += 1
 
             if dry_run:
+                print("IDENTITY DRY RUN", "family=", family["id"], "status=", result["verification_status"], "token_status=", result["token_status"])
                 continue
 
-            update_platform_family_identity(
+            if family.get("id"):save_platform_family_intelligence(result)
+            save_platform_identity_investigation(result)
+
+            if result["verification_status"] != "VERIFIED":
+                continue
+
+            notifications.append(format_family_intelligence_message(result, family))
+
+            if family.get("id"):update_platform_family_identity(
                 family["id"],
-                best_result.get(
-                    "status",
-                    "PLATFORM_CONFIRMED",
-                ),
-                best_result.get(
-                    "website_url",
-                    "",
-                ),
-                best_result.get(
-                    "domain",
-                    "",
-                ),
-                best_result.get(
-                    "brand",
-                    "",
-                ),
+                "STRONG_CONFIRMED",
+                result.get("official_website", ""),
+                "",
+                result.get("project_name", ""),
             )
 
             platform_address = ""
 
-            if family["member_addresses"]:
+            if family.get("member_addresses"):
                 platform_address = (
                     family["member_addresses"][0]
                 )
 
-            promote_identity_to_brand(
-                best_result,
+            if family.get("id") and result.get("project_name"):
+                from platform_token_radar import extract_domain_and_brand
+                domain, brand = extract_domain_and_brand(result.get("official_website", ""))
+                promote_identity_to_brand({
+                    "status": "STRONG_CONFIRMED",
+                    "confirmed": True,
+                    "brand": brand,
+                    "project_name": result.get("project_name", ""),
+                    "domain": domain,
+                    "website_url": result.get("official_website", ""),
+                    "platform_types": result.get("infrastructure_types", []),
+                    "official_token_name": "",
+                    "official_token_symbol": result.get("official_token_symbol", ""),
+                    "source": "FAMILY_INTELLIGENCE",
+                },
                 first_seen_block=int(
                     family.get(
                         "first_block",
@@ -253,25 +206,27 @@ def run_platform_identity_pipeline(
                     or 0
                 ),
                 platform_address=platform_address,
-            )
+                )
 
             print(
                 "Platform identity confirmed",
                 "family=",
                 family["id"],
                 "brand=",
-                best_result.get("brand"),
+                result.get("project_name"),
                 "status=",
-                best_result.get("status"),
+                result.get("verification_status"),
             )
 
     finally:
         conn.close()
 
     return {
-        "families": len(families),
+        "families": len(family_rows),
+        "investigations": len(subjects),
         "candidates": total_candidates,
         "confirmed": total_confirmed,
+        "notifications": notifications,
     }
 
 
@@ -321,8 +276,13 @@ async def request_identity_refresh():
 
         print(
             "Platform identity refresh",
-            result,
+            {k:v for k,v in result.items() if k != "notifications"},
         )
+        for message in result.get("notifications", []):
+            try:
+                await send_telegram(message)
+            except Exception as e:
+                print("Platform intelligence Telegram failed:", repr(e))
 
     except Exception as e:
         # Identity failure must never stop chain monitoring.
@@ -787,6 +747,8 @@ async def main():
     init_platform_brand_db()
     init_platform_token_match_db()
     init_platform_candidate_db()
+    init_platform_family_db()
+    init_platform_family_intelligence_db()
 
     monitor = HyperEVMBlockMonitor()
 

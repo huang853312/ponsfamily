@@ -795,6 +795,235 @@ def init_platform_family_db():
     conn.close()
 
 
+def init_platform_family_intelligence_db():
+    """Migration-safe structured intelligence storage, separate from on-chain Family facts."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS platform_family_intelligence (
+                family_id INTEGER PRIMARY KEY,
+                project_name TEXT NOT NULL DEFAULT '',
+                official_x TEXT NOT NULL DEFAULT '',
+                official_website TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                infrastructure_types TEXT NOT NULL DEFAULT '[]',
+                official_token_symbol TEXT NOT NULL DEFAULT '',
+                official_token_ca TEXT NOT NULL DEFAULT '',
+                token_status TEXT NOT NULL DEFAULT 'NONE',
+                confidence INTEGER NOT NULL DEFAULT 0,
+                verification_status TEXT NOT NULL DEFAULT 'NO_DATA',
+                verification_method TEXT NOT NULL DEFAULT '',
+                hostname TEXT NOT NULL DEFAULT '',
+                root_domain TEXT NOT NULL DEFAULT '',
+                subdomain TEXT NOT NULL DEFAULT '',
+                docs TEXT NOT NULL DEFAULT '[]',
+                github TEXT NOT NULL DEFAULT '[]',
+                source_url TEXT NOT NULL DEFAULT '',
+                core_word TEXT NOT NULL DEFAULT '',
+                derived_words TEXT NOT NULL DEFAULT '[]',
+                discovered_token_name TEXT NOT NULL DEFAULT '',
+                discovered_token_symbol TEXT NOT NULL DEFAULT '',
+                discovered_ca TEXT NOT NULL DEFAULT '',
+                evidence_source TEXT NOT NULL DEFAULT '',
+                token_verification_status TEXT NOT NULL DEFAULT 'NO_DATA',
+                token_evidence TEXT NOT NULL DEFAULT '[]',
+                token_source_urls TEXT NOT NULL DEFAULT '[]',
+                evidence TEXT NOT NULL DEFAULT '[]',
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS platform_identity_investigations (
+                subject_key TEXT PRIMARY KEY,
+                family_id INTEGER,
+                source_url TEXT NOT NULL DEFAULT '',
+                verification_status TEXT NOT NULL DEFAULT 'NO_DATA',
+                result TEXT NOT NULL DEFAULT '{}',
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS platform_identity_address_evidence (
+                subject_key TEXT NOT NULL,
+                family_id INTEGER,
+                address TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT '',
+                source_url TEXT NOT NULL DEFAULT '',
+                evidence_source TEXT NOT NULL DEFAULT '',
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                PRIMARY KEY(subject_key, address, source_url)
+            )
+        """)
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(platform_family_intelligence)")}
+        for name, definition in {
+            "verification_method": "TEXT NOT NULL DEFAULT ''",
+            "hostname": "TEXT NOT NULL DEFAULT ''",
+            "root_domain": "TEXT NOT NULL DEFAULT ''",
+            "subdomain": "TEXT NOT NULL DEFAULT ''",
+            "docs": "TEXT NOT NULL DEFAULT '[]'",
+            "github": "TEXT NOT NULL DEFAULT '[]'",
+            "source_url": "TEXT NOT NULL DEFAULT ''",
+            "core_word": "TEXT NOT NULL DEFAULT ''",
+            "derived_words": "TEXT NOT NULL DEFAULT '[]'",
+            "discovered_token_name": "TEXT NOT NULL DEFAULT ''",
+            "discovered_token_symbol": "TEXT NOT NULL DEFAULT ''",
+            "discovered_ca": "TEXT NOT NULL DEFAULT ''",
+            "evidence_source": "TEXT NOT NULL DEFAULT ''",
+            "token_verification_status": "TEXT NOT NULL DEFAULT 'NO_DATA'",
+            "token_evidence": "TEXT NOT NULL DEFAULT '[]'",
+            "token_source_urls": "TEXT NOT NULL DEFAULT '[]'",
+        }.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE platform_family_intelligence ADD COLUMN {name} {definition}")
+        conn.commit()
+
+
+def save_platform_family_intelligence(result):
+    """Persist an engine result without changing Family membership or scanner grades."""
+    import json
+    family_id = int((result or {}).get("family_id") or 0)
+    if family_id <= 0:
+        return False
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            INSERT INTO platform_family_intelligence (
+                family_id, project_name, official_x, official_website,
+                description, infrastructure_types, official_token_symbol,
+                official_token_ca, token_status, confidence,
+                verification_status, verification_method, hostname, root_domain,
+                subdomain, docs, github, source_url, core_word, derived_words,
+                discovered_token_name, discovered_token_symbol, discovered_ca,
+                evidence_source, token_verification_status, token_evidence,
+                token_source_urls, evidence, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))
+            ON CONFLICT(family_id) DO UPDATE SET
+                project_name=excluded.project_name,
+                official_x=excluded.official_x,
+                official_website=excluded.official_website,
+                description=excluded.description,
+                infrastructure_types=excluded.infrastructure_types,
+                official_token_symbol=excluded.official_token_symbol,
+                official_token_ca=excluded.official_token_ca,
+                token_status=excluded.token_status,
+                confidence=excluded.confidence,
+                verification_status=excluded.verification_status,
+                verification_method=excluded.verification_method,
+                hostname=excluded.hostname,
+                root_domain=excluded.root_domain,
+                subdomain=excluded.subdomain,
+                docs=excluded.docs,
+                github=excluded.github,
+                source_url=excluded.source_url,
+                core_word=excluded.core_word,
+                derived_words=excluded.derived_words,
+                discovered_token_name=excluded.discovered_token_name,
+                discovered_token_symbol=excluded.discovered_token_symbol,
+                discovered_ca=excluded.discovered_ca,
+                evidence_source=excluded.evidence_source,
+                token_verification_status=excluded.token_verification_status,
+                token_evidence=excluded.token_evidence,
+                token_source_urls=excluded.token_source_urls,
+                evidence=excluded.evidence,
+                updated_at=strftime('%s','now')
+        """, (
+            family_id, result.get("project_name", ""), result.get("official_x", ""),
+            result.get("official_website", ""), result.get("description", ""),
+            json.dumps(result.get("infrastructure_types", [])),
+            result.get("official_token_symbol", ""), result.get("official_token_ca", ""),
+            result.get("token_status", "NONE"), int(result.get("confidence", 0) or 0),
+            result.get("verification_status", "NO_DATA"),
+            result.get("verification_method", ""), result.get("hostname", ""),
+            result.get("root_domain", ""), result.get("subdomain", ""),
+            json.dumps(result.get("docs", [])), json.dumps(result.get("github", [])),
+            result.get("source_url", ""), result.get("core_word", ""),
+            json.dumps(result.get("derived_words", [])),
+            result.get("discovered_token_name", ""), result.get("discovered_token_symbol", ""),
+            result.get("discovered_ca", ""), result.get("evidence_source", ""),
+            result.get("token_verification_status", "NO_DATA"),
+            json.dumps(result.get("token_evidence", [])),json.dumps(result.get("token_source_urls", [])),
+            json.dumps(result.get("evidence", [])),
+        ))
+        conn.commit()
+    return True
+
+
+def get_platform_family_intelligence(family_id):
+    import json
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM platform_family_intelligence WHERE family_id=?", (int(family_id),)).fetchone()
+    if not row:
+        return None
+    value = dict(row)
+    value["infrastructure_types"] = json.loads(value["infrastructure_types"])
+    value["evidence"] = json.loads(value["evidence"])
+    value["docs"] = json.loads(value["docs"])
+    value["github"] = json.loads(value["github"])
+    value["derived_words"] = json.loads(value["derived_words"])
+    value["token_evidence"] = json.loads(value["token_evidence"])
+    value["token_source_urls"] = json.loads(value["token_source_urls"])
+    return value
+
+
+def list_standalone_identity_seeds(limit=100):
+    """Candidates not represented by a Family remain eligible for investigation."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT p.* FROM platform_candidates p
+            LEFT JOIN platform_family_members m
+              ON lower(m.candidate_address)=lower(p.address)
+            WHERE p.status='NEW' AND m.family_id IS NULL
+            ORDER BY p.block_number DESC LIMIT ?
+        """, (int(limit),)).fetchall()
+    return [{
+        "id": None,
+        "subject_key": "candidate:" + row["address"].lower(),
+        "creator": row["creator"] or "",
+        "member_addresses": [row["address"]],
+        "member_count": 1,
+        "platform_types": row["infra_roles"] or "",
+        "brand_hint": "",
+        "token_names": [row["token_name"]] if row["token_name"] else [],
+        "token_symbols": [row["token_symbol"]] if row["token_symbol"] else [],
+        "identity_urls": [],
+    } for row in rows]
+
+
+def save_platform_identity_investigation(result):
+    """Persist family-less results and reverse address evidence without inventing a Family."""
+    import json
+    subject_key = str(result.get("subject_key") or "").strip()
+    if not subject_key:
+        return False
+    family_id = int(result.get("family_id") or 0) or None
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""INSERT INTO platform_identity_investigations
+            (subject_key,family_id,source_url,verification_status,result,updated_at)
+            VALUES(?,?,?,?,?,strftime('%s','now'))
+            ON CONFLICT(subject_key) DO UPDATE SET family_id=excluded.family_id,
+            source_url=excluded.source_url,verification_status=excluded.verification_status,
+            result=excluded.result,updated_at=strftime('%s','now')""",
+            (subject_key,family_id,result.get("source_url", ""),result.get("verification_status", "NO_DATA"),json.dumps(result)))
+        for item in result.get("discovered_project_addresses", []):
+            address=str(item.get("address") or "").lower()
+            if not address:continue
+            row=conn.execute("SELECT family_id FROM platform_family_members WHERE lower(candidate_address)=? LIMIT 1",(address,)).fetchone()
+            linked_family=int(row[0]) if row else family_id
+            if family_id is None and linked_family is not None:
+                family_id=linked_family
+            conn.execute("""INSERT INTO platform_identity_address_evidence
+                (subject_key,family_id,address,role,source_url,evidence_source,updated_at)
+                VALUES(?,?,?,?,?,?,strftime('%s','now'))
+                ON CONFLICT(subject_key,address,source_url) DO UPDATE SET
+                family_id=excluded.family_id,role=excluded.role,evidence_source=excluded.evidence_source,
+                updated_at=strftime('%s','now')""",
+                (subject_key,linked_family,address,item.get("role", ""),item.get("source_url", ""),item.get("evidence_source", "")))
+        if family_id is not None:
+            conn.execute("UPDATE platform_identity_investigations SET family_id=? WHERE subject_key=?",(family_id,subject_key))
+        conn.commit()
+    return True
+
+
 def replace_platform_families(families):
     """
     Incrementally refresh platform families.
@@ -1086,7 +1315,7 @@ def list_platform_families_for_identity(limit=100):
         """
         SELECT *
         FROM platform_families
-        WHERE status IN ('NEW', 'VERIFYING')
+        WHERE status IN ('NEW', 'DISCOVERED', 'WEBSITE_PENDING', 'VERIFYING')
         ORDER BY updated_at ASC, id ASC
         LIMIT ?
         """,
