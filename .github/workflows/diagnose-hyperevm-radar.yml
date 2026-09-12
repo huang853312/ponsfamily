@@ -7,6 +7,8 @@ on:
     paths:
       - ".github/workflows/diagnose-hyperevm-radar.yml"
   workflow_dispatch:
+  schedule:
+    - cron: "*/10 * * * *"
 
 permissions:
   contents: read
@@ -36,15 +38,38 @@ jobs:
             -o UserKnownHostsFile=~/.ssh/known_hosts \
             -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 \
             "$SERVER_USER@$SERVER_HOST" '
-              set -u
+              set +e
+
               echo "=== SERVICE ==="
-              sudo systemctl is-active hyperevm-radar.service || true
+              sudo systemctl is-active hyperevm-radar.service
+              sudo systemctl show hyperevm-radar.service -p ActiveState -p SubState -p MainPID -p ExecMainStartTimestamp -p NRestarts
               PID=$(sudo systemctl show -p MainPID --value hyperevm-radar.service)
 
               echo "=== PROCESS ENV NAMES ==="
-              for K in TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID HYPEREVM_SEARCH_API_URL HYPEREVM_SEARCH_API_KEY; do
-                if sudo sh -c "tr '\''\\0'\'' '\''\\n'\'' < /proc/$PID/environ | grep -q \"^$K=.\""; then echo "$K=PRESENT"; else echo "$K=MISSING"; fi
-              done
+              if [ -n "$PID" ] && [ "$PID" != "0" ] && [ -r "/proc/$PID/environ" ]; then
+                for K in TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID HYPEREVM_SEARCH_API_URL HYPEREVM_SEARCH_API_KEY; do
+                  if sudo sh -c "tr '\''\\0'\'' '\''\\n'\'' < /proc/$PID/environ | grep -q \"^$K=.\""; then echo "$K=PRESENT"; else echo "$K=MISSING"; fi
+                done
+              else
+                echo "PROCESS_ENV=UNAVAILABLE"
+              fi
+
+              echo "=== TELEGRAM API ==="
+              if [ -n "$PID" ] && [ "$PID" != "0" ] && [ -r "/proc/$PID/environ" ]; then
+                TOKEN=$(sudo sh -c "tr '\''\\0'\'' '\''\\n'\'' < /proc/$PID/environ | sed -n '\''s/^TELEGRAM_BOT_TOKEN=//p'\'' | head -n1")
+                CHAT=$(sudo sh -c "tr '\''\\0'\'' '\''\\n'\'' < /proc/$PID/environ | sed -n '\''s/^TELEGRAM_CHAT_ID=//p'\'' | head -n1")
+                if [ -n "$TOKEN" ]; then
+                  CODE=$(curl -sS -o /tmp/hyperevm-telegram-getme.json -w "%{http_code}" --max-time 10 "https://api.telegram.org/bot${TOKEN}/getMe")
+                  echo "GETME_HTTP=$CODE"
+                  /opt/hyperevm-radar/.venv/bin/python -c "import json; p='\''/tmp/hyperevm-telegram-getme.json'\''; d=json.load(open(p)); print('\''GETME_OK'\'', d.get('\''ok'\'')); print('\''BOT_USERNAME'\'', (d.get('\''result'\'') or {}).get('\''username'\''))" 2>/dev/null || true
+                else
+                  echo "GETME_HTTP=SKIPPED_NO_TOKEN"
+                fi
+                if [ -n "$CHAT" ]; then echo "CHAT_ID=PRESENT"; else echo "CHAT_ID=MISSING"; fi
+              fi
+
+              echo "=== RECENT SERVICE LOGS ==="
+              sudo journalctl -u hyperevm-radar.service --since "30 minutes ago" --no-pager -n 200 || true
 
               echo "=== SEARCH PROVIDER TEST ==="
               cd /opt/hyperevm-radar
@@ -55,6 +80,9 @@ except Exception as e: print('\''DDG_ERROR'\'',type(e).__name__,str(e)[:160])
 try:
  h=CompositeSearchProvider().search(q,6); print('\''COMPOSITE_HITS'\'',len(h)); print('\''COMPOSITE_URLS'\'',[x.url for x in h[:5]])
 except Exception as e: print('\''COMPOSITE_ERROR'\'',type(e).__name__,str(e)[:160])" || true
+
+              echo "=== IDENTITY PIPELINE RECENT DATA ==="
+              /opt/hyperevm-radar/.venv/bin/python -c "import sqlite3,json,os; p='\''data/radar.db'\''; print('\''DB_EXISTS'\'',os.path.exists(p)); c=sqlite3.connect(p); print('\''TABLES'\'',[r[0] for r in c.execute('\''select name from sqlite_master where type=\"table\" order by name'\'').fetchall()]); rows=c.execute('\''select subject_key,verification_status,updated_at from platform_identity_investigations order by updated_at desc limit 10'\'').fetchall(); print('\''RECENT_INVESTIGATIONS'\'',rows)" || true
 
               echo "=== PARTIAL EVIDENCE ==="
               /opt/hyperevm-radar/.venv/bin/python -c "import sqlite3,json; c=sqlite3.connect('\''data/radar.db'\''); rows=c.execute('\''select subject_key,result from platform_identity_investigations where verification_status=\"PARTIAL\" order by updated_at desc limit 5'\'').fetchall();
