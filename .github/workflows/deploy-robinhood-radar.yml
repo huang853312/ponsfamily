@@ -1,0 +1,195 @@
+name: Deploy Robinhood Chain Radar
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "hyperevm-radar/**"
+      - ".github/workflows/deploy-robinhood-radar.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-robinhood-radar-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test-build-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python3 -m pip install --disable-pip-version-check aiohttp requests web3
+
+      - name: Test canonical HyperEVM logic before cloning
+        working-directory: hyperevm-radar
+        run: |
+          PYTHONPATH=. python3 -m unittest discover -s tests -v
+          python3 -m compileall -q .
+
+      - name: Build 1-to-1 Robinhood Chain clone
+        run: |
+          rm -rf /tmp/robinhood-radar
+          cp -a hyperevm-radar /tmp/robinhood-radar
+          rm -rf /tmp/robinhood-radar/data /tmp/robinhood-radar/__pycache__
+          find /tmp/robinhood-radar -name '*.pyc' -delete
+          python3 - <<'PY'
+          from pathlib import Path
+          root=Path('/tmp/robinhood-radar')
+          # Chain adapter only. The financial-infrastructure / Family / identity /
+          # core_word + 3/4/5 / official-token verification logic is unchanged.
+          replacements=[
+              ('CHAIN_ID = 999', 'CHAIN_ID = 4663'),
+              ('https://rpc.hyperliquid.xyz/evm', 'https://rpc.mainnet.chain.robinhood.com'),
+              ('https://api.dexscreener.com/token-pairs/v1/hyperevm/', 'https://api.dexscreener.com/token-pairs/v1/robinhood/'),
+              ('https://hyperevmscan.io/address/', 'https://robinhoodchain.blockscout.com/address/'),
+              ('{"hyperevm", "hyperliquid"}', '{"robinhood"}'),
+              ('"hyperliquid" in x or "hyperevm" in x', '"robinhood" in x'),
+              ('HYPEREVM_SEARCH_API_URL', 'ROBINHOOD_SEARCH_API_URL'),
+              ('HYPEREVM_SEARCH_API_KEY', 'ROBINHOOD_SEARCH_API_KEY'),
+              ('HyperEVM', 'Robinhood Chain'),
+              ('Hyperliquid', 'Robinhood Chain'),
+          ]
+          for p in root.rglob('*'):
+              if not p.is_file() or p.suffix not in {'.py','.md','.json','.txt','.example'}:
+                  continue
+              try: s=p.read_text()
+              except UnicodeDecodeError: continue
+              old=s
+              for a,b in replacements: s=s.replace(a,b)
+              if s!=old: p.write_text(s)
+          # Never seed Robinhood with HyperEVM deployer addresses.
+          (root/'addresses.json').write_text('{\n  "deployers": []\n}\n')
+          # Robinhood-specific discovery-only ecosystem source. Official identity
+          # confirmation remains Website/X/Docs cross-verification.
+          p=root/'platform_identity_candidates.py'
+          s=p.read_text()
+          start=s.find('ECOSYSTEM_SOURCES = [')
+          end=s.find('\n\n\nclass EcosystemPageParser', start)
+          if start >= 0 and end > start:
+              s=s[:start] + '''ECOSYSTEM_SOURCES = [\n    (\n        "ROBINHOOD_CHAIN_OFFICIAL",\n        "https://docs.robinhood.com/chain/",\n    ),\n]\n''' + s[end:]
+              p.write_text(s)
+          PY
+          grep -q 'CHAIN_ID = 4663' /tmp/robinhood-radar/config.py
+          grep -q 'https://rpc.mainnet.chain.robinhood.com' /tmp/robinhood-radar/config.py
+          grep -q 'derive_core_words' /tmp/robinhood-radar/platform_family_intelligence.py
+          python3 -m compileall -q /tmp/robinhood-radar
+
+      - name: Configure SSH
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          touch ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts
+
+      - name: Check server capacity and Robinhood RPC
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          SSH="ssh -i $HOME/.ssh/deploy_key -p $SERVER_PORT -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30"
+          $SSH "$SERVER_USER@$SERVER_HOST" '
+            set -e
+            echo "=== CAPACITY ==="
+            nproc
+            free -h
+            df -h /opt
+            echo "=== HYPEREVM SERVICE ==="
+            sudo systemctl is-active hyperevm-radar.service
+            echo "=== ROBINHOOD RPC ==="
+            python3 - <<"PY"
+          import json, urllib.request
+          u="https://rpc.mainnet.chain.robinhood.com"
+          def rpc(method):
+              req=urllib.request.Request(u,data=json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":[]}).encode(),headers={"Content-Type":"application/json"})
+              return json.load(urllib.request.urlopen(req,timeout=10))["result"]
+          print("chain_id", int(rpc("eth_chainId"),16))
+          print("latest_block", int(rpc("eth_blockNumber"),16))
+          assert int(rpc("eth_chainId"),16)==4663
+          PY
+          '
+
+      - name: Deploy isolated Robinhood Radar
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          SSH="ssh -i $HOME/.ssh/deploy_key -p $SERVER_PORT -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30"
+          $SSH "$SERVER_USER@$SERVER_HOST" 'sudo mkdir -p /opt/robinhood-radar && sudo chown root:root /opt/robinhood-radar'
+          rsync -az --delete \
+            --exclude='.env' --exclude='.venv/' --exclude='data/' --exclude='radar.db*' \
+            -e "$SSH" --rsync-path='sudo rsync' \
+            /tmp/robinhood-radar/ "$SERVER_USER@$SERVER_HOST:/opt/robinhood-radar/"
+          $SSH "$SERVER_USER@$SERVER_HOST" '
+            set -e
+            cd /opt/robinhood-radar
+            if [ ! -d .venv ]; then python3 -m venv .venv; fi
+            .venv/bin/pip install --disable-pip-version-check -q aiohttp requests web3
+            if [ ! -f .env ]; then
+              if [ -f /opt/hyperevm-radar/.env ]; then sudo cp /opt/hyperevm-radar/.env .env; else sudo touch .env; fi
+            fi
+            sudo sed -i "s/^HYPEREVM_SEARCH_API_URL=/ROBINHOOD_SEARCH_API_URL=/; s/^HYPEREVM_SEARCH_API_KEY=/ROBINHOOD_SEARCH_API_KEY=/" .env || true
+            sudo tee /etc/systemd/system/robinhood-radar.service >/dev/null <<"UNIT"
+          [Unit]
+          Description=Robinhood Chain Financial Infrastructure Radar
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          WorkingDirectory=/opt/robinhood-radar
+          Environment=PYTHONUNBUFFERED=1
+          EnvironmentFile=-/opt/robinhood-radar/.env
+          ExecStart=/opt/robinhood-radar/.venv/bin/python /opt/robinhood-radar/main.py
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+            sudo systemctl daemon-reload
+            sudo systemctl enable robinhood-radar.service
+            sudo systemctl restart robinhood-radar.service
+            sleep 8
+            sudo systemctl is-active robinhood-radar.service
+            sudo systemctl is-active hyperevm-radar.service
+            sudo systemctl show robinhood-radar.service -p MainPID -p NRestarts -p Environment --no-pager
+            sudo journalctl -u robinhood-radar.service -n 40 --no-pager
+          '
+
+      - name: Verify both radars remain healthy
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -p "$SERVER_PORT" -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=accept-new "$SERVER_USER@$SERVER_HOST" '
+            set -e
+            sudo systemctl is-active --quiet hyperevm-radar.service
+            sudo systemctl is-active --quiet robinhood-radar.service
+            test -f /opt/robinhood-radar/radar.db
+            python3 - <<"PY"
+          import sqlite3
+          db=sqlite3.connect("/opt/robinhood-radar/radar.db")
+          tables={r[0] for r in db.execute("select name from sqlite_master where type=\"table\"")}
+          required={"contracts","platform_candidates","platform_families","platform_identity_investigations"}
+          print("required_tables_ok", required <= tables)
+          print("contracts", db.execute("select count(*) from contracts").fetchone()[0])
+          print("latest_block", db.execute("select max(block_number) from contracts").fetchone()[0])
+          assert required <= tables
+          PY
+          '
