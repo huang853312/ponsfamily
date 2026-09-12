@@ -41,23 +41,15 @@ jobs:
               sudo systemctl is-active hyperevm-radar.service || true
               sudo systemctl show hyperevm-radar.service -p ExecStart -p WorkingDirectory -p EnvironmentFiles --no-pager || true
 
-              echo "=== ENV FILE PRESENCE ==="
-              if sudo test -f /opt/hyperevm-radar/.env; then echo "ENV_FILE=PRESENT"; else echo "ENV_FILE=MISSING"; fi
-              if sudo grep -q "^TELEGRAM_BOT_TOKEN=." /opt/hyperevm-radar/.env 2>/dev/null; then echo "TELEGRAM_BOT_TOKEN=PRESENT"; else echo "TELEGRAM_BOT_TOKEN=MISSING"; fi
-              if sudo grep -q "^TELEGRAM_CHAT_ID=." /opt/hyperevm-radar/.env 2>/dev/null; then echo "TELEGRAM_CHAT_ID=PRESENT"; else echo "TELEGRAM_CHAT_ID=MISSING"; fi
-
-              echo "=== PROCESS ENV NAMES ==="
+              echo "=== TELEGRAM ENV ==="
               PID=$(sudo systemctl show -p MainPID --value hyperevm-radar.service)
-              if [ "$PID" != "0" ] && sudo test -r "/proc/$PID/environ"; then
-                if sudo sh -c "tr '\''\\0'\'' '\''\\n'\'' < /proc/$PID/environ | grep -q '\''^TELEGRAM_BOT_TOKEN=.'\''"; then echo "PROCESS_TELEGRAM_BOT_TOKEN=PRESENT"; else echo "PROCESS_TELEGRAM_BOT_TOKEN=MISSING"; fi
-                if sudo sh -c "tr '\''\\0'\'' '\''\\n'\'' < /proc/$PID/environ | grep -q '\''^TELEGRAM_CHAT_ID=.'\''"; then echo "PROCESS_TELEGRAM_CHAT_ID=PRESENT"; else echo "PROCESS_TELEGRAM_CHAT_ID=MISSING"; fi
-              else
-                echo "PROCESS_ENV=UNREADABLE"
-              fi
+              if sudo sh -c "tr '\''\\0'\'' '\''\\n'\'' < /proc/$PID/environ | grep -q '\''^TELEGRAM_BOT_TOKEN=.'\''"; then echo "PROCESS_TELEGRAM_BOT_TOKEN=PRESENT"; else echo "PROCESS_TELEGRAM_BOT_TOKEN=MISSING"; fi
+              if sudo sh -c "tr '\''\\0'\'' '\''\\n'\'' < /proc/$PID/environ | grep -q '\''^TELEGRAM_CHAT_ID=.'\''"; then echo "PROCESS_TELEGRAM_CHAT_ID=PRESENT"; else echo "PROCESS_TELEGRAM_CHAT_ID=MISSING"; fi
 
               echo "=== RECENT RADAR LOGS ==="
-              sudo journalctl -u hyperevm-radar.service --since "45 minutes ago" --no-pager | grep -E "Platform candidate|Platform cluster candidate|Platform identity refresh|Platform identity confirmed|Telegram|contract error|B-level" | tail -n 120 || true
+              sudo journalctl -u hyperevm-radar.service --since "60 minutes ago" --no-pager | grep -E "Platform candidate|Platform cluster candidate|Platform identity refresh|Platform identity confirmed|Telegram|contract error|B-level" | tail -n 160 || true
 
-              echo "=== DB COUNTS ==="
-              /opt/hyperevm-radar/.venv/bin/python -c "import sqlite3; p='\''/opt/hyperevm-radar/radar.db'\''; c=sqlite3.connect(p); names={r[0] for r in c.execute('\''select name from sqlite_master where type=\"table\"'\'')}; tables=['\''contracts'\'','\''platform_candidates'\'','\''platform_families'\'','\''platform_family_intelligence'\'','\''platform_identity_investigations'\'']; [print(t+'\''='\''+(str(c.execute('\''select count(*) from '\''+t).fetchone()[0]) if t in names else '\''NO_TABLE'\'')) for t in tables]" || true
+              echo "=== DB SUMMARY ==="
+              cd /opt/hyperevm-radar
+              /opt/hyperevm-radar/.venv/bin/python -c "import sqlite3,json; c=sqlite3.connect('\''data/radar.db'\''); names={r[0] for r in c.execute('\''select name from sqlite_master where type=\"table\"'\'')}; tables=['\''contracts'\'','\''platform_candidates'\'','\''platform_families'\'','\''platform_family_intelligence'\'','\''platform_identity_investigations'\'']; [print(t+'\''='\''+(str(c.execute('\''select count(*) from '\''+t).fetchone()[0]) if t in names else '\''NO_TABLE'\'')) for t in tables]; print('\''INVESTIGATION_STATUS'\'', c.execute('\''select verification_status,count(*) from platform_identity_investigations group by verification_status'\'').fetchall()); rows=c.execute('\''select subject_key,verification_status,result from platform_identity_investigations order by updated_at desc limit 12'\'').fetchall(); [print('\''INV'\'',r[0],r[1],{k:v for k,v in json.loads(r[2]).items() if k in ('\''project_name'\'','\''official_website'\'','\''official_x'\'','\''verification_method'\'','\''confidence'\'','\''core_word'\'','\''derived_words'\'','\''token_status'\'')}) for r in rows]" || true
             '
