@@ -57,10 +57,11 @@ def list_platform_families_for_identity_fair(limit=100):
             LEFT JOIN platform_identity_investigations AS i
               ON i.subject_key = ('family:' || f.id)
             WHERE f.status IN ('NEW', 'DISCOVERED', 'WEBSITE_PENDING', 'VERIFYING')
+              AND (i.subject_key IS NULL OR COALESCE(i.next_retry_at, 0) <= strftime('%s','now'))
             ORDER BY
                 CASE WHEN i.updated_at IS NULL THEN 0 ELSE 1 END ASC,
                 CASE WHEN i.updated_at IS NULL THEN f.last_block END DESC,
-                COALESCE(i.updated_at, 0) ASC,
+                COALESCE(i.next_retry_at, i.updated_at, 0) ASC,
                 f.id ASC
             LIMIT ?
             """,
@@ -122,6 +123,10 @@ def run_platform_identity_pipeline(
 
     total_candidates = 0
     total_confirmed = 0
+    websites_found = 0
+    x_found = 0
+    status_counts = {"VERIFIED": 0, "PARTIAL": 0, "NO_DATA": 0}
+    retry_scheduled = 0
     notifications = []
     engine = engine or FamilyIntelligenceEngine()
 
@@ -189,16 +194,31 @@ def run_platform_identity_pipeline(
             except Exception as exc:
                 result = {"family_id":family.get("id"),"subject_key":family.get("subject_key") or (f"family:{family.get('id')}" if family.get("id") else ""),"project_name":"","official_x":"","official_website":"","description":"","infrastructure_types":["Other"],"official_token_symbol":"","official_token_ca":"","token_status":"NONE","confidence":0,"verification_status":"NO_DATA","discovered_project_addresses":[],"discovered_candidates":0,"evidence":[{"source":"identity_engine","status":"NO_DATA","detail":type(exc).__name__}]}
             total_candidates += int(result.get("discovered_candidates", 0) or 0)
-            if result["verification_status"] == "VERIFIED":total_confirmed += 1
+            status = str(result.get("verification_status") or "NO_DATA").upper()
+            status_counts[status if status in status_counts else "NO_DATA"] += 1
+            if result.get("official_website"): websites_found += 1
+            if result.get("official_x"): x_found += 1
+            if status == "VERIFIED": total_confirmed += 1
 
             if dry_run:
                 print("IDENTITY DRY RUN", "family=", family["id"], "status=", result["verification_status"], "token_status=", result["token_status"])
                 continue
 
             if family.get("id"):save_platform_family_intelligence(result)
-            save_platform_identity_investigation(result)
+            retry_state = save_platform_identity_investigation(result)
 
             if result["verification_status"] != "VERIFIED":
+                if isinstance(retry_state, dict):
+                    retry_scheduled += 1
+                    print(
+                        "Identity retry scheduled",
+                        "subject=", result.get("subject_key"),
+                        "status=", retry_state.get("verification_status"),
+                        "attempt=", retry_state.get("attempt_count"),
+                        "backoff=", retry_state.get("backoff_seconds"),
+                        "next_retry_at=", retry_state.get("next_retry_at"),
+                        "reason=", retry_state.get("last_failure_reason"),
+                    )
                 continue
 
             notifications.append(format_family_intelligence_message(result, family))
@@ -261,6 +281,12 @@ def run_platform_identity_pipeline(
         "investigations": len(subjects),
         "candidates": total_candidates,
         "confirmed": total_confirmed,
+        "websites_found": websites_found,
+        "x_found": x_found,
+        "verified": status_counts["VERIFIED"],
+        "partial": status_counts["PARTIAL"],
+        "no_data": status_counts["NO_DATA"],
+        "retry_scheduled": retry_scheduled,
         "notifications": notifications,
     }
 
@@ -314,11 +340,27 @@ async def request_identity_refresh():
             "Platform identity refresh",
             {k:v for k,v in result.items() if k != "notifications"},
         )
+        telegram_success = 0
+        telegram_failed = 0
         for message in result.get("notifications", []):
             try:
-                await send_telegram(message)
+                sent = await send_telegram(message)
+                if sent:
+                    telegram_success += 1
+                else:
+                    telegram_failed += 1
+                    print("Platform intelligence Telegram failed: send returned false")
             except Exception as e:
+                telegram_failed += 1
                 print("Platform intelligence Telegram failed:", repr(e))
+        print(
+            "Platform identity round summary",
+            {
+                **{k:v for k,v in result.items() if k != "notifications"},
+                "telegram_success": telegram_success,
+                "telegram_failed": telegram_failed,
+            },
+        )
 
     except Exception as e:
         # Identity failure must never stop chain monitoring.

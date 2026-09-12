@@ -838,6 +838,11 @@ def init_platform_family_intelligence_db():
                 source_url TEXT NOT NULL DEFAULT '',
                 verification_status TEXT NOT NULL DEFAULT 'NO_DATA',
                 result TEXT NOT NULL DEFAULT '{}',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                next_retry_at INTEGER NOT NULL DEFAULT 0,
+                backoff_seconds INTEGER NOT NULL DEFAULT 0,
+                last_failure_reason TEXT NOT NULL DEFAULT '',
+                last_success_at INTEGER NOT NULL DEFAULT 0,
                 updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             )
         """)
@@ -853,6 +858,21 @@ def init_platform_family_intelligence_db():
                 PRIMARY KEY(subject_key, address, source_url)
             )
         """)
+        investigation_columns = {row[1] for row in conn.execute("PRAGMA table_info(platform_identity_investigations)")}
+        for name, definition in {
+            "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+            "next_retry_at": "INTEGER NOT NULL DEFAULT 0",
+            "backoff_seconds": "INTEGER NOT NULL DEFAULT 0",
+            "last_failure_reason": "TEXT NOT NULL DEFAULT ''",
+            "last_success_at": "INTEGER NOT NULL DEFAULT 0",
+        }.items():
+            if name not in investigation_columns:
+                conn.execute(f"ALTER TABLE platform_identity_investigations ADD COLUMN {name} {definition}")
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_identity_retry_due
+            ON platform_identity_investigations(next_retry_at, verification_status)
+        """)
+
         existing = {row[1] for row in conn.execute("PRAGMA table_info(platform_family_intelligence)")}
         for name, definition in {
             "verification_method": "TEXT NOT NULL DEFAULT ''",
@@ -989,21 +1009,64 @@ def list_standalone_identity_seeds(limit=100):
     } for row in rows]
 
 
+def _identity_failure_reason(result):
+    status = str((result or {}).get("verification_status") or "NO_DATA").upper()
+    evidence = list((result or {}).get("evidence") or [])
+    for item in reversed(evidence):
+        detail = str((item or {}).get("detail") or "").strip()
+        source = str((item or {}).get("source") or "").strip()
+        item_status = str((item or {}).get("status") or "").upper()
+        if detail and item_status in {"NO_DATA", "ERROR", "FAILED"}:
+            return f"{source or 'identity'}:{detail}"[:240]
+    if status == "PARTIAL":
+        return "cross_verification_incomplete"
+    if status == "NO_DATA":
+        return "no_official_identity_sources"
+    return ""
+
+
 def save_platform_identity_investigation(result):
-    """Persist family-less results and reverse address evidence without inventing a Family."""
+    """Persist identity results plus explicit retry/backoff state."""
     import json
     subject_key = str(result.get("subject_key") or "").strip()
     if not subject_key:
         return False
     family_id = int(result.get("family_id") or 0) or None
+    status = str(result.get("verification_status") or "NO_DATA").upper()
+    now = int(time.time())
     with sqlite3.connect(DB_PATH) as conn:
+        previous = conn.execute(
+            "SELECT attempt_count FROM platform_identity_investigations WHERE subject_key=?",
+            (subject_key,),
+        ).fetchone()
+        prior_attempts = int(previous[0] or 0) if previous else 0
+        if status == "VERIFIED":
+            attempt_count = 0
+            backoff_seconds = 0
+            next_retry_at = 0
+            failure_reason = ""
+            last_success_at = now
+        else:
+            attempt_count = prior_attempts + 1
+            base = 300 if status == "PARTIAL" else 600
+            cap = 7200 if status == "PARTIAL" else 21600
+            backoff_seconds = min(cap, base * (2 ** min(attempt_count - 1, 8)))
+            next_retry_at = now + backoff_seconds
+            failure_reason = _identity_failure_reason(result)
+            last_success_at = 0
         conn.execute("""INSERT INTO platform_identity_investigations
-            (subject_key,family_id,source_url,verification_status,result,updated_at)
-            VALUES(?,?,?,?,?,strftime('%s','now'))
+            (subject_key,family_id,source_url,verification_status,result,attempt_count,
+             next_retry_at,backoff_seconds,last_failure_reason,last_success_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,strftime('%s','now'))
             ON CONFLICT(subject_key) DO UPDATE SET family_id=excluded.family_id,
             source_url=excluded.source_url,verification_status=excluded.verification_status,
-            result=excluded.result,updated_at=strftime('%s','now')""",
-            (subject_key,family_id,result.get("source_url", ""),result.get("verification_status", "NO_DATA"),json.dumps(result)))
+            result=excluded.result,attempt_count=excluded.attempt_count,
+            next_retry_at=excluded.next_retry_at,backoff_seconds=excluded.backoff_seconds,
+            last_failure_reason=excluded.last_failure_reason,
+            last_success_at=CASE WHEN excluded.last_success_at>0 THEN excluded.last_success_at ELSE platform_identity_investigations.last_success_at END,
+            updated_at=strftime('%s','now')""",
+            (subject_key,family_id,result.get("source_url", ""),status,json.dumps(result),
+             attempt_count,next_retry_at,backoff_seconds,failure_reason,last_success_at))
         for item in result.get("discovered_project_addresses", []):
             address=str(item.get("address") or "").lower()
             if not address:continue
@@ -1021,7 +1084,13 @@ def save_platform_identity_investigation(result):
         if family_id is not None:
             conn.execute("UPDATE platform_identity_investigations SET family_id=? WHERE subject_key=?",(family_id,subject_key))
         conn.commit()
-    return True
+    return {
+        "attempt_count": attempt_count,
+        "next_retry_at": next_retry_at,
+        "backoff_seconds": backoff_seconds,
+        "last_failure_reason": failure_reason,
+        "verification_status": status,
+    }
 
 
 def replace_platform_families(families):
