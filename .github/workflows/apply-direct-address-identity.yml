@@ -1,0 +1,38 @@
+name: Apply Direct Address Identity Repair
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/apply-direct-address-identity.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply direct address identity patch
+        run: python3 hyperevm-radar/tools/apply_identity_discovery_fix.py
+      - name: Verify radar
+        run: |
+          python3 -m pip install --disable-pip-version-check aiohttp requests web3
+          cd hyperevm-radar
+          PYTHONPATH=. python3 -m unittest discover -s tests -v
+          python3 -m compileall -q .
+      - name: Commit repaired identity engine
+        run: |
+          if git diff --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add hyperevm-radar/platform_family_intelligence.py
+          git commit -m "Strengthen address to website and X discovery"
+          git push origin HEAD:main
