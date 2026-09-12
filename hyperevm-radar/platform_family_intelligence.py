@@ -303,7 +303,20 @@ PARKED_PAGE_MARKERS = (
 
 def _is_docs_url(url):
     host=_host(url); path=(urlparse(url).path or "").lower()
-    return host.startswith("docs.") or "docs" in host.split(".") or path.startswith("/docs") or "/docs/" in path
+    return host.startswith("docs.") or "docs" in host.split(".") or host.endswith("gitbook.io") or path.startswith("/docs") or "/docs/" in path
+
+DOC_DETAIL_MARKERS = ("contract", "contracts", "address", "addresses", "deployment", "deployments", "hyperevm", "hyperliquid", "chain-999", "chain_999")
+
+def _looks_like_docs_detail_url(url):
+    if not _is_docs_url(url): return False
+    parsed=urlparse(url); blob=((parsed.path or "")+" "+(parsed.query or "")).lower()
+    return any(marker in blob for marker in DOC_DETAIL_MARKERS)
+
+def _same_docs_space(a,b):
+    ha,hb=_host(a),_host(b)
+    if not ha or not hb: return False
+    if ha==hb: return True
+    return bool(ha.endswith(".gitbook.io") and hb.endswith(".gitbook.io") and ha==hb)
 
 def _is_parked_page(page):
     if not page or page.status!="AVAILABLE": return False
@@ -406,7 +419,21 @@ class FamilyIntelligenceEngine:
             hits.extend(self._search(f'"{address}"',started,evidence))
             hits.extend(self._search(f'"{address}" HyperEVM OR Hyperliquid',started,evidence))
             hits.extend(self._search(f'site:x.com "{address}"',started,evidence))
+        # Docs discovery is broader than generic web identity discovery. Search the
+        # creator plus the whole Family (bounded for latency), because official docs
+        # often publish only one Router/Factory/Vault address and not the first three.
+        for address in ordered_addresses[:12]:
+            # Keep the original query shape for existing providers/tests, then add
+            # the broader deployment/address vocabulary for deeper Docs discovery.
             hits.extend(self._search(f'"{address}" (docs OR documentation OR contracts)',started,evidence))
+            hits.extend(self._search(
+                f'"{address}" (deployments OR addresses OR HyperEVM OR Hyperliquid)',
+                started,evidence,
+            ))
+            if time.monotonic()-started>=self.total_timeout: break
+        for address in ordered_addresses[:6]:
+            hits.extend(self._search(f'site:gitbook.io "{address}"',started,evidence))
+            if time.monotonic()-started>=self.total_timeout: break
         text_clues=[]
         for x in direct_clues:
             x=str(x or "").strip()
@@ -442,16 +469,26 @@ class FamilyIntelligenceEngine:
                 web_hits.append(hit)
 
         direct_docs_pages=[]
-        for hit in docs_hits[:4]:
+        seen_docs=set()
+        docs_queue=[hit.url for hit in docs_hits[:8]]
+        # Crawl one shallow layer of likely contract/address/deployment pages. This
+        # turns a Docs landing-page hit into the exact page that contains Family CAs.
+        while docs_queue and len(direct_docs_pages)<12:
             if time.monotonic()-started>=self.total_timeout: break
-            try: page=self.pages.fetch(hit.url,self.request_timeout)
+            docs_url=docs_queue.pop(0).split("#",1)[0]
+            if not docs_url or docs_url in seen_docs: continue
+            seen_docs.add(docs_url)
+            try: page=self.pages.fetch(docs_url,self.request_timeout)
             except Exception as exc:
-                evidence.append({"source":"direct_docs","url":hit.url,"status":"NO_DATA","detail":type(exc).__name__}); continue
+                evidence.append({"source":"direct_docs","url":docs_url,"status":"NO_DATA","detail":type(exc).__name__}); continue
             if page.status!="AVAILABLE": continue
             blob=(page.raw+" "+page.text).lower(); page.address_match=bool(addresses & {x.lower() for x in ADDRESS_RE.findall(blob)})
             direct_docs_pages.append(page)
             evidence.append({"source":"direct_docs","url":page.url,"status":"AVAILABLE","address_match":page.address_match})
             for link in page.links:
+                if _same_docs_space(link,page.url) and _looks_like_docs_detail_url(link) and link.split("#",1)[0] not in seen_docs:
+                    docs_queue.append(link)
+                    continue
                 match=X_RE.search(link)
                 if match:
                     x_urls.append(match.group(0))
@@ -511,31 +548,40 @@ class FamilyIntelligenceEngine:
         x_links_site=bool(website and x_page.status=="AVAILABLE" and any(_same_site(link,website) for link in x_page.links))
         site_links_x=bool(website_page and site_x and x_url in site_x)
         homepage_address=bool(website_page and getattr(website_page,"address_match",False))
-        all_links=[hit.url for hit in unique]+(website_page.links if website_page else [])+(x_page.links if x_page.status=="AVAILABLE" else [])
-        docs=list(dict.fromkeys(link for link in all_links if "docs" in _host(link) or "/docs" in link))
+        all_links=[hit.url for hit in unique]+[p.url for p in direct_docs_pages]+(website_page.links if website_page else [])+(x_page.links if x_page.status=="AVAILABLE" else [])
+        docs=list(dict.fromkeys(link for link in all_links if _is_docs_url(link)))
         github=list(dict.fromkeys(link for link in all_links if _host(link)=="github.com"))
-        trusted_docs=[page for page in direct_docs_pages if getattr(page,"address_match",False)]
-        for link in docs[:4]:
-            if any(page.url==link for page in trusted_docs): continue
+        trusted_docs=[]
+        docs_crosslinked=False
+        for page in direct_docs_pages:
+            linked_by_site=bool(website_page and any(_same_docs_space(link,page.url) for link in website_page.links if _is_docs_url(link)))
+            same_root=bool(root_domain and domain_parts(page.url)[1]==root_domain)
+            docs_to_site=bool(website and any(_same_site(link,website) for link in page.links))
+            docs_to_x=bool(x_url and any((m:=X_RE.search(link)) and m.group(0).rstrip("/").lower()==x_url.rstrip("/").lower() for link in page.links))
+            if linked_by_site or same_root or docs_to_site or docs_to_x:
+                trusted_docs.append(page); docs_crosslinked=True
+                evidence.append({"source":"official_docs","url":page.url,"address_match":getattr(page,"address_match",False),"crosslinked":True})
+        for link in docs[:6]:
+            if any(page.url==link for page in direct_docs_pages): continue
             linked_by_site=bool(website_page and link in website_page.links); same_root=bool(root_domain and domain_parts(link)[1]==root_domain)
             if not (linked_by_site or same_root): continue
             try: page=self.pages.fetch(link,self.request_timeout)
             except Exception as exc: evidence.append({"source":"official_docs","url":link,"status":"NO_DATA","detail":type(exc).__name__}); continue
             if page.status=="AVAILABLE":
-                blob=(page.raw+" "+page.text).lower(); page.address_match=bool(addresses & {x.lower() for x in ADDRESS_RE.findall(blob)}); trusted_docs.append(page); evidence.append({"source":"official_docs","url":page.url,"address_match":page.address_match})
-        docs_address=any(getattr(page,"address_match",False) for page in trusted_docs)
+                blob=(page.raw+" "+page.text).lower(); page.address_match=bool(addresses & {x.lower() for x in ADDRESS_RE.findall(blob)}); trusted_docs.append(page); docs_crosslinked=True; evidence.append({"source":"official_docs","url":page.url,"address_match":page.address_match,"crosslinked":True})
+        docs_address=any(getattr(page,"address_match",False) for page in direct_docs_pages+trusted_docs)
         site_identity=_identity_words(root_domain,website_page.title if website_page else "",website_page.description if website_page else "")
         x_identity=_identity_words(x_page.title,x_page.description,x_page.text[:800])
         brand_consistent=bool(site_identity & x_identity)
         corpus_text=" ".join([website_page.text if website_page else "",x_page.text,*[p.text for p in trusted_docs]]).lower()
         product_context=any(word in f" {corpus_text} " for words in TYPE_RULES.values() for word in words)
         chain_context=any(word in corpus_text for word in ("hyperevm","hyper evm","hyperliquid","chain 999"))
-        if homepage_address or docs_address: verification="VERIFIED"; verification_method="VERIFIED_BY_ADDRESS"
+        if homepage_address or (docs_address and docs_crosslinked): verification="VERIFIED"; verification_method="VERIFIED_BY_ADDRESS"
         elif site_links_x and x_links_site and brand_consistent and (chain_context or product_context): verification="VERIFIED"; verification_method="VERIFIED_BY_CROSS_LINK"
         elif website or x_url: verification="PARTIAL"; verification_method="PARTIAL"
         else: verification="NO_DATA"; verification_method="NO_DATA"
         official_x=x_url if verification=="PARTIAL" or site_links_x or x_links_site else ""
-        evidence.append({"kind":"CROSS_VERIFICATION","website_to_x":site_links_x,"x_to_website":x_links_site,"brand_consistent":brand_consistent,"chain_context":chain_context,"product_context":product_context,"family_address_on_website":homepage_address,"family_address_in_docs":docs_address,"status":verification_method})
+        evidence.append({"kind":"CROSS_VERIFICATION","website_to_x":site_links_x,"x_to_website":x_links_site,"brand_consistent":brand_consistent,"chain_context":chain_context,"product_context":product_context,"family_address_on_website":homepage_address,"family_address_in_docs":docs_address,"docs_crosslinked":docs_crosslinked,"status":verification_method})
 
         corpus=" ".join([family.get("platform_types") or "",website_page.text if website_page else "",website_page.description if website_page else "",x_page.text,x_page.description,*[p.text for p in trusted_docs]]).lower(); padded=f" {corpus} "; types=[]
         roles=[x.strip().upper() for x in str(family.get("platform_types") or "").split(",") if x.strip()]
