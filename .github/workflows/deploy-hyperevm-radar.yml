@@ -1,4 +1,5 @@
 name: Deploy HyperEVM Radar
+# Deployment trigger: identity and early-token discovery upgrade
 
 on:
   push:
