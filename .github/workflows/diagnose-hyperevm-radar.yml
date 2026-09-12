@@ -1,14 +1,13 @@
 name: Diagnose HyperEVM Radar
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/diagnose-hyperevm-radar.yml"
   workflow_dispatch:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: '*/10 * * * *'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/diagnose-hyperevm-radar.yml'
 
 permissions:
   contents: read
@@ -22,70 +21,76 @@ jobs:
         env:
           SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
         run: |
-          install -d -m 700 ~/.ssh
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
           printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          touch ~/.ssh/known_hosts
-          chmod 600 ~/.ssh/known_hosts
 
-      - name: Read-only HyperEVM diagnostics
+      - name: Read-only server health check
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
           SERVER_PORT: ${{ secrets.SERVER_PORT }}
         run: |
           ssh -i ~/.ssh/deploy_key -p "$SERVER_PORT" \
-            -o UserKnownHostsFile=~/.ssh/known_hosts \
             -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 \
-            "$SERVER_USER@$SERVER_HOST" '
-              set +e
+            "$SERVER_USER@$SERVER_HOST" 'bash -s' <<'REMOTE'
+          set +e
+          SERVICE=hyperevm-radar.service
+          echo '=== SERVICE ==='
+          sudo systemctl is-active "$SERVICE" || true
+          sudo systemctl show "$SERVICE" -p ActiveState -p SubState -p MainPID -p ExecMainStartTimestamp -p NRestarts || true
+          PID=$(sudo systemctl show "$SERVICE" -p MainPID --value 2>/dev/null)
 
-              echo "=== SERVICE ==="
-              sudo systemctl is-active hyperevm-radar.service
-              sudo systemctl show hyperevm-radar.service -p ActiveState -p SubState -p MainPID -p ExecMainStartTimestamp -p NRestarts
-              PID=$(sudo systemctl show -p MainPID --value hyperevm-radar.service)
-
-              echo "=== PROCESS ENV NAMES ==="
-              if [ -n "$PID" ] && [ "$PID" != "0" ] && [ -r "/proc/$PID/environ" ]; then
-                for K in TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID HYPEREVM_SEARCH_API_URL HYPEREVM_SEARCH_API_KEY; do
-                  if sudo sh -c "tr '\''\\0'\'' '\''\\n'\'' < /proc/$PID/environ | grep -q \"^$K=.\""; then echo "$K=PRESENT"; else echo "$K=MISSING"; fi
-                done
+          echo '=== PROCESS ENV ==='
+          if [ -n "$PID" ] && [ "$PID" != "0" ]; then
+            ENV_DATA=$(sudo tr '\0' '\n' < "/proc/$PID/environ" 2>/dev/null)
+            for K in TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID HYPEREVM_SEARCH_API_URL HYPEREVM_SEARCH_API_KEY; do
+              if printf '%s\n' "$ENV_DATA" | grep -q "^${K}=."; then
+                echo "${K}=PRESENT"
               else
-                echo "PROCESS_ENV=UNAVAILABLE"
+                echo "${K}=MISSING"
               fi
+            done
 
-              echo "=== TELEGRAM API ==="
-              if [ -n "$PID" ] && [ "$PID" != "0" ] && [ -r "/proc/$PID/environ" ]; then
-                TOKEN=$(sudo sh -c "tr '\''\\0'\'' '\''\\n'\'' < /proc/$PID/environ | sed -n '\''s/^TELEGRAM_BOT_TOKEN=//p'\'' | head -n1")
-                CHAT=$(sudo sh -c "tr '\''\\0'\'' '\''\\n'\'' < /proc/$PID/environ | sed -n '\''s/^TELEGRAM_CHAT_ID=//p'\'' | head -n1")
-                if [ -n "$TOKEN" ]; then
-                  CODE=$(curl -sS -o /tmp/hyperevm-telegram-getme.json -w "%{http_code}" --max-time 10 "https://api.telegram.org/bot${TOKEN}/getMe")
-                  echo "GETME_HTTP=$CODE"
-                  /opt/hyperevm-radar/.venv/bin/python -c "import json; p='\''/tmp/hyperevm-telegram-getme.json'\''; d=json.load(open(p)); print('\''GETME_OK'\'', d.get('\''ok'\'')); print('\''BOT_USERNAME'\'', (d.get('\''result'\'') or {}).get('\''username'\''))" 2>/dev/null || true
-                else
-                  echo "GETME_HTTP=SKIPPED_NO_TOKEN"
-                fi
-                if [ -n "$CHAT" ]; then echo "CHAT_ID=PRESENT"; else echo "CHAT_ID=MISSING"; fi
-              fi
-
-              echo "=== RECENT SERVICE LOGS ==="
-              sudo journalctl -u hyperevm-radar.service --since "30 minutes ago" --no-pager -n 200 || true
-
-              echo "=== SEARCH PROVIDER TEST ==="
-              cd /opt/hyperevm-radar
-              /opt/hyperevm-radar/.venv/bin/python -c "from platform_family_intelligence import ConfiguredJsonSearchProvider,DuckDuckGoSearchProvider,CompositeSearchProvider; q='\''\"0xb5055B2Be5F8005bdC5a236892b148d99b026dAa\" HyperEVM official'\''; a=ConfiguredJsonSearchProvider(); print('\''CONFIGURED_ENDPOINT'\'', '\''PRESENT'\'' if a.endpoint else '\''MISSING'\'');
+            TOKEN=$(printf '%s\n' "$ENV_DATA" | sed -n 's/^TELEGRAM_BOT_TOKEN=//p' | head -n1)
+            if [ -n "$TOKEN" ]; then
+              HTTP=$(curl -sS -o /tmp/tg-getme.json -w '%{http_code}' --max-time 10 "https://api.telegram.org/bot${TOKEN}/getMe" || true)
+              echo "TELEGRAM_GETME_HTTP=${HTTP}"
+              python3 - <<'PY' 2>/dev/null || true
+import json
+p='/tmp/tg-getme.json'
 try:
- h=DuckDuckGoSearchProvider().search(q,6); print('\''DDG_HITS'\'',len(h)); print('\''DDG_URLS'\'',[x.url for x in h[:5]])
-except Exception as e: print('\''DDG_ERROR'\'',type(e).__name__,str(e)[:160])
-try:
- h=CompositeSearchProvider().search(q,6); print('\''COMPOSITE_HITS'\'',len(h)); print('\''COMPOSITE_URLS'\'',[x.url for x in h[:5]])
-except Exception as e: print('\''COMPOSITE_ERROR'\'',type(e).__name__,str(e)[:160])" || true
+    d=json.load(open(p))
+    print('TELEGRAM_GETME_OK=', d.get('ok'))
+    print('TELEGRAM_BOT_USERNAME=', (d.get('result') or {}).get('username'))
+except Exception as e:
+    print('TELEGRAM_GETME_PARSE_ERROR=', type(e).__name__)
+PY
+            fi
+          else
+            echo 'PROCESS_ENV=UNAVAILABLE'
+          fi
 
-              echo "=== IDENTITY PIPELINE RECENT DATA ==="
-              /opt/hyperevm-radar/.venv/bin/python -c "import sqlite3,json,os; p='\''data/radar.db'\''; print('\''DB_EXISTS'\'',os.path.exists(p)); c=sqlite3.connect(p); print('\''TABLES'\'',[r[0] for r in c.execute('\''select name from sqlite_master where type=\"table\" order by name'\'').fetchall()]); rows=c.execute('\''select subject_key,verification_status,updated_at from platform_identity_investigations order by updated_at desc limit 10'\'').fetchall(); print('\''RECENT_INVESTIGATIONS'\'',rows)" || true
+          echo '=== RECENT LOGS ==='
+          sudo journalctl -u "$SERVICE" --since '30 minutes ago' --no-pager -n 200 || true
 
-              echo "=== PARTIAL EVIDENCE ==="
-              /opt/hyperevm-radar/.venv/bin/python -c "import sqlite3,json; c=sqlite3.connect('\''data/radar.db'\''); rows=c.execute('\''select subject_key,result from platform_identity_investigations where verification_status=\"PARTIAL\" order by updated_at desc limit 5'\'').fetchall();
-for k,s in rows:
- r=json.loads(s); print('\''SUBJECT'\'',k); print('\''WEBSITE'\'',r.get('\''official_website'\'')); print('\''X'\'',r.get('\''official_x'\'')); print('\''EVIDENCE'\'',[(e.get('\''source'\''),e.get('\''kind'\''),e.get('\''status'\''),e.get('\''detail'\''),e.get('\''url'\'')) for e in r.get('\''evidence'\'',[])][-12:])" || true
-            '
+          echo '=== RADAR FILES ==='
+          cd /opt/hyperevm-radar 2>/dev/null || exit 0
+          pwd
+          ls -l main.py platform_family_intelligence.py notifier.py 2>/dev/null || true
+
+          echo '=== DATABASE RECENCY ==='
+          python3 - <<'PY' 2>/dev/null || true
+import os, sqlite3
+p='/opt/hyperevm-radar/data/radar.db'
+print('DB_EXISTS=', os.path.exists(p))
+if os.path.exists(p):
+    c=sqlite3.connect(p)
+    tables={r[0] for r in c.execute("select name from sqlite_master where type='table'")}
+    print('HAS_IDENTITY_INVESTIGATIONS=', 'platform_identity_investigations' in tables)
+    if 'platform_identity_investigations' in tables:
+        rows=c.execute('select subject_key, verification_status, updated_at from platform_identity_investigations order by updated_at desc limit 10').fetchall()
+        print('RECENT_INVESTIGATIONS=', rows)
+PY
+          REMOTE
