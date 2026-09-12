@@ -57,6 +57,8 @@ jobs:
               ('HYPEREVM_SEARCH_API_KEY', 'ROBINHOOD_SEARCH_API_KEY'),
               ('HyperEVM', 'Robinhood Chain'),
               ('Hyperliquid', 'Robinhood Chain'),
+              # Preserve valid Python identifiers while adapting human/search text.
+              ('Robinhood ChainBlockMonitor', 'HyperEVMBlockMonitor'),
           ]
           for p in root.rglob('*'):
               if not p.is_file() or p.suffix not in {'.py','.md','.json','.txt','.example'}:
