@@ -42,6 +42,11 @@ jobs:
           sudo systemctl show "$SERVICE" -p ActiveState -p SubState -p MainPID -p ExecMainStartTimestamp -p NRestarts || true
           PID=$(sudo systemctl show "$SERVICE" -p MainPID --value 2>/dev/null)
 
+          echo '=== PROCESS ==='
+          if [ -n "$PID" ] && [ "$PID" != "0" ]; then
+            ps -p "$PID" -o pid=,etime=,%cpu=,%mem=,cmd= || true
+          fi
+
           echo '=== PROCESS ENV ==='
           if [ -n "$PID" ] && [ "$PID" != "0" ]; then
             ENV_DATA=$(sudo tr '\0' '\n' < "/proc/$PID/environ" 2>/dev/null)
@@ -53,17 +58,23 @@ jobs:
               fi
             done
             TOKEN=$(printf '%s\n' "$ENV_DATA" | sed -n 's/^TELEGRAM_BOT_TOKEN=//p' | head -n1)
+            CHAT=$(printf '%s\n' "$ENV_DATA" | sed -n 's/^TELEGRAM_CHAT_ID=//p' | head -n1)
             if [ -n "$TOKEN" ]; then
               HTTP=$(curl -sS -o /tmp/tg-getme.json -w '%{http_code}' --max-time 10 "https://api.telegram.org/bot${TOKEN}/getMe" || true)
               echo "TELEGRAM_GETME_HTTP=${HTTP}"
               grep -o '"ok":[^,}]*' /tmp/tg-getme.json | head -n1 || true
+              if [ -n "$CHAT" ]; then
+                HTTP2=$(curl -sS -o /tmp/tg-getchat.json -w '%{http_code}' --max-time 10 --get --data-urlencode "chat_id=${CHAT}" "https://api.telegram.org/bot${TOKEN}/getChat" || true)
+                echo "TELEGRAM_GETCHAT_HTTP=${HTTP2}"
+                grep -o '"ok":[^,}]*' /tmp/tg-getchat.json | head -n1 || true
+              fi
             fi
           else
             echo 'PROCESS_ENV=UNAVAILABLE'
           fi
 
           echo '=== RECENT LOGS ==='
-          sudo journalctl -u "$SERVICE" --since '30 minutes ago' --no-pager -n 200 || true
+          sudo journalctl -u "$SERVICE" --since '2 hours ago' --no-pager -n 400 || true
 
           echo '=== RADAR FILES ==='
           cd /opt/hyperevm-radar 2>/dev/null || exit 0
@@ -77,4 +88,60 @@ jobs:
           else
             echo 'DB_EXISTS=NO'
           fi
+
+          echo '=== DATABASE DEEP DIVE ==='
+          python3 - <<'PY'
+          import sqlite3, os, json, time, datetime
+          p='/opt/hyperevm-radar/data/radar.db'
+          if not os.path.exists(p):
+              print('NO_DB')
+              raise SystemExit
+          c=sqlite3.connect(p)
+          c.row_factory=sqlite3.Row
+          tables=[r[0] for r in c.execute("select name from sqlite_master where type='table' order by name")]
+          print('TABLES=', tables)
+          wanted=['contracts','platform_candidates','platform_families','platform_family_members','platform_identity_investigations','platform_family_intelligence','platform_brands','platform_token_matches','standalone_identity_seeds']
+          for t in wanted:
+              if t not in tables:
+                  print(f'TABLE {t}: MISSING')
+                  continue
+              cols=[r[1] for r in c.execute(f'pragma table_info({t})')]
+              cnt=c.execute(f'select count(*) from {t}').fetchone()[0]
+              print(f'TABLE {t}: COUNT={cnt} COLS={cols}')
+              order=None
+              for k in ['updated_at','first_seen_time','first_seen','created_at','last_block','first_block','block_number','id']:
+                  if k in cols:
+                      order=k
+                      break
+              sql=f'select * from {t}'
+              if order:
+                  sql+=f' order by {order} desc'
+              sql+=' limit 12'
+              try:
+                  rows=[dict(r) for r in c.execute(sql).fetchall()]
+                  safe=[]
+                  for r in rows:
+                      d={}
+                      for k,v in r.items():
+                          if isinstance(v,(bytes,bytearray)):
+                              d[k]=f'<bytes:{len(v)}>'
+                          elif isinstance(v,str) and len(v)>900:
+                              d[k]=v[:900]+'...<truncated>'
+                          else:
+                              d[k]=v
+                      safe.append(d)
+                  print(f'RECENT {t}=', json.dumps(safe, ensure_ascii=False))
+              except Exception as e:
+                  print(f'RECENT {t} ERROR=', type(e).__name__, str(e))
+          if 'platform_identity_investigations' in tables:
+              cols=[r[1] for r in c.execute('pragma table_info(platform_identity_investigations)')]
+              if 'verification_status' in cols:
+                  print('IDENTITY_STATUS_COUNTS=', c.execute('select verification_status,count(*) from platform_identity_investigations group by verification_status order by count(*) desc').fetchall())
+          if 'platform_candidates' in tables:
+              cols=[r[1] for r in c.execute('pragma table_info(platform_candidates)')]
+              for field in ['status','platform_type','discovery_source']:
+                  if field in cols:
+                      print(field.upper()+'_COUNTS=', c.execute(f'select {field},count(*) from platform_candidates group by {field} order by count(*) desc limit 20').fetchall())
+          print('NOW_EPOCH=', int(time.time()), 'NOW=', datetime.datetime.now().isoformat())
+          PY
           REMOTE
