@@ -12,117 +12,65 @@ def replace_once(old: str, new: str, label: str) -> None:
     text = text.replace(old, new, 1)
 
 
-# 1) Search website, X and Docs directly from each chain address instead of
-# making X/Docs wait for a website to be discovered first.
-replace_once(
-'''        for address in ordered_addresses[:3]:
-            hits.extend(self._search(f'"{address}"',started,evidence))
-            hits.extend(self._search(f'"{address}" HyperEVM OR Hyperliquid',started,evidence))
-''',
-'''        for address in ordered_addresses[:3]:
+# Strengthen the two weak links without changing verification semantics:
+# address -> website and address -> official X.
+# DEX Screener is used only as candidate-discovery metadata; explorer contract
+# names are only extra search clues. Neither source can make a project VERIFIED.
+
+anchor = '''    def _search(self, query, started, evidence):
+        if time.monotonic()-started>=self.total_timeout: return []
+        try:
+            rows=self.search.search(query,self.request_timeout)
+            evidence.append({"source":"search","query":query[:180],"status":"HITS" if rows else "NO_DATA","hits":len(rows)})
+            return rows
+        except Exception as exc:
+            evidence.append({"source":"search","query":query[:180],"status":"NO_DATA","detail":type(exc).__name__}); return []
+'''
+addition = anchor + '''\n    def _direct_address_identity(self, address, started, evidence):\n        """Return non-search-engine website/X candidates and contract-name clues."""\n        hits=[]; clues=[]\n        if time.monotonic()-started>=self.total_timeout: return hits,clues\n        # DEX Screener exposes website/social metadata attached to a token/pair.\n        # Treat it as discovery evidence only; normal cross-verification still applies.\n        try:\n            response=requests.get(\n                f"https://api.dexscreener.com/token-pairs/v1/hyperevm/{address}",\n                timeout=self.request_timeout,\n                headers={"Accept":"application/json","User-Agent":"HyperEVM-Radar/3.1"},\n            )\n            response.raise_for_status(); rows=response.json()\n            if not isinstance(rows,list): rows=[]\n            for row in rows[:8]:\n                info=row.get("info") or {}\n                for item in info.get("websites") or []:\n                    url=str((item or {}).get("url") or "").strip()\n                    if url.startswith(("http://","https://")):\n                        hits.append(SearchHit(url,source="DEXSCREENER_ADDRESS_METADATA"))\n                for item in info.get("socials") or []:\n                    item=item or {}; platform=str(item.get("platform") or "").lower(); handle=str(item.get("handle") or item.get("url") or "").strip()\n                    if platform in {"twitter","x"} and handle:\n                        if handle.startswith(("http://","https://")): url=handle\n                        else: url="https://x.com/"+handle.lstrip("@/")\n                        hits.append(SearchHit(url,source="DEXSCREENER_ADDRESS_METADATA"))\n                for side in ("baseToken","quoteToken"):\n                    token=row.get(side) or {}\n                    if str(token.get("address") or "").lower()==address.lower():\n                        for value in (token.get("name"),token.get("symbol")):\n                            value=str(value or "").strip()\n                            if len(value)>=3 and value.lower() not in {"token","unknown"}: clues.append(value)\n            evidence.append({"source":"dexscreener_address_metadata","address":address,"status":"HITS" if hits else "NO_DATA","hits":len(hits)})\n        except Exception as exc:\n            evidence.append({"source":"dexscreener_address_metadata","address":address,"status":"NO_DATA","detail":type(exc).__name__})\n\n        # Explorer pages are available immediately after deployment even when web\n        # search has not indexed the address. A verified contract name becomes a\n        # search clue, never an identity assertion.\n        if time.monotonic()-started<self.total_timeout:\n            try:\n                page=self.pages.fetch(f"https://hyperevmscan.io/address/{address}",self.request_timeout)\n                blob=" ".join((page.title,page.description,page.text[:12000])) if page.status=="AVAILABLE" else ""\n                match=re.search(r"Contract Name\\s+([A-Za-z][A-Za-z0-9_.$-]{2,80})",blob,re.I)\n                name=match.group(1).strip() if match else ""\n                generic=("proxy","erc20","token","contract","transparentupgradeableproxy","beaconproxy")\n                if name and name.lower() not in generic and not name.lower().endswith("proxy"):\n                    clues.append(name)\n                evidence.append({"source":"hyperevmscan_address","address":address,"status":page.status,"contract_name":name[:100]})\n            except Exception as exc:\n                evidence.append({"source":"hyperevmscan_address","address":address,"status":"NO_DATA","detail":type(exc).__name__})\n        return hits,list(dict.fromkeys(clues))\n'''
+replace_once(anchor, addition, "direct address identity helper")
+
+old = '''        started=time.monotonic(); ordered_addresses=_ordered_addresses(family); addresses=set(ordered_addresses); evidence=[]; hits=[]
+        # Search creator first, then up to two member addresses. Exact-address query
+        # is primary; a second chain-context query catches results whose index omitted
+        # the word "official". This fixes the old single-query blind spot.
+        for address in ordered_addresses[:3]:
             hits.extend(self._search(f'"{address}"',started,evidence))
             hits.extend(self._search(f'"{address}" HyperEVM OR Hyperliquid',started,evidence))
             hits.extend(self._search(f'site:x.com "{address}"',started,evidence))
             hits.extend(self._search(f'"{address}" (docs OR documentation OR contracts)',started,evidence))
-''',
-"address parallel search",
-)
-
-# 2) Add conservative URL/page helpers. Parked domains must not become the
-# project website merely because they happen to rank first in search.
-anchor = '''def _project_addresses(page, evidence_source):
-    if not page or page.status!="AVAILABLE": return []
-    blob=page.raw+" "+page.text; out=[]; role_words=("factory","router","vault","oracle","pool")
-    for match in ADDRESS_RE.finditer(blob):
-        context=blob[max(0,match.start()-120):match.end()+120].lower()
-        role=next((word.upper() for word in role_words if word in context),"")
-        out.append({"address":match.group(0).lower(),"role":role,"source_url":page.url,"evidence_source":evidence_source})
-    return out
+        text_clues=[]
 '''
-replacement = anchor + '''\nPARKED_PAGE_MARKERS = (\n    "domain for sale", "buy this domain", "this domain is for sale",\n    "afternic", "sedo domain parking", "hugedomains", "parkingcrew",\n)\n\ndef _is_docs_url(url):\n    host=_host(url); path=(urlparse(url).path or "").lower()\n    return host.startswith("docs.") or "docs" in host.split(".") or path.startswith("/docs") or "/docs/" in path\n\ndef _is_parked_page(page):\n    if not page or page.status!="AVAILABLE": return False\n    blob=" ".join((page.title,page.description,page.text[:5000])).lower()\n    return any(marker in blob for marker in PARKED_PAGE_MARKERS)\n'''
-replace_once(anchor, replacement, "identity helpers")
-
-# 3) Separate Docs candidates from ordinary websites, then inspect Docs
-# immediately. Exact family-address evidence in Docs is retained even if the
-# homepage has not been found yet. Docs links can also seed X/homepage search.
-old = '''        unique=unique_hits(hits); x_urls=[]; web_hits=[]
-        excluded={"github.com","t.me","telegram.me","youtube.com","x.com","twitter.com","dexscreener.com","coingecko.com","coinmarketcap.com","defillama.com","debank.com","etherscan.io"}
-        for hit in unique:
-            match=X_RE.search(hit.url)
-            if match:
-                x_urls.append(match.group(0)); evidence.append({"source":hit.source,"kind":"X_CANDIDATE","url":match.group(0),"title":hit.title[:160]})
-            elif _host(hit.url) not in excluded:
-                web_hits.append(hit)
-
-        website_page=None; website_candidate=web_hits[0].url if web_hits else ""
+new = '''        started=time.monotonic(); ordered_addresses=_ordered_addresses(family); addresses=set(ordered_addresses); evidence=[]; hits=[]; direct_clues=[]
+        # First ask sources that know the address directly. This avoids waiting for
+        # a public search engine to index a brand-new HyperEVM deployment.
+        for address in ordered_addresses[:3]:
+            direct_hits,new_clues=self._direct_address_identity(address,started,evidence)
+            hits.extend(direct_hits); direct_clues.extend(new_clues)
+            hits.extend(self._search(f'"{address}"',started,evidence))
+            hits.extend(self._search(f'"{address}" HyperEVM OR Hyperliquid',started,evidence))
+            hits.extend(self._search(f'site:x.com "{address}"',started,evidence))
+            hits.extend(self._search(f'"{address}" (docs OR documentation OR contracts)',started,evidence))
+        text_clues=[]
+        for x in direct_clues:
+            x=str(x or "").strip()
+            if len(x)>=3 and x.lower() not in {y.lower() for y in text_clues}: text_clues.append(x)
 '''
-new = '''        unique=unique_hits(hits); x_urls=[]; docs_hits=[]; web_hits=[]
-        excluded={"github.com","t.me","telegram.me","youtube.com","x.com","twitter.com","dexscreener.com","coingecko.com","coinmarketcap.com","defillama.com","debank.com","etherscan.io"}
-        for hit in unique:
-            match=X_RE.search(hit.url)
-            if match:
-                x_urls.append(match.group(0)); evidence.append({"source":hit.source,"kind":"X_CANDIDATE","url":match.group(0),"title":hit.title[:160]})
-            elif _is_docs_url(hit.url):
-                docs_hits.append(hit); evidence.append({"source":hit.source,"kind":"DOCS_CANDIDATE","url":hit.url,"title":hit.title[:160]})
-            elif _host(hit.url) not in excluded:
-                web_hits.append(hit)
+replace_once(old, new, "direct address discovery integration")
 
-        direct_docs_pages=[]
-        for hit in docs_hits[:4]:
-            if time.monotonic()-started>=self.total_timeout: break
-            try: page=self.pages.fetch(hit.url,self.request_timeout)
-            except Exception as exc:
-                evidence.append({"source":"direct_docs","url":hit.url,"status":"NO_DATA","detail":type(exc).__name__}); continue
-            if page.status!="AVAILABLE": continue
-            blob=(page.raw+" "+page.text).lower(); page.address_match=bool(addresses & {x.lower() for x in ADDRESS_RE.findall(blob)})
-            direct_docs_pages.append(page)
-            evidence.append({"source":"direct_docs","url":page.url,"status":"AVAILABLE","address_match":page.address_match})
-            for link in page.links:
-                match=X_RE.search(link)
-                if match:
-                    x_urls.append(match.group(0))
-                    evidence.append({"source":"direct_docs","kind":"X_CANDIDATE","url":match.group(0)})
-                    continue
-                if link.startswith(("http://","https://")) and _host(link) not in excluded and not _is_docs_url(link):
-                    web_hits.insert(0,SearchHit(link,source="DOCS_BACKLINK"))
-
-        website_page=None; website_candidate=""
+# Search direct metadata/explorer names before weaker family hints, and add a
+# website-oriented query so a contract name can resolve straight to a homepage.
+old = '''        for clue in text_clues[:2]:
+            hits.extend(self._search(f'"{clue}" HyperEVM',started,evidence))
+            hits.extend(self._search(f'site:x.com "{clue}" HyperEVM',started,evidence))
+            hits.extend(self._search(f'"{clue}" docs HyperEVM',started,evidence))
 '''
-replace_once(old, new, "candidate classification and direct docs")
-
-# 4) Reject parked pages and only remember a website candidate after the page
-# was successfully fetched and passed the parked-domain check.
-old = '''            if page.status!="AVAILABLE": continue
-            page_blob=(page.raw+" "+page.text).lower(); page.address_match=bool(addresses & {x.lower() for x in ADDRESS_RE.findall(page_blob)})
-            if page.address_match or any(X_RE.search(link) for link in page.links): website_page=page; break
-            if website_page is None: website_page=page
+new = '''        for clue in text_clues[:4]:
+            hits.extend(self._search(f'"{clue}" HyperEVM',started,evidence))
+            hits.extend(self._search(f'"{clue}" HyperEVM (official OR app OR protocol)',started,evidence))
+            hits.extend(self._search(f'site:x.com "{clue}" HyperEVM',started,evidence))
+            hits.extend(self._search(f'"{clue}" docs HyperEVM',started,evidence))
 '''
-new = '''            if page.status!="AVAILABLE": continue
-            if _is_parked_page(page):
-                evidence.append({"source":"website","url":page.url,"status":"REJECTED_PARKED"}); continue
-            if not website_candidate: website_candidate=page.url
-            page_blob=(page.raw+" "+page.text).lower(); page.address_match=bool(addresses & {x.lower() for x in ADDRESS_RE.findall(page_blob)})
-            if page.address_match or any(X_RE.search(link) for link in page.links): website_page=page; break
-            if website_page is None: website_page=page
-'''
-replace_once(old, new, "parked website rejection")
-
-# 5) Direct Docs with an exact Family address can participate in address-based
-# verification immediately. Other Docs still require website/root linkage.
-old = '''        trusted_docs=[]
-        for link in docs[:4]:
-            linked_by_site=bool(website_page and link in website_page.links); same_root=bool(root_domain and domain_parts(link)[1]==root_domain)
-            if not (linked_by_site or same_root): continue
-            try: page=self.pages.fetch(link,self.request_timeout)
-'''
-new = '''        trusted_docs=[page for page in direct_docs_pages if getattr(page,"address_match",False)]
-        for link in docs[:4]:
-            if any(page.url==link for page in trusted_docs): continue
-            linked_by_site=bool(website_page and link in website_page.links); same_root=bool(root_domain and domain_parts(link)[1]==root_domain)
-            if not (linked_by_site or same_root): continue
-            try: page=self.pages.fetch(link,self.request_timeout)
-'''
-replace_once(old, new, "direct docs trust")
+replace_once(old, new, "expanded direct clue search")
 
 PATH.write_text(text, encoding="utf-8")
 print("patched", PATH)
