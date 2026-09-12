@@ -343,22 +343,80 @@ class FamilyIntelligenceEngine:
         except Exception as exc:
             evidence.append({"source":"search","query":query[:180],"status":"NO_DATA","detail":type(exc).__name__}); return []
 
+    def _direct_address_identity(self, address, started, evidence):
+        """Return non-search-engine website/X candidates and contract-name clues."""
+        hits=[]; clues=[]
+        if time.monotonic()-started>=self.total_timeout: return hits,clues
+        # DEX Screener exposes website/social metadata attached to a token/pair.
+        # Treat it as discovery evidence only; normal cross-verification still applies.
+        try:
+            response=requests.get(
+                f"https://api.dexscreener.com/token-pairs/v1/hyperevm/{address}",
+                timeout=self.request_timeout,
+                headers={"Accept":"application/json","User-Agent":"HyperEVM-Radar/3.1"},
+            )
+            response.raise_for_status(); rows=response.json()
+            if not isinstance(rows,list): rows=[]
+            for row in rows[:8]:
+                info=row.get("info") or {}
+                for item in info.get("websites") or []:
+                    url=str((item or {}).get("url") or "").strip()
+                    if url.startswith(("http://","https://")):
+                        hits.append(SearchHit(url,source="DEXSCREENER_ADDRESS_METADATA"))
+                for item in info.get("socials") or []:
+                    item=item or {}; platform=str(item.get("platform") or "").lower(); handle=str(item.get("handle") or item.get("url") or "").strip()
+                    if platform in {"twitter","x"} and handle:
+                        if handle.startswith(("http://","https://")): url=handle
+                        else: url="https://x.com/"+handle.lstrip("@/")
+                        hits.append(SearchHit(url,source="DEXSCREENER_ADDRESS_METADATA"))
+                for side in ("baseToken","quoteToken"):
+                    token=row.get(side) or {}
+                    if str(token.get("address") or "").lower()==address.lower():
+                        for value in (token.get("name"),token.get("symbol")):
+                            value=str(value or "").strip()
+                            if len(value)>=3 and value.lower() not in {"token","unknown"}: clues.append(value)
+            evidence.append({"source":"dexscreener_address_metadata","address":address,"status":"HITS" if hits else "NO_DATA","hits":len(hits)})
+        except Exception as exc:
+            evidence.append({"source":"dexscreener_address_metadata","address":address,"status":"NO_DATA","detail":type(exc).__name__})
+
+        # Explorer pages are available immediately after deployment even when web
+        # search has not indexed the address. A verified contract name becomes a
+        # search clue, never an identity assertion.
+        if time.monotonic()-started<self.total_timeout:
+            try:
+                page=self.pages.fetch(f"https://hyperevmscan.io/address/{address}",self.request_timeout)
+                blob=" ".join((page.title,page.description,page.text[:12000])) if page.status=="AVAILABLE" else ""
+                match=re.search(r"Contract Name\s+([A-Za-z][A-Za-z0-9_.$-]{2,80})",blob,re.I)
+                name=match.group(1).strip() if match else ""
+                generic=("proxy","erc20","token","contract","transparentupgradeableproxy","beaconproxy")
+                if name and name.lower() not in generic and not name.lower().endswith("proxy"):
+                    clues.append(name)
+                evidence.append({"source":"hyperevmscan_address","address":address,"status":page.status,"contract_name":name[:100]})
+            except Exception as exc:
+                evidence.append({"source":"hyperevmscan_address","address":address,"status":"NO_DATA","detail":type(exc).__name__})
+        return hits,list(dict.fromkeys(clues))
+
     def enrich(self,family,auxiliary_candidates=()):
-        started=time.monotonic(); ordered_addresses=_ordered_addresses(family); addresses=set(ordered_addresses); evidence=[]; hits=[]
-        # Search creator first, then up to two member addresses. Exact-address query
-        # is primary; a second chain-context query catches results whose index omitted
-        # the word "official". This fixes the old single-query blind spot.
+        started=time.monotonic(); ordered_addresses=_ordered_addresses(family); addresses=set(ordered_addresses); evidence=[]; hits=[]; direct_clues=[]
+        # First ask sources that know the address directly. This avoids waiting for
+        # a public search engine to index a brand-new HyperEVM deployment.
         for address in ordered_addresses[:3]:
+            direct_hits,new_clues=self._direct_address_identity(address,started,evidence)
+            hits.extend(direct_hits); direct_clues.extend(new_clues)
             hits.extend(self._search(f'"{address}"',started,evidence))
             hits.extend(self._search(f'"{address}" HyperEVM OR Hyperliquid',started,evidence))
             hits.extend(self._search(f'site:x.com "{address}"',started,evidence))
             hits.extend(self._search(f'"{address}" (docs OR documentation OR contracts)',started,evidence))
         text_clues=[]
+        for x in direct_clues:
+            x=str(x or "").strip()
+            if len(x)>=3 and x.lower() not in {y.lower() for y in text_clues}: text_clues.append(x)
         for x in [family.get("brand_hint"),*(family.get("token_names") or []),*(family.get("token_symbols") or [])]:
             x=str(x or "").strip()
             if len(x)>=3 and x.lower() not in {y.lower() for y in text_clues}: text_clues.append(x)
-        for clue in text_clues[:2]:
+        for clue in text_clues[:4]:
             hits.extend(self._search(f'"{clue}" HyperEVM',started,evidence))
+            hits.extend(self._search(f'"{clue}" HyperEVM (official OR app OR protocol)',started,evidence))
             hits.extend(self._search(f'site:x.com "{clue}" HyperEVM',started,evidence))
             hits.extend(self._search(f'"{clue}" docs HyperEVM',started,evidence))
         for item in auxiliary_candidates:
