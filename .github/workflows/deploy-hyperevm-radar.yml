@@ -64,6 +64,7 @@ jobs:
 
           rsync -az --delete \
             --exclude='.env' \
+            --exclude='.venv/' \
             --exclude='data/' \
             --exclude='radar.db*' \
             --exclude='addresses.json' \
@@ -86,7 +87,17 @@ jobs:
             "$SERVER_USER@$SERVER_HOST" '
             set -e
             sudo systemctl restart hyperevm-radar.service
-            sudo systemctl is-active hyperevm-radar.service
-            sudo systemctl status hyperevm-radar.service --no-pager
+
+            service_active=false
+            for attempt in $(seq 1 10); do
+              if sudo systemctl is-active --quiet hyperevm-radar.service; then
+                service_active=true
+                break
+              fi
+              sleep 3
+            done
+
+            sudo systemctl status hyperevm-radar.service --no-pager || true
             sudo journalctl -u hyperevm-radar.service -n 20 --no-pager
+            test "$service_active" = true
           '
