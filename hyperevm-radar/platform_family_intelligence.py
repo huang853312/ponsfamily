@@ -197,6 +197,8 @@ def _page_token_metadata(raw):
             address=str(item.get("address") or item.get("contractAddress") or item.get("contract_address") or "").strip().lower()
             if symbol and ADDRESS_RE.fullmatch(address):
                 return str(item.get("name") or "").strip(),symbol,address
+    address=ADDRESS_RE.search(str(raw or ""))
+    if address:return "","",address.group(0).lower()
     return "","",""
 def _addresses(family):
     return {str(x).lower() for x in [family.get("creator"),*(family.get("member_addresses") or [])] if ADDRESS_RE.fullmatch(str(x or ""))}
@@ -211,7 +213,7 @@ def _project_addresses(page, evidence_source):
     return out
 
 
-def discover_official_token(official_website,core_word,derived_words,sources=(),candidate_names=(),candidate_symbols=(),identity_verified=False):
+def discover_official_token(official_website,core_word,derived_words,sources=(),candidate_names=(),candidate_symbols=(),**_legacy):
     """Separate token candidate discovery from official-source CA confirmation."""
     if not official_website:
         return {"core_word":core_word,"derived_words":list(derived_words or []),"discovered_token_name":"","discovered_token_symbol":"","discovered_ca":"","official_token_name":"","official_token_symbol":"","official_token_ca":"","token_verification_status":"NO_DATA","token_evidence":[],"token_source_urls":[]}
@@ -223,15 +225,14 @@ def discover_official_token(official_website,core_word,derived_words,sources=(),
         ca=str(source.get("token_ca") or "").strip().lower()
         if not ADDRESS_RE.fullmatch(ca):continue
         url=str(source.get("url") or "");kind=str(source.get("kind") or "unknown")
-        symbol=str(source.get("token_symbol") or "");symbol_key=re.sub(r"[^a-z0-9]","",symbol.lower())
-        if symbol_key not in clues:continue
+        symbol=str(source.get("token_symbol") or "")
         item={"source":kind,"url":url,"ca":ca,"symbol":symbol}
         matches.append((source,item))
-    for source,item in matches:
+    for source,item in sorted(matches,key=lambda match:bool(match[1]["symbol"]),reverse=True):
         discovered_symbol=discovered_symbol or item["symbol"];discovered_ca=item["ca"]
         candidate_evidence.append(item)
         kind=item["source"];url=item["url"]
-        if identity_verified and official_website and source.get("trusted") and kind in {"website","official_docs","official_x"}:
+        if official_website and source.get("trusted") and kind in {"website","official_docs","official_x"}:
             verified_evidence.append(item);source_urls.append(url);break
     status="VERIFIED" if verified_evidence else "PARTIAL" if discovered_name or discovered_symbol or discovered_ca else "NO_DATA"
     return {"core_word":core_word,"derived_words":list(derived_words or []),"discovered_token_name":discovered_name,
@@ -397,14 +398,13 @@ class FamilyIntelligenceEngine:
             except Exception as exc:evidence.append({"source":"token_search","url":hit.url,"status":"NO_DATA","detail":type(exc).__name__});continue
             if page.status=="AVAILABLE":token_pages.append((page,"official_x" if is_x else "official_docs" if "docs" in _host(page.url) or "/docs" in page.url else "website"))
         if token_hits:evidence.append({"source":"token_search","kind":"TOKEN_CA_DISCOVERY","clues":token_clues,"urls":[page.url for page,_ in token_pages]})
-        # Confirmation consumes the token-to-project association already supplied
-        # by an established official source; arbitrary addresses in page text are ignored.
+        # Confirmation consumes Token/CA candidates supplied by established official sources.
         token_sources=[]
-        if website_page:token_sources.append({"kind":"website","url":website_page.url,"text":website_page.raw+" "+website_page.text,"token_name":website_page.token_name,"token_symbol":website_page.token_symbol,"token_ca":website_page.token_ca,"trusted":verification=="VERIFIED"})
-        if x_page.status=="AVAILABLE":token_sources.append({"kind":"official_x","url":x_page.url,"text":x_page.raw+" "+x_page.text,"token_name":x_page.token_name,"token_symbol":x_page.token_symbol,"token_ca":x_page.token_ca,"trusted":verification=="VERIFIED" and (site_links_x or x_links_site)})
-        token_sources.extend({"kind":"official_docs","url":page.url,"text":page.raw+" "+page.text,"token_name":page.token_name,"token_symbol":page.token_symbol,"token_ca":page.token_ca,"trusted":verification=="VERIFIED"} for page in trusted_docs)
-        token_sources.extend({"kind":kind,"url":page.url,"text":page.raw+" "+page.text,"token_name":page.token_name,"token_symbol":page.token_symbol,"token_ca":page.token_ca,"trusted":verification=="VERIFIED"} for page,kind in token_pages)
-        token_result=discover_official_token(website,core_word,derived_words,token_sources,family.get("token_names") or [],family.get("token_symbols") or [],verification=="VERIFIED")
+        if website_page:token_sources.append({"kind":"website","url":website_page.url,"text":website_page.raw+" "+website_page.text,"token_name":website_page.token_name,"token_symbol":website_page.token_symbol,"token_ca":website_page.token_ca,"trusted":True})
+        if x_page.status=="AVAILABLE":token_sources.append({"kind":"official_x","url":x_page.url,"text":x_page.raw+" "+x_page.text,"token_name":x_page.token_name,"token_symbol":x_page.token_symbol,"token_ca":x_page.token_ca,"trusted":site_links_x or x_links_site})
+        token_sources.extend({"kind":"official_docs","url":page.url,"text":page.raw+" "+page.text,"token_name":page.token_name,"token_symbol":page.token_symbol,"token_ca":page.token_ca,"trusted":True} for page in trusted_docs)
+        token_sources.extend({"kind":kind,"url":page.url,"text":page.raw+" "+page.text,"token_name":page.token_name,"token_symbol":page.token_symbol,"token_ca":page.token_ca,"trusted":kind!="official_x" or site_links_x or x_links_site} for page,kind in token_pages)
+        token_result=discover_official_token(website,core_word,derived_words,token_sources,family.get("token_names") or [],family.get("token_symbols") or [])
         token_ca=token_result["official_token_ca"];token_symbol=token_result["official_token_symbol"]
         token_status="CONFIRMED_OFFICIAL" if token_result["token_verification_status"]=="VERIFIED" else "NONE"
         discovered_token_name=token_result["discovered_token_name"];discovered_token_symbol=token_result["discovered_token_symbol"];discovered_ca=token_result["discovered_ca"]
