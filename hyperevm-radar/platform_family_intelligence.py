@@ -549,6 +549,36 @@ class FamilyIntelligenceEngine:
         if github: evidence.append({"source":"cross_links","kind":"GITHUB","urls":github})
 
         token_pages=[]; token_hits=[]; token_clues=list(dict.fromkeys(x for x in (core_word,*derived_words) if x)); token_targets=[f"site:{root_domain}"] if root_domain else []
+        chain_token_candidates=[]
+        # Search DEX Screener by the full project core word and 3/4/5 derivatives.
+        # Results are filtered back to HyperEVM and scored only as discovery candidates.
+        # This lets a platform token be noticed before its CA is indexed by web search.
+        for clue in token_clues:
+            if time.monotonic()-started>=self.total_timeout: break
+            try:
+                response=requests.get(
+                    "https://api.dexscreener.com/latest/dex/search",
+                    params={"q": clue}, timeout=self.request_timeout,
+                    headers={"Accept":"application/json","User-Agent":"HyperEVM-Radar/3.2"},
+                )
+                response.raise_for_status(); rows=(response.json() or {}).get("pairs") or []
+                found=0
+                for row in rows[:30]:
+                    if str(row.get("chainId") or "").lower() not in {"hyperevm","hyperliquid"}: continue
+                    for side in ("baseToken","quoteToken"):
+                        token=row.get(side) or {}; ca=str(token.get("address") or "").strip().lower()
+                        name=str(token.get("name") or "").strip(); symbol=str(token.get("symbol") or "").strip()
+                        if not ADDRESS_RE.fullmatch(ca): continue
+                        words=_identity_words(name,symbol)
+                        normalized_symbol=re.sub(r"[^a-z0-9]","",symbol.lower())
+                        if clue.lower() not in words and normalized_symbol!=clue.lower() and clue.lower() not in re.sub(r"[^a-z0-9]","",name.lower()): continue
+                        item={"kind":"chain_dex_candidate","url":str(row.get("url") or ""),"token_name":name,"token_symbol":symbol,"token_ca":ca,"trusted":False,"clue":clue,"pair_address":str(row.get("pairAddress") or "")}
+                        key=(ca,symbol.lower())
+                        if key not in {(x["token_ca"],x["token_symbol"].lower()) for x in chain_token_candidates}:
+                            chain_token_candidates.append(item); found+=1
+                evidence.append({"source":"dexscreener_token_search","query":clue,"status":"HITS" if found else "NO_DATA","hits":found})
+            except Exception as exc:
+                evidence.append({"source":"dexscreener_token_search","query":clue,"status":"NO_DATA","detail":type(exc).__name__})
         if x_url: token_targets.append(f"site:x.com/{urlparse(x_url).path.strip('/').split('/')[0]}")
         for clue in token_clues:
             for target in token_targets:
@@ -561,12 +591,14 @@ class FamilyIntelligenceEngine:
             except Exception: continue
             if page.status=="AVAILABLE": token_pages.append((page,"official_x" if is_x else "official_docs" if "docs" in _host(page.url) or "/docs" in page.url else "website"))
 
-        token_sources=[]
+        token_sources=list(chain_token_candidates)
         if website_page: token_sources.append({"kind":"website","url":website_page.url,"token_name":website_page.token_name,"token_symbol":website_page.token_symbol,"token_ca":website_page.token_ca,"trusted":True})
         if x_page.status=="AVAILABLE": token_sources.append({"kind":"official_x","url":x_page.url,"token_name":x_page.token_name,"token_symbol":x_page.token_symbol,"token_ca":x_page.token_ca,"trusted":site_links_x or x_links_site})
         token_sources.extend({"kind":"official_docs","url":p.url,"token_name":p.token_name,"token_symbol":p.token_symbol,"token_ca":p.token_ca,"trusted":True} for p in trusted_docs)
         token_sources.extend({"kind":kind,"url":p.url,"token_name":p.token_name,"token_symbol":p.token_symbol,"token_ca":p.token_ca,"trusted":kind!="official_x" or site_links_x or x_links_site} for p,kind in token_pages)
-        token_result=discover_official_token(website,core_word,derived_words,token_sources,family.get("token_names") or [],family.get("token_symbols") or [])
+        dex_names=[x.get("token_name") for x in chain_token_candidates if x.get("token_name")]
+        dex_symbols=[x.get("token_symbol") for x in chain_token_candidates if x.get("token_symbol")]
+        token_result=discover_official_token(website,core_word,derived_words,token_sources,[*(family.get("token_names") or []),*dex_names],[*(family.get("token_symbols") or []),*dex_symbols])
         token_ca=token_result["official_token_ca"]; token_symbol=token_result["official_token_symbol"]; token_status="CONFIRMED_OFFICIAL" if token_result["token_verification_status"]=="VERIFIED" else "NONE"
         token_evidence_source=token_result["token_evidence"][0]["source"] if token_result["token_evidence"] else ""
         evidence.extend({**item,"kind":"OFFICIAL_TOKEN_CA" if token_status=="CONFIRMED_OFFICIAL" else "TOKEN_CANDIDATE"} for item in token_result["token_evidence"])
