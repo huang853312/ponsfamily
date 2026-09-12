@@ -12,65 +12,62 @@ def replace_once(old: str, new: str, label: str) -> None:
     text = text.replace(old, new, 1)
 
 
-# Strengthen the two weak links without changing verification semantics:
-# address -> website and address -> official X.
-# DEX Screener is used only as candidate-discovery metadata; explorer contract
-# names are only extra search clues. Neither source can make a project VERIFIED.
+# Strengthen platform-token discovery while preserving the hard rule:
+# chain/DEX evidence may create TOKEN_CANDIDATE only; only website/Docs/official X
+# can produce CONFIRMED_OFFICIAL.
+anchor = '''        token_pages=[]; token_hits=[]; token_clues=list(dict.fromkeys(x for x in (core_word,*derived_words) if x)); token_targets=[f"site:{root_domain}"] if root_domain else []
+'''
+addition = '''        token_pages=[]; token_hits=[]; token_clues=list(dict.fromkeys(x for x in (core_word,*derived_words) if x)); token_targets=[f"site:{root_domain}"] if root_domain else []
+        chain_token_candidates=[]
+        # Search DEX Screener by the full project core word and 3/4/5 derivatives.
+        # Results are filtered back to HyperEVM and scored only as discovery candidates.
+        # This lets a platform token be noticed before its CA is indexed by web search.
+        for clue in token_clues:
+            if time.monotonic()-started>=self.total_timeout: break
+            try:
+                response=requests.get(
+                    "https://api.dexscreener.com/latest/dex/search",
+                    params={"q": clue}, timeout=self.request_timeout,
+                    headers={"Accept":"application/json","User-Agent":"HyperEVM-Radar/3.2"},
+                )
+                response.raise_for_status(); rows=(response.json() or {}).get("pairs") or []
+                found=0
+                for row in rows[:30]:
+                    if str(row.get("chainId") or "").lower() not in {"hyperevm","hyperliquid"}: continue
+                    for side in ("baseToken","quoteToken"):
+                        token=row.get(side) or {}; ca=str(token.get("address") or "").strip().lower()
+                        name=str(token.get("name") or "").strip(); symbol=str(token.get("symbol") or "").strip()
+                        if not ADDRESS_RE.fullmatch(ca): continue
+                        words=_identity_words(name,symbol)
+                        normalized_symbol=re.sub(r"[^a-z0-9]","",symbol.lower())
+                        if clue.lower() not in words and normalized_symbol!=clue.lower() and clue.lower() not in re.sub(r"[^a-z0-9]","",name.lower()): continue
+                        item={"kind":"chain_dex_candidate","url":str(row.get("url") or ""),"token_name":name,"token_symbol":symbol,"token_ca":ca,"trusted":False,"clue":clue,"pair_address":str(row.get("pairAddress") or "")}
+                        key=(ca,symbol.lower())
+                        if key not in {(x["token_ca"],x["token_symbol"].lower()) for x in chain_token_candidates}:
+                            chain_token_candidates.append(item); found+=1
+                evidence.append({"source":"dexscreener_token_search","query":clue,"status":"HITS" if found else "NO_DATA","hits":found})
+            except Exception as exc:
+                evidence.append({"source":"dexscreener_token_search","query":clue,"status":"NO_DATA","detail":type(exc).__name__})
+'''
+replace_once(anchor, addition, "dex platform token candidates")
 
-anchor = '''    def _search(self, query, started, evidence):
-        if time.monotonic()-started>=self.total_timeout: return []
-        try:
-            rows=self.search.search(query,self.request_timeout)
-            evidence.append({"source":"search","query":query[:180],"status":"HITS" if rows else "NO_DATA","hits":len(rows)})
-            return rows
-        except Exception as exc:
-            evidence.append({"source":"search","query":query[:180],"status":"NO_DATA","detail":type(exc).__name__}); return []
+old = '''        token_sources=[]
+        if website_page: token_sources.append({"kind":"website","url":website_page.url,"token_name":website_page.token_name,"token_symbol":website_page.token_symbol,"token_ca":website_page.token_ca,"trusted":True})
 '''
-addition = anchor + '''\n    def _direct_address_identity(self, address, started, evidence):\n        """Return non-search-engine website/X candidates and contract-name clues."""\n        hits=[]; clues=[]\n        if time.monotonic()-started>=self.total_timeout: return hits,clues\n        # DEX Screener exposes website/social metadata attached to a token/pair.\n        # Treat it as discovery evidence only; normal cross-verification still applies.\n        try:\n            response=requests.get(\n                f"https://api.dexscreener.com/token-pairs/v1/hyperevm/{address}",\n                timeout=self.request_timeout,\n                headers={"Accept":"application/json","User-Agent":"HyperEVM-Radar/3.1"},\n            )\n            response.raise_for_status(); rows=response.json()\n            if not isinstance(rows,list): rows=[]\n            for row in rows[:8]:\n                info=row.get("info") or {}\n                for item in info.get("websites") or []:\n                    url=str((item or {}).get("url") or "").strip()\n                    if url.startswith(("http://","https://")):\n                        hits.append(SearchHit(url,source="DEXSCREENER_ADDRESS_METADATA"))\n                for item in info.get("socials") or []:\n                    item=item or {}; platform=str(item.get("platform") or "").lower(); handle=str(item.get("handle") or item.get("url") or "").strip()\n                    if platform in {"twitter","x"} and handle:\n                        if handle.startswith(("http://","https://")): url=handle\n                        else: url="https://x.com/"+handle.lstrip("@/")\n                        hits.append(SearchHit(url,source="DEXSCREENER_ADDRESS_METADATA"))\n                for side in ("baseToken","quoteToken"):\n                    token=row.get(side) or {}\n                    if str(token.get("address") or "").lower()==address.lower():\n                        for value in (token.get("name"),token.get("symbol")):\n                            value=str(value or "").strip()\n                            if len(value)>=3 and value.lower() not in {"token","unknown"}: clues.append(value)\n            evidence.append({"source":"dexscreener_address_metadata","address":address,"status":"HITS" if hits else "NO_DATA","hits":len(hits)})\n        except Exception as exc:\n            evidence.append({"source":"dexscreener_address_metadata","address":address,"status":"NO_DATA","detail":type(exc).__name__})\n\n        # Explorer pages are available immediately after deployment even when web\n        # search has not indexed the address. A verified contract name becomes a\n        # search clue, never an identity assertion.\n        if time.monotonic()-started<self.total_timeout:\n            try:\n                page=self.pages.fetch(f"https://hyperevmscan.io/address/{address}",self.request_timeout)\n                blob=" ".join((page.title,page.description,page.text[:12000])) if page.status=="AVAILABLE" else ""\n                match=re.search(r"Contract Name\\s+([A-Za-z][A-Za-z0-9_.$-]{2,80})",blob,re.I)\n                name=match.group(1).strip() if match else ""\n                generic=("proxy","erc20","token","contract","transparentupgradeableproxy","beaconproxy")\n                if name and name.lower() not in generic and not name.lower().endswith("proxy"):\n                    clues.append(name)\n                evidence.append({"source":"hyperevmscan_address","address":address,"status":page.status,"contract_name":name[:100]})\n            except Exception as exc:\n                evidence.append({"source":"hyperevmscan_address","address":address,"status":"NO_DATA","detail":type(exc).__name__})\n        return hits,list(dict.fromkeys(clues))\n'''
-replace_once(anchor, addition, "direct address identity helper")
+new = '''        token_sources=list(chain_token_candidates)
+        if website_page: token_sources.append({"kind":"website","url":website_page.url,"token_name":website_page.token_name,"token_symbol":website_page.token_symbol,"token_ca":website_page.token_ca,"trusted":True})
+'''
+replace_once(old, new, "feed chain candidates into token discovery")
 
-old = '''        started=time.monotonic(); ordered_addresses=_ordered_addresses(family); addresses=set(ordered_addresses); evidence=[]; hits=[]
-        # Search creator first, then up to two member addresses. Exact-address query
-        # is primary; a second chain-context query catches results whose index omitted
-        # the word "official". This fixes the old single-query blind spot.
-        for address in ordered_addresses[:3]:
-            hits.extend(self._search(f'"{address}"',started,evidence))
-            hits.extend(self._search(f'"{address}" HyperEVM OR Hyperliquid',started,evidence))
-            hits.extend(self._search(f'site:x.com "{address}"',started,evidence))
-            hits.extend(self._search(f'"{address}" (docs OR documentation OR contracts)',started,evidence))
-        text_clues=[]
+# Preserve candidate name/symbol from DEX metadata even when the family did not
+# already know it. Official fields remain empty until a trusted source confirms CA.
+old = '''        token_result=discover_official_token(website,core_word,derived_words,token_sources,family.get("token_names") or [],family.get("token_symbols") or [])
 '''
-new = '''        started=time.monotonic(); ordered_addresses=_ordered_addresses(family); addresses=set(ordered_addresses); evidence=[]; hits=[]; direct_clues=[]
-        # First ask sources that know the address directly. This avoids waiting for
-        # a public search engine to index a brand-new HyperEVM deployment.
-        for address in ordered_addresses[:3]:
-            direct_hits,new_clues=self._direct_address_identity(address,started,evidence)
-            hits.extend(direct_hits); direct_clues.extend(new_clues)
-            hits.extend(self._search(f'"{address}"',started,evidence))
-            hits.extend(self._search(f'"{address}" HyperEVM OR Hyperliquid',started,evidence))
-            hits.extend(self._search(f'site:x.com "{address}"',started,evidence))
-            hits.extend(self._search(f'"{address}" (docs OR documentation OR contracts)',started,evidence))
-        text_clues=[]
-        for x in direct_clues:
-            x=str(x or "").strip()
-            if len(x)>=3 and x.lower() not in {y.lower() for y in text_clues}: text_clues.append(x)
+new = '''        dex_names=[x.get("token_name") for x in chain_token_candidates if x.get("token_name")]
+        dex_symbols=[x.get("token_symbol") for x in chain_token_candidates if x.get("token_symbol")]
+        token_result=discover_official_token(website,core_word,derived_words,token_sources,[*(family.get("token_names") or []),*dex_names],[*(family.get("token_symbols") or []),*dex_symbols])
 '''
-replace_once(old, new, "direct address discovery integration")
-
-# Search direct metadata/explorer names before weaker family hints, and add a
-# website-oriented query so a contract name can resolve straight to a homepage.
-old = '''        for clue in text_clues[:2]:
-            hits.extend(self._search(f'"{clue}" HyperEVM',started,evidence))
-            hits.extend(self._search(f'site:x.com "{clue}" HyperEVM',started,evidence))
-            hits.extend(self._search(f'"{clue}" docs HyperEVM',started,evidence))
-'''
-new = '''        for clue in text_clues[:4]:
-            hits.extend(self._search(f'"{clue}" HyperEVM',started,evidence))
-            hits.extend(self._search(f'"{clue}" HyperEVM (official OR app OR protocol)',started,evidence))
-            hits.extend(self._search(f'site:x.com "{clue}" HyperEVM',started,evidence))
-            hits.extend(self._search(f'"{clue}" docs HyperEVM',started,evidence))
-'''
-replace_once(old, new, "expanded direct clue search")
+replace_once(old, new, "include DEX token names and symbols")
 
 PATH.write_text(text, encoding="utf-8")
 print("patched", PATH)
