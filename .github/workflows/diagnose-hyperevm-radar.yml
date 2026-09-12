@@ -1,0 +1,76 @@
+name: Diagnose HyperEVM Radar
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/diagnose-hyperevm-radar.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Configure SSH
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          touch ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Read-only HyperEVM diagnostics
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -p "$SERVER_PORT" \
+            -o UserKnownHostsFile=~/.ssh/known_hosts \
+            -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 \
+            "$SERVER_USER@$SERVER_HOST" '
+              set -u
+              echo "=== SERVICE ==="
+              sudo systemctl is-active hyperevm-radar.service || true
+              sudo systemctl show hyperevm-radar.service -p ExecStart -p WorkingDirectory -p EnvironmentFiles --no-pager || true
+
+              echo "=== ENV FILE PRESENCE ==="
+              if sudo test -f /opt/hyperevm-radar/.env; then echo "ENV_FILE=PRESENT"; else echo "ENV_FILE=MISSING"; fi
+              if sudo grep -q "^TELEGRAM_BOT_TOKEN=." /opt/hyperevm-radar/.env 2>/dev/null; then echo "TELEGRAM_BOT_TOKEN=PRESENT"; else echo "TELEGRAM_BOT_TOKEN=MISSING"; fi
+              if sudo grep -q "^TELEGRAM_CHAT_ID=." /opt/hyperevm-radar/.env 2>/dev/null; then echo "TELEGRAM_CHAT_ID=PRESENT"; else echo "TELEGRAM_CHAT_ID=MISSING"; fi
+
+              echo "=== PROCESS ENV NAMES ==="
+              PID=$(sudo systemctl show -p MainPID --value hyperevm-radar.service)
+              if [ "$PID" != "0" ] && sudo test -r "/proc/$PID/environ"; then
+                if sudo tr "\0" "\n" < "/proc/$PID/environ" 2>/dev/null | grep -q "^TELEGRAM_BOT_TOKEN=."; then echo "PROCESS_TELEGRAM_BOT_TOKEN=PRESENT"; else echo "PROCESS_TELEGRAM_BOT_TOKEN=MISSING"; fi
+                if sudo tr "\0" "\n" < "/proc/$PID/environ" 2>/dev/null | grep -q "^TELEGRAM_CHAT_ID=."; then echo "PROCESS_TELEGRAM_CHAT_ID=PRESENT"; else echo "PROCESS_TELEGRAM_CHAT_ID=MISSING"; fi
+              else
+                echo "PROCESS_ENV=UNREADABLE"
+              fi
+
+              echo "=== RECENT RADAR LOGS ==="
+              sudo journalctl -u hyperevm-radar.service --since "45 minutes ago" --no-pager | grep -E "Platform candidate|Platform cluster candidate|Platform identity refresh|Platform identity confirmed|Telegram|contract error|B-level" | tail -n 120 || true
+
+              echo "=== DB COUNTS ==="
+              /opt/hyperevm-radar/.venv/bin/python - <<"PY"
+import sqlite3
+p="/opt/hyperevm-radar/radar.db"
+try:
+    c=sqlite3.connect(p)
+    names={r[0] for r in c.execute("select name from sqlite_master where type='table'")}
+    for t in ["contracts","platform_candidates","platform_families","platform_family_intelligence","platform_identity_investigations"]:
+        if t in names:
+            print(f"{t}={c.execute('select count(*) from '+t).fetchone()[0]}")
+        else:
+            print(f"{t}=NO_TABLE")
+except Exception as e:
+    print("DB_ERROR", type(e).__name__, str(e))
+PY
+            '
