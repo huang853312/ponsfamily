@@ -1,26 +1,70 @@
+import asyncio
 import os
+
 import aiohttp
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_MAX_ATTEMPTS = 3
+TELEGRAM_RETRY_BASE_SECONDS = 1.0
+
+
+class TelegramDeliveryError(RuntimeError):
+    """Raised when a Telegram alert could not be delivered."""
+
 
 async def send_telegram(text: str):
+    """Send one Telegram message and fail loudly after bounded retries.
+
+    The caller already catches exceptions and writes them to service logs, so this
+    function must never return a silent False for configuration/API failures.
+    """
     if not BOT_TOKEN or not CHAT_ID:
-        return False
+        raise TelegramDeliveryError(
+            "Telegram configuration missing: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID"
+        )
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+
+    last_error = "unknown Telegram delivery failure"
 
     async with aiohttp.ClientSession() as session:
-        async with session.post(
-            url,
-            json={
-                "chat_id": CHAT_ID,
-                "text": text,
-                "disable_web_page_preview": True
-            },
-            timeout=10,
-        ) as resp:
-            return resp.status == 200
+        for attempt in range(1, TELEGRAM_MAX_ATTEMPTS + 1):
+            try:
+                async with session.post(
+                    url,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    body = (await resp.text())[:500]
+                    if resp.status == 200:
+                        return True
+
+                    last_error = (
+                        f"Telegram API HTTP {resp.status} on attempt "
+                        f"{attempt}/{TELEGRAM_MAX_ATTEMPTS}: {body}"
+                    )
+
+                    # Do not retry permanent client/configuration failures.
+                    if 400 <= resp.status < 500 and resp.status != 429:
+                        break
+
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                last_error = (
+                    f"Telegram transport failure on attempt "
+                    f"{attempt}/{TELEGRAM_MAX_ATTEMPTS}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+            if attempt < TELEGRAM_MAX_ATTEMPTS:
+                await asyncio.sleep(TELEGRAM_RETRY_BASE_SECONDS * (2 ** (attempt - 1)))
+
+    raise TelegramDeliveryError(last_error)
 
 
 def format_family_intelligence_message(result, family):
