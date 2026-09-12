@@ -39,17 +39,25 @@ jobs:
               set -u
               echo "=== SERVICE ==="
               sudo systemctl is-active hyperevm-radar.service || true
-              sudo systemctl show hyperevm-radar.service -p ExecStart -p WorkingDirectory -p EnvironmentFiles --no-pager || true
-
-              echo "=== TELEGRAM ENV ==="
               PID=$(sudo systemctl show -p MainPID --value hyperevm-radar.service)
-              if sudo sh -c "tr '\''\\0'\'' '\''\\n'\'' < /proc/$PID/environ | grep -q '\''^TELEGRAM_BOT_TOKEN=.'\''"; then echo "PROCESS_TELEGRAM_BOT_TOKEN=PRESENT"; else echo "PROCESS_TELEGRAM_BOT_TOKEN=MISSING"; fi
-              if sudo sh -c "tr '\''\\0'\'' '\''\\n'\'' < /proc/$PID/environ | grep -q '\''^TELEGRAM_CHAT_ID=.'\''"; then echo "PROCESS_TELEGRAM_CHAT_ID=PRESENT"; else echo "PROCESS_TELEGRAM_CHAT_ID=MISSING"; fi
 
-              echo "=== RECENT RADAR LOGS ==="
-              sudo journalctl -u hyperevm-radar.service --since "60 minutes ago" --no-pager | grep -E "Platform candidate|Platform cluster candidate|Platform identity refresh|Platform identity confirmed|Telegram|contract error|B-level" | tail -n 160 || true
+              echo "=== PROCESS ENV NAMES ==="
+              for K in TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID HYPEREVM_SEARCH_API_URL HYPEREVM_SEARCH_API_KEY; do
+                if sudo sh -c "tr '\''\\0'\'' '\''\\n'\'' < /proc/$PID/environ | grep -q \"^$K=.\""; then echo "$K=PRESENT"; else echo "$K=MISSING"; fi
+              done
 
-              echo "=== DB SUMMARY ==="
+              echo "=== SEARCH PROVIDER TEST ==="
               cd /opt/hyperevm-radar
-              /opt/hyperevm-radar/.venv/bin/python -c "import sqlite3,json; c=sqlite3.connect('\''data/radar.db'\''); names={r[0] for r in c.execute('\''select name from sqlite_master where type=\"table\"'\'')}; tables=['\''contracts'\'','\''platform_candidates'\'','\''platform_families'\'','\''platform_family_intelligence'\'','\''platform_identity_investigations'\'']; [print(t+'\''='\''+(str(c.execute('\''select count(*) from '\''+t).fetchone()[0]) if t in names else '\''NO_TABLE'\'')) for t in tables]; print('\''INVESTIGATION_STATUS'\'', c.execute('\''select verification_status,count(*) from platform_identity_investigations group by verification_status'\'').fetchall()); rows=c.execute('\''select subject_key,verification_status,result from platform_identity_investigations order by updated_at desc limit 12'\'').fetchall(); [print('\''INV'\'',r[0],r[1],{k:v for k,v in json.loads(r[2]).items() if k in ('\''project_name'\'','\''official_website'\'','\''official_x'\'','\''verification_method'\'','\''confidence'\'','\''core_word'\'','\''derived_words'\'','\''token_status'\'')}) for r in rows]" || true
+              /opt/hyperevm-radar/.venv/bin/python -c "from platform_family_intelligence import ConfiguredJsonSearchProvider,DuckDuckGoSearchProvider,CompositeSearchProvider; q='\''\"0xb5055B2Be5F8005bdC5a236892b148d99b026dAa\" HyperEVM official'\''; a=ConfiguredJsonSearchProvider(); print('\''CONFIGURED_ENDPOINT'\'', '\''PRESENT'\'' if a.endpoint else '\''MISSING'\'');
+try:
+ h=DuckDuckGoSearchProvider().search(q,6); print('\''DDG_HITS'\'',len(h)); print('\''DDG_URLS'\'',[x.url for x in h[:5]])
+except Exception as e: print('\''DDG_ERROR'\'',type(e).__name__,str(e)[:160])
+try:
+ h=CompositeSearchProvider().search(q,6); print('\''COMPOSITE_HITS'\'',len(h)); print('\''COMPOSITE_URLS'\'',[x.url for x in h[:5]])
+except Exception as e: print('\''COMPOSITE_ERROR'\'',type(e).__name__,str(e)[:160])" || true
+
+              echo "=== PARTIAL EVIDENCE ==="
+              /opt/hyperevm-radar/.venv/bin/python -c "import sqlite3,json; c=sqlite3.connect('\''data/radar.db'\''); rows=c.execute('\''select subject_key,result from platform_identity_investigations where verification_status=\"PARTIAL\" order by updated_at desc limit 5'\'').fetchall();
+for k,s in rows:
+ r=json.loads(s); print('\''SUBJECT'\'',k); print('\''WEBSITE'\'',r.get('\''official_website'\'')); print('\''X'\'',r.get('\''official_x'\'')); print('\''EVIDENCE'\'',[(e.get('\''source'\''),e.get('\''kind'\''),e.get('\''status'\''),e.get('\''detail'\''),e.get('\''url'\'')) for e in r.get('\''evidence'\'',[])][-12:])" || true
             '
