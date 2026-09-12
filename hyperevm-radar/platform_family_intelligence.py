@@ -296,6 +296,20 @@ def _project_addresses(page, evidence_source):
         out.append({"address":match.group(0).lower(),"role":role,"source_url":page.url,"evidence_source":evidence_source})
     return out
 
+PARKED_PAGE_MARKERS = (
+    "domain for sale", "buy this domain", "this domain is for sale",
+    "afternic", "sedo domain parking", "hugedomains", "parkingcrew",
+)
+
+def _is_docs_url(url):
+    host=_host(url); path=(urlparse(url).path or "").lower()
+    return host.startswith("docs.") or "docs" in host.split(".") or path.startswith("/docs") or "/docs/" in path
+
+def _is_parked_page(page):
+    if not page or page.status!="AVAILABLE": return False
+    blob=" ".join((page.title,page.description,page.text[:5000])).lower()
+    return any(marker in blob for marker in PARKED_PAGE_MARKERS)
+
 def discover_official_token(official_website,core_word,derived_words,sources=(),candidate_names=(),candidate_symbols=(),**_legacy):
     if not official_website:
         return {"core_word":core_word,"derived_words":list(derived_words or []),"discovered_token_name":"","discovered_token_symbol":"","discovered_ca":"","official_token_name":"","official_token_symbol":"","official_token_ca":"","token_verification_status":"NO_DATA","token_evidence":[],"token_source_urls":[]}
@@ -337,6 +351,8 @@ class FamilyIntelligenceEngine:
         for address in ordered_addresses[:3]:
             hits.extend(self._search(f'"{address}"',started,evidence))
             hits.extend(self._search(f'"{address}" HyperEVM OR Hyperliquid',started,evidence))
+            hits.extend(self._search(f'site:x.com "{address}"',started,evidence))
+            hits.extend(self._search(f'"{address}" (docs OR documentation OR contracts)',started,evidence))
         text_clues=[]
         for x in [family.get("brand_hint"),*(family.get("token_names") or []),*(family.get("token_symbols") or [])]:
             x=str(x or "").strip()
@@ -356,22 +372,46 @@ class FamilyIntelligenceEngine:
                 if hit.url: found.setdefault(hit.url.split("#",1)[0],hit)
             return list(found.values())
 
-        unique=unique_hits(hits); x_urls=[]; web_hits=[]
+        unique=unique_hits(hits); x_urls=[]; docs_hits=[]; web_hits=[]
         excluded={"github.com","t.me","telegram.me","youtube.com","x.com","twitter.com","dexscreener.com","coingecko.com","coinmarketcap.com","defillama.com","debank.com","etherscan.io"}
         for hit in unique:
             match=X_RE.search(hit.url)
             if match:
                 x_urls.append(match.group(0)); evidence.append({"source":hit.source,"kind":"X_CANDIDATE","url":match.group(0),"title":hit.title[:160]})
+            elif _is_docs_url(hit.url):
+                docs_hits.append(hit); evidence.append({"source":hit.source,"kind":"DOCS_CANDIDATE","url":hit.url,"title":hit.title[:160]})
             elif _host(hit.url) not in excluded:
                 web_hits.append(hit)
 
-        website_page=None; website_candidate=web_hits[0].url if web_hits else ""
+        direct_docs_pages=[]
+        for hit in docs_hits[:4]:
+            if time.monotonic()-started>=self.total_timeout: break
+            try: page=self.pages.fetch(hit.url,self.request_timeout)
+            except Exception as exc:
+                evidence.append({"source":"direct_docs","url":hit.url,"status":"NO_DATA","detail":type(exc).__name__}); continue
+            if page.status!="AVAILABLE": continue
+            blob=(page.raw+" "+page.text).lower(); page.address_match=bool(addresses & {x.lower() for x in ADDRESS_RE.findall(blob)})
+            direct_docs_pages.append(page)
+            evidence.append({"source":"direct_docs","url":page.url,"status":"AVAILABLE","address_match":page.address_match})
+            for link in page.links:
+                match=X_RE.search(link)
+                if match:
+                    x_urls.append(match.group(0))
+                    evidence.append({"source":"direct_docs","kind":"X_CANDIDATE","url":match.group(0)})
+                    continue
+                if link.startswith(("http://","https://")) and _host(link) not in excluded and not _is_docs_url(link):
+                    web_hits.insert(0,SearchHit(link,source="DOCS_BACKLINK"))
+
+        website_page=None; website_candidate=""
         for hit in web_hits[:self.max_hits]:
             if time.monotonic()-started>=self.total_timeout: break
             try: page=self.pages.fetch(hit.url,self.request_timeout)
             except Exception as exc:
                 evidence.append({"source":"website","url":hit.url,"status":"NO_DATA","detail":type(exc).__name__}); continue
             if page.status!="AVAILABLE": continue
+            if _is_parked_page(page):
+                evidence.append({"source":"website","url":page.url,"status":"REJECTED_PARKED"}); continue
+            if not website_candidate: website_candidate=page.url
             page_blob=(page.raw+" "+page.text).lower(); page.address_match=bool(addresses & {x.lower() for x in ADDRESS_RE.findall(page_blob)})
             if page.address_match or any(X_RE.search(link) for link in page.links): website_page=page; break
             if website_page is None: website_page=page
@@ -416,8 +456,9 @@ class FamilyIntelligenceEngine:
         all_links=[hit.url for hit in unique]+(website_page.links if website_page else [])+(x_page.links if x_page.status=="AVAILABLE" else [])
         docs=list(dict.fromkeys(link for link in all_links if "docs" in _host(link) or "/docs" in link))
         github=list(dict.fromkeys(link for link in all_links if _host(link)=="github.com"))
-        trusted_docs=[]
+        trusted_docs=[page for page in direct_docs_pages if getattr(page,"address_match",False)]
         for link in docs[:4]:
+            if any(page.url==link for page in trusted_docs): continue
             linked_by_site=bool(website_page and link in website_page.links); same_root=bool(root_domain and domain_parts(link)[1]==root_domain)
             if not (linked_by_site or same_root): continue
             try: page=self.pages.fetch(link,self.request_timeout)
