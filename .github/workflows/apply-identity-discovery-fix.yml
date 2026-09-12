@@ -1,0 +1,43 @@
+name: Apply Identity Discovery Fix
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "hyperevm-radar/tools/apply_identity_discovery_fix.py"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply-fix:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply identity discovery patch
+        run: python3 hyperevm-radar/tools/apply_identity_discovery_fix.py
+
+      - name: Verify syntax and tests
+        run: |
+          python3 -m pip install --disable-pip-version-check aiohttp requests web3
+          cd hyperevm-radar
+          PYTHONPATH=. python3 -m unittest discover -s tests -v
+          python3 -m compileall -q .
+
+      - name: Commit patch
+        run: |
+          if git diff --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add hyperevm-radar/platform_family_intelligence.py
+          git commit -m "Improve parallel website X and docs identity discovery"
+          git push origin HEAD:main
