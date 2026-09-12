@@ -49,8 +49,8 @@ jobs:
               echo "=== PROCESS ENV NAMES ==="
               PID=$(sudo systemctl show -p MainPID --value hyperevm-radar.service)
               if [ "$PID" != "0" ] && sudo test -r "/proc/$PID/environ"; then
-                if sudo tr "\0" "\n" < "/proc/$PID/environ" 2>/dev/null | grep -q "^TELEGRAM_BOT_TOKEN=."; then echo "PROCESS_TELEGRAM_BOT_TOKEN=PRESENT"; else echo "PROCESS_TELEGRAM_BOT_TOKEN=MISSING"; fi
-                if sudo tr "\0" "\n" < "/proc/$PID/environ" 2>/dev/null | grep -q "^TELEGRAM_CHAT_ID=."; then echo "PROCESS_TELEGRAM_CHAT_ID=PRESENT"; else echo "PROCESS_TELEGRAM_CHAT_ID=MISSING"; fi
+                if sudo sh -c "tr '\''\\0'\'' '\''\\n'\'' < /proc/$PID/environ | grep -q '\''^TELEGRAM_BOT_TOKEN=.'\''"; then echo "PROCESS_TELEGRAM_BOT_TOKEN=PRESENT"; else echo "PROCESS_TELEGRAM_BOT_TOKEN=MISSING"; fi
+                if sudo sh -c "tr '\''\\0'\'' '\''\\n'\'' < /proc/$PID/environ | grep -q '\''^TELEGRAM_CHAT_ID=.'\''"; then echo "PROCESS_TELEGRAM_CHAT_ID=PRESENT"; else echo "PROCESS_TELEGRAM_CHAT_ID=MISSING"; fi
               else
                 echo "PROCESS_ENV=UNREADABLE"
               fi
@@ -59,18 +59,5 @@ jobs:
               sudo journalctl -u hyperevm-radar.service --since "45 minutes ago" --no-pager | grep -E "Platform candidate|Platform cluster candidate|Platform identity refresh|Platform identity confirmed|Telegram|contract error|B-level" | tail -n 120 || true
 
               echo "=== DB COUNTS ==="
-              /opt/hyperevm-radar/.venv/bin/python - <<"PY"
-import sqlite3
-p="/opt/hyperevm-radar/radar.db"
-try:
-    c=sqlite3.connect(p)
-    names={r[0] for r in c.execute("select name from sqlite_master where type='table'")}
-    for t in ["contracts","platform_candidates","platform_families","platform_family_intelligence","platform_identity_investigations"]:
-        if t in names:
-            print(f"{t}={c.execute('select count(*) from '+t).fetchone()[0]}")
-        else:
-            print(f"{t}=NO_TABLE")
-except Exception as e:
-    print("DB_ERROR", type(e).__name__, str(e))
-PY
+              /opt/hyperevm-radar/.venv/bin/python -c "import sqlite3; p='\''/opt/hyperevm-radar/radar.db'\''; c=sqlite3.connect(p); names={r[0] for r in c.execute('\''select name from sqlite_master where type=\"table\"'\'')}; tables=['\''contracts'\'','\''platform_candidates'\'','\''platform_families'\'','\''platform_family_intelligence'\'','\''platform_identity_investigations'\'']; [print(t+'\''='\''+(str(c.execute('\''select count(*) from '\''+t).fetchone()[0]) if t in names else '\''NO_TABLE'\'')) for t in tables]" || true
             '
