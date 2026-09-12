@@ -19,6 +19,18 @@ jobs:
           fetch-depth: 0
       - name: Apply docs identity discovery patch
         run: python3 hyperevm-radar/tools/apply_docs_identity_discovery_fix.py
+      - name: Preserve legacy docs query compatibility
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('hyperevm-radar/platform_family_intelligence.py')
+          s=p.read_text()
+          old='''        for address in ordered_addresses[:12]:\n            hits.extend(self._search(\n                f'"{address}" (docs OR documentation OR contracts OR deployments OR addresses OR HyperEVM)',\n                started,evidence,\n            ))\n            if time.monotonic()-started>=self.total_timeout: break\n'''
+          new='''        for address in ordered_addresses[:12]:\n            # Keep the original query shape for existing providers/tests, then add\n            # the broader deployment/address vocabulary for deeper Docs discovery.\n            hits.extend(self._search(f'"{address}" (docs OR documentation OR contracts)',started,evidence))\n            hits.extend(self._search(\n                f'"{address}" (deployments OR addresses OR HyperEVM OR Hyperliquid)',\n                started,evidence,\n            ))\n            if time.monotonic()-started>=self.total_timeout: break\n'''
+          if old not in s:
+              raise SystemExit('compatibility anchor not found')
+          p.write_text(s.replace(old,new,1))
+          PY
       - name: Verify radar
         run: |
           python3 -m pip install --disable-pip-version-check aiohttp requests web3
