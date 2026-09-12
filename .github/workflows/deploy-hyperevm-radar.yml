@@ -87,6 +87,12 @@ jobs:
             -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 \
             "$SERVER_USER@$SERVER_HOST" '
             set -e
+            # Logging-only runtime setting: force Python stdout/stderr to reach
+            # journald immediately. This does not change Radar discovery logic.
+            sudo mkdir -p /etc/systemd/system/hyperevm-radar.service.d
+            printf "%s\n" "[Service]" "Environment=PYTHONUNBUFFERED=1" | \
+              sudo tee /etc/systemd/system/hyperevm-radar.service.d/10-unbuffered-logs.conf >/dev/null
+            sudo systemctl daemon-reload
             sudo systemctl restart hyperevm-radar.service
 
             service_active=false
@@ -99,6 +105,7 @@ jobs:
             done
 
             sudo systemctl status hyperevm-radar.service --no-pager || true
-            sudo journalctl -u hyperevm-radar.service -n 20 --no-pager
+            sudo systemctl show hyperevm-radar.service -p Environment --no-pager | grep -F "PYTHONUNBUFFERED=1"
+            sudo journalctl -u hyperevm-radar.service -n 40 --no-pager
             test "$service_active" = true
           '
