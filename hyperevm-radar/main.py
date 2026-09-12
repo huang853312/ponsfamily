@@ -1,7 +1,7 @@
 import asyncio
 import time
 
-from database import DB_PATH, init_db, init_cluster_db, init_relation_db, init_platform_brand_db, init_platform_token_match_db, init_platform_candidate_db, init_platform_family_db, init_platform_family_intelligence_db, save_platform_family_intelligence, save_platform_identity_investigation, list_standalone_identity_seeds, seen, save_contract, add_cluster_member, recent_cluster, save_relation, get_relations_for_child, get_relations_for_parent, save_token_creator, find_confirmed_platform_matches, save_platform_token_match, save_platform_candidate, get_creator_deployment_cluster, list_new_platform_candidates, replace_platform_families, list_platform_families_for_identity, update_platform_family_identity
+from database import DB_PATH, init_db, init_cluster_db, init_relation_db, init_platform_brand_db, init_platform_token_match_db, init_platform_candidate_db, init_platform_family_db, init_platform_family_intelligence_db, save_platform_family_intelligence, save_platform_identity_investigation, list_standalone_identity_seeds, seen, save_contract, add_cluster_member, recent_cluster, save_relation, get_relations_for_child, get_relations_for_parent, save_token_creator, find_confirmed_platform_matches, save_platform_token_match, save_platform_candidate, get_creator_deployment_cluster, list_new_platform_candidates, replace_platform_families, update_platform_family_identity
 from detectors.fingerprint import fingerprint
 from detectors.hyperevm import extract_words, classify
 from detectors.token import detect_erc20
@@ -36,6 +36,41 @@ def refresh_platform_families():
 
 
 
+def list_platform_families_for_identity_fair(limit=100):
+    """Return unresolved families without starving newly discovered projects.
+
+    Priority order:
+    1. Families never investigated before, newest first.
+    2. Previously investigated unresolved families, least-recently checked first.
+
+    This keeps the batch limit while guaranteeing rotation instead of repeatedly
+    selecting the same oldest NEW families forever.
+    """
+    import sqlite3
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT f.*
+            FROM platform_families AS f
+            LEFT JOIN platform_identity_investigations AS i
+              ON i.subject_key = ('family:' || f.id)
+            WHERE f.status IN ('NEW', 'DISCOVERED', 'WEBSITE_PENDING', 'VERIFYING')
+            ORDER BY
+                CASE WHEN i.updated_at IS NULL THEN 0 ELSE 1 END ASC,
+                CASE WHEN i.updated_at IS NULL THEN f.last_block END DESC,
+                COALESCE(i.updated_at, 0) ASC,
+                f.id ASC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+
 def run_platform_identity_pipeline(
     *,
     limit=20,
@@ -60,7 +95,7 @@ def run_platform_identity_pipeline(
         promote_identity_to_brand,
     )
 
-    family_rows = list_platform_families_for_identity(
+    family_rows = list_platform_families_for_identity_fair(
         limit=limit
     )
     if standalone_seeds is None:
@@ -238,6 +273,7 @@ def run_platform_identity_pipeline(
 # - Never blocks the block-monitor event loop with requests.
 # - At most one Identity Pipeline run per cooldown window.
 # - Multiple candidate events during the window are coalesced.
+# - A periodic worker also drains unresolved work after restart or quiet periods.
 # =========================================================
 
 IDENTITY_REFRESH_COOLDOWN = 600
@@ -293,6 +329,19 @@ async def request_identity_refresh():
 
     finally:
         _identity_refresh_running = False
+
+
+async def identity_refresh_worker():
+    """Continuously drain unresolved Identity work, including after restarts."""
+    while True:
+        try:
+            await request_identity_refresh()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print("Platform identity worker failed:", repr(exc))
+
+        await asyncio.sleep(IDENTITY_REFRESH_COOLDOWN)
 
 
 async def handle_contract(monitor, event):
@@ -920,7 +969,15 @@ async def main():
 
     monitor.get_contract_creations = get_contract_creations_with_pools
 
-    await monitor.run(block_handler)
+    identity_task = asyncio.create_task(identity_refresh_worker())
+    try:
+        await monitor.run(block_handler)
+    finally:
+        identity_task.cancel()
+        try:
+            await identity_task
+        except asyncio.CancelledError:
+            pass
 
 
 if __name__ == "__main__":
