@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+*.before_*
+*.backup
+*.bak_*
+*.cleanbackup
+*.factory_fix_verified_*
