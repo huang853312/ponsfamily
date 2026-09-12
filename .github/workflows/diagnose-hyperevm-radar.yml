@@ -52,21 +52,11 @@ jobs:
                 echo "${K}=MISSING"
               fi
             done
-
             TOKEN=$(printf '%s\n' "$ENV_DATA" | sed -n 's/^TELEGRAM_BOT_TOKEN=//p' | head -n1)
             if [ -n "$TOKEN" ]; then
               HTTP=$(curl -sS -o /tmp/tg-getme.json -w '%{http_code}' --max-time 10 "https://api.telegram.org/bot${TOKEN}/getMe" || true)
               echo "TELEGRAM_GETME_HTTP=${HTTP}"
-              python3 - <<'PY' 2>/dev/null || true
-import json
-p='/tmp/tg-getme.json'
-try:
-    d=json.load(open(p))
-    print('TELEGRAM_GETME_OK=', d.get('ok'))
-    print('TELEGRAM_BOT_USERNAME=', (d.get('result') or {}).get('username'))
-except Exception as e:
-    print('TELEGRAM_GETME_PARSE_ERROR=', type(e).__name__)
-PY
+              grep -o '"ok":[^,}]*' /tmp/tg-getme.json | head -n1 || true
             fi
           else
             echo 'PROCESS_ENV=UNAVAILABLE'
@@ -80,17 +70,11 @@ PY
           pwd
           ls -l main.py platform_family_intelligence.py notifier.py 2>/dev/null || true
 
-          echo '=== DATABASE RECENCY ==='
-          python3 - <<'PY' 2>/dev/null || true
-import os, sqlite3
-p='/opt/hyperevm-radar/data/radar.db'
-print('DB_EXISTS=', os.path.exists(p))
-if os.path.exists(p):
-    c=sqlite3.connect(p)
-    tables={r[0] for r in c.execute("select name from sqlite_master where type='table'")}
-    print('HAS_IDENTITY_INVESTIGATIONS=', 'platform_identity_investigations' in tables)
-    if 'platform_identity_investigations' in tables:
-        rows=c.execute('select subject_key, verification_status, updated_at from platform_identity_investigations order by updated_at desc limit 10').fetchall()
-        print('RECENT_INVESTIGATIONS=', rows)
-PY
+          echo '=== DATABASE ==='
+          if [ -f /opt/hyperevm-radar/data/radar.db ]; then
+            echo 'DB_EXISTS=YES'
+            stat -c 'DB_MTIME=%y DB_SIZE=%s' /opt/hyperevm-radar/data/radar.db || true
+          else
+            echo 'DB_EXISTS=NO'
+          fi
           REMOTE
