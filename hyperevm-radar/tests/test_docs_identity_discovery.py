@@ -50,4 +50,5 @@ class DocsIdentityDiscoveryTests(unittest.TestCase):
         self.assertTrue(cross["family_address_in_docs"])
         self.assertFalse(cross["docs_crosslinked"])
 
+# Deployment-triggering test file: behavior above guards the strengthened Docs path.
 if __name__ == "__main__": unittest.main()
