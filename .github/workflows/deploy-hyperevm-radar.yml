@@ -41,6 +41,8 @@ jobs:
 
       - name: Configure SSH
         env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
           SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
         run: |
           install -d -m 700 ~/.ssh
