@@ -19,6 +19,8 @@ jobs:
           fetch-depth: 0
       - name: Apply identity and token discovery patch
         run: python3 hyperevm-radar/tools/apply_identity_token_strong_fix.py
+      - name: Apply token-context safety follow-up
+        run: python3 hyperevm-radar/tools/apply_identity_token_strong_followup.py
       - name: Verify radar
         run: |
           python3 -m pip install --disable-pip-version-check aiohttp requests web3
