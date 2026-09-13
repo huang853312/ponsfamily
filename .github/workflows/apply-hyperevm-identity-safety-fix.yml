@@ -74,12 +74,13 @@ jobs:
           import difflib
           base=payload['baseline'].splitlines(keepends=True);target=payload['block'].splitlines(keepends=True)
           print(''.join(difflib.unified_diff(base,old_method.splitlines(keepends=True),fromfile='baseline',tofile='production')),flush=True)
-          patched=old_method
+          patched=old_method.replace('x_url=next((url for url in dict.fromkeys(x_urls) if not _is_shared_provider_x(url)),"")','x_url=next(iter(dict.fromkeys(x_urls)),"")')
           for tag,i,j,k,l in reversed(difflib.SequenceMatcher(None,base,target,autojunk=False).get_opcodes()):
               if tag=='equal':continue
               before=''.join(base[i:j]);after=''.join(target[k:l])
               assert before and patched.count(before)==1,'Patch context differs from production'
               patched=patched.replace(before,after,1)
+          patched=patched.replace('for candidate in list(dict.fromkeys(x_urls))[:6]:','for candidate in [u for u in dict.fromkeys(x_urls) if not _is_shared_provider_x(u)][:6]:')
           lines[node.lineno-1:node.end_lineno]=[patched+'\n'];fixed=''.join(lines)
           compile(fixed,str(p),'exec')
           backup=p.with_name(p.name+'.before_identity_safety_fix_'+time.strftime('%Y%m%dT%H%M%SZ',time.gmtime()))
