@@ -1,0 +1,126 @@
+name: Diagnose All Radar APIs
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/diagnose-all-radar-apis.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Configure SSH
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+      - name: Inventory and probe both Radar environments without secrets
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -p "$SERVER_PORT" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 "$SERVER_USER@$SERVER_HOST" 'sudo /opt/hyperevm-radar/.venv/bin/python -' <<'PY'
+          import ast,json,re,shlex,sqlite3,subprocess,time
+          from pathlib import Path
+          from urllib.parse import urlparse,quote_plus
+          import requests
+          def emit(**kw): print(json.dumps(kw,ensure_ascii=False),flush=True)
+          def dotenv(path):
+              vals={}
+              if path.exists():
+                  for line in path.read_text(errors='replace').splitlines():
+                      line=line.strip()
+                      if line.startswith('export '):line=line[7:]
+                      if not line or line.startswith('#') or '=' not in line:continue
+                      k,v=line.split('=',1)
+                      if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*',k.strip()):continue
+                      try:parts=shlex.split(v,comments=True);vals[k.strip()]=' '.join(parts)
+                      except ValueError:continue
+              return vals
+          def call(label,method,url,**kw):
+              start=time.monotonic()
+              try:
+                  r=requests.request(method,url,timeout=20,**kw)
+                  try:p=r.json()
+                  except ValueError:p=None
+                  emit(test=label,http=r.status_code,seconds=round(time.monotonic()-start,2),json_valid=p is not None)
+                  return p
+              except Exception as e:
+                  emit(test=label,error=type(e).__name__)
+                  return None
+          def count(p):
+              if not isinstance(p,dict):return 0
+              data=p.get('data') or {}
+              rows=p.get('results') or p.get('organic') or (p.get('web') or {}).get('results') or (data.get('webPages') or {}).get('value') or []
+              return sum(1 for x in rows if isinstance(x,dict) and (x.get('url') or x.get('link'))) if isinstance(rows,list) else 0
+          seen=set()
+          for chain in ['hyperevm','robinhood']:
+              root=Path('/opt/'+chain+'-radar')
+              stored=dotenv(root/'.env')
+              proc={}
+              try:
+                  pid=subprocess.check_output(['systemctl','show',chain+'-radar.service','-p','MainPID','--value'],text=True).strip()
+                  if pid.isdigit() and pid!='0':
+                      for raw in Path('/proc/'+pid+'/environ').read_bytes().split(b'\0'):
+                          if b'=' in raw:
+                              k,v=raw.split(b'=',1);proc[k.decode(errors='replace')]=v.decode(errors='replace')
+              except Exception as e:emit(chain=chain,process_env_error=type(e).__name__)
+              env={**stored,**proc}
+              emit(chain=chain,service_process_present=bool(proc))
+              for name in sorted(set(stored)|set(proc)):
+                  if re.search(r'API|RPC|TELEGRAM|TAVILY|SERPER|BRAVE|LANGSEARCH|ALCHEMY|ANKR',name,re.I):
+                      emit(chain=chain,variable=name,stored=bool(stored.get(name)),loaded=bool(proc.get(name)))
+              prefix=chain.upper()
+              endpoint=env.get(prefix+'_SEARCH_API_URL','')
+              key=env.get(prefix+'_SEARCH_API_KEY','')
+              if endpoint:
+                  host=urlparse(endpoint).hostname
+                  emit(chain=chain,search_host=host,query_placeholder='{query}' in endpoint)
+                  if (endpoint,key) not in seen:
+                      seen.add((endpoint,key))
+                      p=call(chain+'_RADAR_SEARCH_GET','GET',endpoint.format(query=quote_plus('HyperLend HyperEVM official')),headers={'Authorization':'Bearer '+key,'Accept':'application/json'})
+                      emit(test=chain+'_RADAR_SEARCH_GET',parsed_urls=count(p))
+                      if host=='api.langsearch.com':
+                          p=call(chain+'_LANGSEARCH_POST','POST','https://api.langsearch.com/v1/web-search',headers={'Authorization':'Bearer '+key},json={'query':'HyperLend HyperEVM official','count':3,'freshness':'noLimit','summary':False})
+                          emit(test=chain+'_LANGSEARCH_POST',parsed_urls=count(p))
+                  else:emit(chain=chain,search_same_config_as_previously_tested=True)
+              for name,value in env.items():
+                  if not value or not re.search(r'KEY|TOKEN',name,re.I):continue
+                  spec=None
+                  if 'BRAVE' in name.upper():spec=('BRAVE','GET','https://api.search.brave.com/res/v1/web/search',{'headers':{'X-Subscription-Token':value},'params':{'q':'HyperLend HyperEVM official','count':3}})
+                  elif 'SERPER' in name.upper():spec=('SERPER','POST','https://google.serper.dev/search',{'headers':{'X-API-KEY':value},'json':{'q':'HyperLend HyperEVM official','num':3}})
+                  elif 'TAVILY' in name.upper():spec=('TAVILY','POST','https://api.tavily.com/search',{'headers':{'Authorization':'Bearer '+value},'json':{'query':'HyperLend HyperEVM official','max_results':3}})
+                  elif 'LANGSEARCH' in name.upper():spec=('LANGSEARCH','POST','https://api.langsearch.com/v1/web-search',{'headers':{'Authorization':'Bearer '+value},'json':{'query':'HyperLend HyperEVM official','count':3,'summary':False}})
+                  if spec and (spec[0],value) not in seen:
+                      seen.add((spec[0],value));p=call(chain+'_'+name,spec[1],spec[2],**spec[3]);emit(test=chain+'_'+name,parsed_urls=count(p))
+                  elif spec is None and re.search(r'SEARCH|API',name,re.I) and name!=prefix+'_SEARCH_API_KEY':
+                      emit(chain=chain,variable=name,test_status='NEEDS_PROVIDER_IDENTIFICATION')
+              rpcs={k:v for k,v in env.items() if 'RPC' in k.upper() and v.startswith(('https://','http://'))}
+              if chain=='hyperevm':
+                  try:
+                      tree=ast.parse((root/'config.py').read_text())
+                      for node in tree.body:
+                          if isinstance(node,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='RPC_URL' for t in node.targets) and isinstance(node.value,ast.Constant):
+                              rpcs['CODE_RPC_URL']=node.value.value
+                  except Exception as e:emit(chain=chain,config_read_error=type(e).__name__)
+              for name,url in rpcs.items():
+                  if ('rpc',url) in seen:continue
+                  seen.add(('rpc',url))
+                  for method in ['eth_chainId','eth_blockNumber']:
+                      p=call(chain+'_'+name+'_'+method,'POST',url,json={'jsonrpc':'2.0','id':1,'method':method,'params':[]})
+                      if isinstance(p,dict):emit(test=chain+'_'+name+'_'+method,rpc_result=p.get('result'),rpc_error_present='error' in p)
+              token=env.get('TELEGRAM_BOT_TOKEN','');chat=env.get('TELEGRAM_CHAT_ID','')
+              if token:
+                  for method,args in [('getMe',{}),('getChat',{'chat_id':chat})]:
+                      if method=='getChat' and not chat:continue
+                      p=call(chain+'_TELEGRAM_'+method,'GET','https://api.telegram.org/bot'+token+'/'+method,params=args)
+                      if isinstance(p,dict):emit(test=chain+'_TELEGRAM_'+method,ok=p.get('ok'))
+          for label,url in [('DEFILLAMA','https://api.llama.fi/protocols'),('DEXSCREENER','https://api.dexscreener.com/latest/dex/tokens/0x5555555555555555555555555555555555555555'),('HYPEREVMSCAN_PUBLIC','https://hyperevmscan.io/address/0x5555555555555555555555555555555555555555'),('HYPERECO','https://hypereco.io/'),('DDG_HTML','https://html.duckduckgo.com/html/?q=HyperLend+HyperEVM'),('DDG_LITE','https://lite.duckduckgo.com/lite/?q=HyperLend+HyperEVM'),('BING_HTML','https://www.bing.com/search?q=HyperLend+HyperEVM')]:
+              call(label,'GET',url,headers={'User-Agent':'Mozilla/5.0'})
+          emit(diagnostic_complete=True,no_radar_changes=True)
+                    PY
