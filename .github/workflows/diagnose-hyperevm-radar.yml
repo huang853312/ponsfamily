@@ -142,6 +142,24 @@ jobs:
               for field in ['status','platform_type','discovery_source']:
                   if field in cols:
                       print(field.upper()+'_COUNTS=', c.execute(f'select {field},count(*) from platform_candidates group by {field} order by count(*) desc limit 20').fetchall())
+          print('=== IDENTITY CAUSE EVIDENCE ===')
+          for key in ['family:12','family:16','family:36','family:49']:
+              row=c.execute('select * from platform_identity_investigations where subject_key=?',(key,)).fetchone()
+              if not row: continue
+              d=dict(row); result=json.loads(d.pop('result') or '{}')
+              print('CAUSE_STATE=',json.dumps(d,ensure_ascii=False))
+              print('CAUSE_RESULT=',json.dumps({k:result.get(k) for k in ['subject_key','official_website','official_x','verification_status','docs']},ensure_ascii=False))
+              for e in result.get('evidence',[]):
+                  if e.get('source') in ['search','direct_docs','website','x_public'] or e.get('kind') in ['DOCS_CANDIDATE','CROSS_VERIFICATION']:
+                      print('CAUSE_EVIDENCE=',json.dumps({'subject':key,**e},ensure_ascii=False))
+          import ast
+          from pathlib import Path
+          for fn,names in [('platform_family_intelligence.py',['_is_docs_url']),('database.py',['save_platform_identity_investigation']),('main.py',['_identity_pending_families'])]:
+              source=Path('/opt/hyperevm-radar/'+fn).read_text()
+              for n in ast.walk(ast.parse(source)):
+                  if isinstance(n,ast.FunctionDef) and n.name in names:
+                      print('PRODUCTION_FUNCTION=',fn,n.name)
+                      print(''.join(source.splitlines(keepends=True)[n.lineno-1:n.end_lineno]))
           print('NOW_EPOCH=', int(time.time()), 'NOW=', datetime.datetime.now().isoformat())
           PY
           REMOTE
@@ -156,3 +174,5 @@ jobs:
 # Twelve-hour notification investigation 1789339710939
 
 # Post identity safety verification 1789341405773
+
+# Detailed cause inspection 1789341570738
