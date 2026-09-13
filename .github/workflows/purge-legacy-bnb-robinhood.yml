@@ -1,0 +1,103 @@
+name: Purge legacy BNB and Robinhood radars
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/purge-legacy-bnb-robinhood.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  purge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Configure SSH
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          touch ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts
+
+      - name: Purge BNB and Robinhood only
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          SSH="ssh -i $HOME/.ssh/deploy_key -p $SERVER_PORT -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30"
+          $SSH "$SERVER_USER@$SERVER_HOST" '
+            set -eu
+
+            # Protect the current HyperEVM service before doing anything destructive.
+            test "$(systemctl is-active hyperevm-radar.service)" = "active"
+            test "$(systemctl is-enabled hyperevm-radar.service)" = "enabled"
+
+            echo "=== STOP/DISABLE LEGACY SERVICES ==="
+            for svc in \
+              robinhood-radar.service \
+              bnb-stockfi-radar.service \
+              bnb-radar.service \
+              bsc-radar.service \
+              bnbchain-radar.service \
+              bscchain-radar.service; do
+              sudo systemctl disable --now "$svc" 2>/dev/null || true
+            done
+
+            echo "=== REMOVE LEGACY UNIT FILES ==="
+            for svc in robinhood-radar.service bnb-stockfi-radar.service bnb-radar.service bsc-radar.service bnbchain-radar.service bscchain-radar.service; do
+              sudo rm -f "/etc/systemd/system/$svc" "/lib/systemd/system/$svc" "/usr/lib/systemd/system/$svc"
+              sudo rm -f "/etc/systemd/system/multi-user.target.wants/$svc"
+            done
+            sudo systemctl daemon-reload
+            sudo systemctl reset-failed 2>/dev/null || true
+
+            echo "=== REMOVE LEGACY SERVER DIRECTORIES ==="
+            for d in \
+              /opt/robinhood-radar \
+              /opt/bnb-stockfi-radar \
+              /opt/bnb-radar \
+              /opt/bsc-radar \
+              /opt/bnbchain-radar \
+              /opt/bscchain-radar; do
+              if [ -e "$d" ]; then
+                echo "Removing $d"
+                sudo rm -rf -- "$d"
+              fi
+            done
+
+            echo "=== VERIFY NO LEGACY PROCESSES ==="
+            if ps -eo pid,cmd | grep -Ei "/opt/(robinhood-radar|bnb-stockfi-radar|bnb-radar|bsc-radar|bnbchain-radar|bscchain-radar)" | grep -v grep; then
+              echo "ERROR: legacy process still exists"
+              exit 1
+            fi
+
+            echo "=== VERIFY NO LEGACY UNITS ==="
+            if systemctl list-unit-files --type=service --no-pager | grep -Ei "^(robinhood-radar|bnb-stockfi-radar|bnb-radar|bsc-radar|bnbchain-radar|bscchain-radar)\.service"; then
+              echo "ERROR: legacy unit still exists"
+              exit 1
+            fi
+
+            echo "=== VERIFY NO LEGACY DIRECTORIES ==="
+            for d in /opt/robinhood-radar /opt/bnb-stockfi-radar /opt/bnb-radar /opt/bsc-radar /opt/bnbchain-radar /opt/bscchain-radar; do
+              if [ -e "$d" ]; then
+                echo "ERROR: legacy directory remains: $d"
+                exit 1
+              fi
+            done
+
+            echo "=== CHECK TIMERS/CRON FOR LEGACY NAMES ==="
+            systemctl list-timers --all --no-pager | grep -Ei "robinhood-radar|bnb-stockfi-radar|bnb-radar|bsc-radar|bnbchain-radar|bscchain-radar" && exit 1 || true
+            crontab -l 2>/dev/null | grep -Ei "robinhood-radar|bnb-stockfi-radar|bnb-radar|bsc-radar|bnbchain-radar|bscchain-radar" && exit 1 || true
+            sudo crontab -l 2>/dev/null | grep -Ei "robinhood-radar|bnb-stockfi-radar|bnb-radar|bsc-radar|bnbchain-radar|bscchain-radar" && exit 1 || true
+
+            echo "=== PROTECTED CURRENT HYPEREVM ==="
+            echo -n "active="; systemctl is-active hyperevm-radar.service
+            echo -n "enabled="; systemctl is-enabled hyperevm-radar.service
+            systemctl show hyperevm-radar.service -p MainPID -p NRestarts -p FragmentPath --no-pager
+          '
