@@ -74,7 +74,7 @@ jobs:
           fi
 
           echo '=== RECENT LOGS ==='
-          sudo journalctl -u "$SERVICE" --since '2 hours ago' --no-pager -n 400 || true
+          sudo journalctl -u "$SERVICE" --since '12 hours ago' --no-pager -n 1200 || true
 
           echo '=== RADAR FILES ==='
           cd /opt/hyperevm-radar 2>/dev/null || exit 0
@@ -136,7 +136,7 @@ jobs:
           if 'platform_identity_investigations' in tables:
               cols=[r[1] for r in c.execute('pragma table_info(platform_identity_investigations)')]
               if 'verification_status' in cols:
-                  print('IDENTITY_STATUS_COUNTS=', c.execute('select verification_status,count(*) from platform_identity_investigations group by verification_status order by count(*) desc').fetchall())
+                  print('IDENTITY_STATUS_COUNTS=', [tuple(r) for r in c.execute('select verification_status,count(*) from platform_identity_investigations group by verification_status order by count(*) desc')])
           if 'platform_candidates' in tables:
               cols=[r[1] for r in c.execute('pragma table_info(platform_candidates)')]
               for field in ['status','platform_type','discovery_source']:
@@ -152,3 +152,5 @@ jobs:
 # User-requested runtime verification after API repair
 
 # Fresh HyperEVM runtime check 1789339078528
+
+# Twelve-hour notification investigation 1789339710939
