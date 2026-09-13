@@ -256,7 +256,7 @@ jobs:
               if latest:
                   print(f"{n}|{max_block}|{latest[0]}")
               else:
-                  print(f"{n}|{max_block or ''}|")
+                  print("{}|{}|".format(n, max_block if max_block is not None else ""))
           con.close()
           PY
               )
