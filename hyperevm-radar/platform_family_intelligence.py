@@ -139,6 +139,7 @@ class TinyFishSearchProvider(SearchProvider):
         return ConfiguredJsonSearchProvider._hits(response.json().get("results") or [], self.name)
 
 
+
 class _Links(HTMLParser):
     def __init__(self):
         super().__init__(); self.links=[]; self.parts=[]
@@ -540,7 +541,7 @@ class FamilyIntelligenceEngine:
             return list(found.values())
 
         unique=unique_hits(hits); x_urls=[]; docs_hits=[]; web_hits=[]; github_hits=[]
-        excluded={"github.com","t.me","telegram.me","youtube.com","x.com","twitter.com","dexscreener.com","coingecko.com","coinmarketcap.com","defillama.com","debank.com","etherscan.io"}
+        excluded={"github.com","githubstatus.com","www.githubstatus.com","docs.github.com","support.github.com","t.me","telegram.me","youtube.com","x.com","twitter.com","dexscreener.com","coingecko.com","coinmarketcap.com","defillama.com","debank.com","etherscan.io"}
         for hit in unique:
             match=X_RE.search(hit.url)
             if match:
@@ -567,7 +568,7 @@ class FamilyIntelligenceEngine:
                 elif _is_docs_url(link):
                     docs_hits.append(SearchHit(link,source="GITHUB_BACKLINK"))
                 elif link.startswith(("http://","https://")) and _host(link) not in excluded:
-                    web_hits.insert(0,SearchHit(link,source="GITHUB_BACKLINK"))
+                    web_hits.append(SearchHit(link,source="GITHUB_BACKLINK"))
 
         direct_docs_pages=[]
         seen_docs=set()
@@ -596,9 +597,9 @@ class FamilyIntelligenceEngine:
                     evidence.append({"source":"direct_docs","kind":"X_CANDIDATE","url":match.group(0)})
                     continue
                 if link.startswith(("http://","https://")) and _host(link) not in excluded and not _is_docs_url(link):
-                    web_hits.insert(0,SearchHit(link,source="DOCS_BACKLINK"))
+                    web_hits.append(SearchHit(link,source="DOCS_BACKLINK"))
 
-        website_page=None; website_candidate=""
+        website_page=None; website_candidate=""; best_website_score=-1
         for hit in web_hits[:self.max_hits]:
             if time.monotonic()-started>=self.total_timeout: break
             try: page=self.pages.fetch(hit.url,self.request_timeout)
@@ -607,10 +608,20 @@ class FamilyIntelligenceEngine:
             if page.status!="AVAILABLE": continue
             if _is_parked_page(page):
                 evidence.append({"source":"website","url":page.url,"status":"REJECTED_PARKED"}); continue
-            if not website_candidate: website_candidate=page.url
             page_blob=(page.raw+" "+page.text).lower(); page.address_match=bool(addresses & {x.lower() for x in ADDRESS_RE.findall(page_blob)})
-            if page.address_match or any(X_RE.search(link) for link in page.links): website_page=page; break
-            if website_page is None: website_page=page
+            # A social link alone never establishes relevance to this deployment.
+            blob=" ".join((page.title,page.description,page.text)).lower()
+            relevant_clue=any(len(c)>=3 and re.search(r"(?<!\w)"+re.escape(c.lower())+r"(?!\w)",blob) for c in text_clues)
+            docs_address_link=any(getattr(d,"address_match",False) and
+                (any(_same_site(link,page.url) for link in d.links) or
+                 any(_same_docs_space(link,d.url) for link in page.links if _is_docs_url(link)))
+                for d in direct_docs_pages)
+            score=100 if page.address_match else 80 if docs_address_link else 60 if hit.source in {"DEXSCREENER_ADDRESS_METADATA","IDENTITY_URL_SEED"} else 40 if relevant_clue else -1
+            if score<0:
+                evidence.append({"source":"website","url":page.url,"status":"REJECTED_UNRELATED"}); continue
+            if score>best_website_score:
+                website_page=page; website_candidate=page.url; best_website_score=score
+            if page.address_match: break
 
         hostname=root_domain=subdomain=core_word=""; derived_words=[]; domain_hits=[]
         if website_page:
@@ -628,11 +639,17 @@ class FamilyIntelligenceEngine:
         if website_page:
             site_x=[m.group(0) for link in website_page.links for m in [X_RE.search(link)] if m]
             x_urls=site_x+x_urls; evidence.append({"source":"website","url":website_page.url,"address_match":bool(getattr(website_page,"address_match",False)),"linked_x":site_x})
-        x_url=next(iter(dict.fromkeys(x_urls)),""); x_page=Page(x_url,status="NO_DATA")
-        if x_url and time.monotonic()-started<self.total_timeout:
-            try: x_page=self.x.fetch(x_url,self.request_timeout)
-            except Exception as exc: evidence.append({"source":"x_public","status":"NO_DATA","detail":type(exc).__name__})
-            evidence.append({"source":"x_public","url":x_url,"status":x_page.status})
+        x_url=""; x_page=Page("",status="NO_DATA")
+        for candidate in list(dict.fromkeys(x_urls))[:6]:
+            if time.monotonic()-started>=self.total_timeout: break
+            try: candidate_page=self.x.fetch(candidate,self.request_timeout)
+            except Exception as exc:
+                evidence.append({"source":"x_public","url":candidate,"status":"NO_DATA","detail":type(exc).__name__}); continue
+            evidence.append({"source":"x_public","url":candidate,"status":candidate_page.status})
+            if candidate_page.status!="AVAILABLE": continue
+            if not x_url: x_url=candidate; x_page=candidate_page
+            if website_page and candidate in site_x and any(_same_site(link,website_page.url) for link in candidate_page.links):
+                x_url=candidate; x_page=candidate_page; break
 
         if not website_page and x_page.status=="AVAILABLE":
             backlink=next((link for link in x_page.links if _host(link) not in {"x.com","twitter.com","t.co"}),"")
@@ -670,7 +687,7 @@ class FamilyIntelligenceEngine:
             except Exception as exc: evidence.append({"source":"official_docs","url":link,"status":"NO_DATA","detail":type(exc).__name__}); continue
             if page.status=="AVAILABLE":
                 blob=(page.raw+" "+page.text).lower(); page.address_match=bool(addresses & {x.lower() for x in ADDRESS_RE.findall(blob)}); trusted_docs.append(page); docs_crosslinked=True; evidence.append({"source":"official_docs","url":page.url,"address_match":page.address_match,"crosslinked":True})
-        docs_address=any(getattr(page,"address_match",False) for page in direct_docs_pages+trusted_docs)
+        docs_address=any(getattr(page,"address_match",False) for page in trusted_docs)
         site_identity=_identity_words(root_domain,website_page.title if website_page else "",website_page.description if website_page else "")
         x_identity=_identity_words(x_page.title,x_page.description,x_page.text[:800])
         brand_consistent=bool(site_identity & x_identity)
