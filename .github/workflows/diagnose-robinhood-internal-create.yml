@@ -1,0 +1,97 @@
+name: Diagnose Robinhood Internal CREATE
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/diagnose-robinhood-internal-create.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Configure SSH
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          touch ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts
+
+      - name: Probe Robinhood RPC trace support and recent contract creation activity
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          SSH="ssh -i $HOME/.ssh/deploy_key -p $SERVER_PORT -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30"
+          $SSH "$SERVER_USER@$SERVER_HOST" 'python3 - <<"PY"
+          import json, urllib.request, time
+
+          RPC="https://rpc.mainnet.chain.robinhood.com"
+          headers={"Content-Type":"application/json","User-Agent":"Mozilla/5.0 RobinhoodRadar/1.0"}
+
+          def rpc(method, params):
+              data=json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode()
+              req=urllib.request.Request(RPC,data=data,headers=headers)
+              try:
+                  with urllib.request.urlopen(req,timeout=20) as r:
+                      return json.loads(r.read().decode())
+              except Exception as e:
+                  return {"transport_error":repr(e)}
+
+          cid=rpc("eth_chainId",[])
+          print("CHAIN",json.dumps(cid)[:500])
+          latest=rpc("eth_blockNumber",[])
+          print("LATEST",json.dumps(latest)[:500])
+          if "result" not in latest:
+              raise SystemExit(1)
+          latest_n=int(latest["result"],16)
+
+          # Probe a recent block with full transactions.
+          sample_n=max(0, latest_n-2)
+          sample_hex=hex(sample_n)
+          block=rpc("eth_getBlockByNumber",[sample_hex,True])
+          txs=(block.get("result") or {}).get("transactions") or []
+          top_creates=[t for t in txs if t.get("to") is None]
+          print(f"SAMPLE_BLOCK={sample_n} TXS={len(txs)} TOP_LEVEL_CREATES={len(top_creates)}")
+          for t in top_creates[:5]:
+              print("TOP_CREATE_TX",t.get("hash"),"FROM",t.get("from"))
+
+          probes=[
+              ("debug_traceBlockByNumber",[sample_hex,{"tracer":"callTracer"}]),
+              ("trace_block",[sample_hex]),
+              ("arbtrace_block",[sample_hex]),
+          ]
+          for method,params in probes:
+              out=rpc(method,params)
+              if "result" in out:
+                  typ=type(out["result"]).__name__
+                  size=len(out["result"]) if hasattr(out["result"],"__len__") else -1
+                  print(f"PROBE {method} SUPPORTED type={typ} size={size}")
+                  print(json.dumps(out)[:2000])
+              else:
+                  print(f"PROBE {method} UNSUPPORTED_OR_ERROR {json.dumps(out)[:1000]}")
+
+          # Scan recent 120 blocks for top-level creation frequency.
+          total_txs=0
+          total_top=0
+          blocks_with_top=[]
+          start=max(0,latest_n-119)
+          for n in range(start,latest_n+1):
+              b=rpc("eth_getBlockByNumber",[hex(n),True])
+              rs=b.get("result") or {}
+              arr=rs.get("transactions") or []
+              total_txs += len(arr)
+              c=sum(1 for t in arr if t.get("to") is None)
+              total_top += c
+              if c:
+                  blocks_with_top.append((n,c))
+          print(f"RECENT120 total_txs={total_txs} top_level_creates={total_top} blocks_with_top={blocks_with_top[-20:]}")
+          PY'
