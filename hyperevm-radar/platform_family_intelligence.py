@@ -241,11 +241,16 @@ class CompositeSearchProvider(SearchProvider):
         self.providers=providers or (ConfiguredJsonSearchProvider(), YouSearchProvider(), ExaSearchProvider(), TinyFishSearchProvider(), DuckDuckGoSearchProvider(), BingSearchProvider())
     def search(self, query, timeout):
         hits=[]; seen=set()
+        targets={a.lower() for a in ADDRESS_RE.findall(query)}
         for provider in self.providers:
             try:
                 rows=provider.search(query, timeout)
             except (requests.RequestException, ValueError, KeyError, TypeError):
                 continue
+            # Address queries require address evidence in the returned metadata.
+            # Nonempty unrelated results must not prevent fallback providers.
+            if targets:
+                rows=[h for h in rows if any(a in (h.url+" "+h.title+" "+h.snippet).lower() for a in targets)]
             for hit in rows:
                 key=hit.url.split("#",1)[0]
                 if key and key not in seen:
@@ -540,13 +545,18 @@ class FamilyIntelligenceEngine:
                 if hit.url: found.setdefault(hit.url.split("#",1)[0],hit)
             return list(found.values())
 
+        def useful_docs(url):
+            host=_host(url); path=(urlparse(url).path or "").lower()
+            return (_is_docs_url(url) and host not in {"docs.github.com","docs.fivem.net","docs.google.com","support.github.com"}
+                    and not any(part in path for part in ("/site-policy/","/privacy","/terms-of-service")))
+
         unique=unique_hits(hits); x_urls=[]; docs_hits=[]; web_hits=[]; github_hits=[]
         excluded={"github.com","githubstatus.com","www.githubstatus.com","docs.github.com","support.github.com","t.me","telegram.me","youtube.com","x.com","twitter.com","dexscreener.com","coingecko.com","coinmarketcap.com","defillama.com","debank.com","etherscan.io"}
         for hit in unique:
             match=X_RE.search(hit.url)
             if match:
                 x_urls.append(match.group(0)); evidence.append({"source":hit.source,"kind":"X_CANDIDATE","url":match.group(0),"title":hit.title[:160]})
-            elif _is_docs_url(hit.url):
+            elif useful_docs(hit.url):
                 docs_hits.append(hit); evidence.append({"source":hit.source,"kind":"DOCS_CANDIDATE","url":hit.url,"title":hit.title[:160]})
             elif _host(hit.url)=="github.com":
                 github_hits.append(hit); evidence.append({"source":hit.source,"kind":"GITHUB_CANDIDATE","url":hit.url,"title":hit.title[:160]})
@@ -565,14 +575,14 @@ class FamilyIntelligenceEngine:
                 match=X_RE.search(link)
                 if match:
                     x_urls.append(match.group(0)); evidence.append({"source":"github_discovery","kind":"X_CANDIDATE","url":match.group(0)})
-                elif _is_docs_url(link):
+                elif useful_docs(link):
                     docs_hits.append(SearchHit(link,source="GITHUB_BACKLINK"))
                 elif link.startswith(("http://","https://")) and _host(link) not in excluded:
                     web_hits.append(SearchHit(link,source="GITHUB_BACKLINK"))
 
         direct_docs_pages=[]
         seen_docs=set()
-        docs_queue=[hit.url for hit in docs_hits[:8]]
+        docs_queue=list(dict.fromkeys(hit.url for hit in docs_hits if useful_docs(hit.url)))[:8]
         # Crawl one shallow layer of likely contract/address/deployment pages. This
         # turns a Docs landing-page hit into the exact page that contains Family CAs.
         while docs_queue and len(direct_docs_pages)<12:
@@ -667,7 +677,7 @@ class FamilyIntelligenceEngine:
         site_links_x=bool(website_page and site_x and x_url in site_x)
         homepage_address=bool(website_page and getattr(website_page,"address_match",False))
         all_links=[hit.url for hit in unique]+[p.url for p in direct_docs_pages]+(website_page.links if website_page else [])+(x_page.links if x_page.status=="AVAILABLE" else [])
-        docs=list(dict.fromkeys(link for link in all_links if _is_docs_url(link)))
+        docs=list(dict.fromkeys(link for link in all_links if useful_docs(link)))
         github=list(dict.fromkeys(link for link in all_links if _host(link)=="github.com"))
         trusted_docs=[]
         docs_crosslinked=False
