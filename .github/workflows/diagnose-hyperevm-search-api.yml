@@ -63,7 +63,7 @@ jobs:
           for label,query in queries:
               started=time.monotonic()
               try:
-                  response=requests.get(endpoint.format(query=quote_plus(query)),headers={'Accept':'application/json','User-Agent':'HyperEVM-Radar/3.0',**({'Authorization':'Bearer '+key} if key else {})},timeout=10)
+                  response=requests.post('https://api.langsearch.com/v1/web-search',headers={'Accept':'application/json','Authorization':'Bearer '+key},json={'query':query,'count':5,'freshness':'noLimit','summary':False},timeout=30)
                   print(label,'HTTP=',response.status_code,'SECONDS=',round(time.monotonic()-started,2))
                   try: payload=response.json()
                   except ValueError:
@@ -74,8 +74,8 @@ jobs:
                       continue
                   for field in ['results','organic','web','error','message','detail']:
                       if field in payload: print(label,'FIELD_PRESENT=',field)
-                  web=payload.get('web')
-                  rows=payload.get('results') or payload.get('organic') or (web.get('results') if isinstance(web,dict) else None) or []
+                  web=(payload.get('data') or {}).get('webPages')
+                  rows=(web.get('value') if isinstance(web,dict) else None) or []
                   usable=sum(1 for item in rows if isinstance(item,dict) and (item.get('url') or item.get('link'))) if isinstance(rows,list) else 0
                   print(label,'PARSED_URL_COUNT=',usable)
               except Exception as exc:
