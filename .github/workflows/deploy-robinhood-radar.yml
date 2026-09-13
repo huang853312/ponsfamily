@@ -238,20 +238,42 @@ jobs:
             journalctl -u robinhood-radar.service -n 80 --no-pager | tail -80
             journalctl -u robinhood-radar.service --since "2 minutes ago" --no-pager | grep -F "monitor started chain_id=4663" | tail -1
             test -s /opt/robinhood-radar/data/radar.db
-            python3 - <<"PY"
-          import os, sqlite3, time
+
+            echo "=== WAIT FOR REAL ROBINHOOD DATABASE WRITE ==="
+            found=0
+            for i in $(seq 1 30); do
+              result=$(python3 - <<"PY"
+          import sqlite3
           p="/opt/robinhood-radar/data/radar.db"
           con=sqlite3.connect(p)
           tables={r[0] for r in con.execute("select name from sqlite_master")}
-          assert "contracts" in tables, tables
-          n=con.execute("select count(*) from contracts").fetchone()[0]
-          max_block=con.execute("select max(block_number) from contracts").fetchone()[0]
-          assert n > 0, "Robinhood contracts table is empty"
-          assert max_block is not None, "Robinhood contracts table has no block data"
-          age=time.time()-os.path.getmtime(p)
-          print("robinhood_db=OK contracts=", n, "max_block=", max_block, "mtime_age_s=", round(age,1))
+          if "contracts" not in tables:
+              print("0||")
+          else:
+              n=con.execute("select count(*) from contracts").fetchone()[0]
+              max_block=con.execute("select max(block_number) from contracts").fetchone()[0]
+              latest=con.execute("select address, block_number from contracts order by block_number desc limit 1").fetchone()
+              if latest:
+                  print(f"{n}|{max_block}|{latest[0]}")
+              else:
+                  print(f"{n}|{max_block or ''}|")
           con.close()
           PY
+              )
+              count=$(printf "%s" "$result" | cut -d"|" -f1)
+              max_block=$(printf "%s" "$result" | cut -d"|" -f2)
+              latest_address=$(printf "%s" "$result" | cut -d"|" -f3)
+              echo "attempt=$i contracts=$count max_block=$max_block latest_address=$latest_address"
+              if [ "${count:-0}" -gt 0 ]; then
+                found=1
+                break
+              fi
+              test "$(systemctl is-active robinhood-radar.service)" = active
+              sleep 10
+            done
+            test "$found" = "1"
+            echo "robinhood_db=OK contracts=$count max_block=$max_block latest_address=$latest_address"
+
             r1=$(systemctl show robinhood-radar.service -p NRestarts --value)
             p1=$(systemctl show robinhood-radar.service -p MainPID --value)
             test "$p1" != "0"
