@@ -1,0 +1,68 @@
+name: Stop legacy multi-chain radars
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/stop-legacy-radars.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stop-legacy-services:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Configure SSH
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          touch ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts
+
+      - name: Stop legacy BNB Robinhood and non-canonical HyperEVM services only
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          SSH="ssh -i $HOME/.ssh/deploy_key -p $SERVER_PORT -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30"
+          $SSH "$SERVER_USER@$SERVER_HOST" '
+            set -u
+            echo "=== BEFORE ==="
+            systemctl list-unit-files --type=service --no-pager | grep -Ei "bnb|bsc|robinhood|hyper.*radar|radar.*hyper" || true
+
+            # Explicit legacy services. Never touch the canonical current HyperEVM service.
+            for svc in robinhood-radar.service bnb-radar.service bsc-radar.service bnbchain-radar.service bscchain-radar.service; do
+              if systemctl list-unit-files "$svc" --no-legend 2>/dev/null | grep -q "$svc"; then
+                echo "Stopping legacy service: $svc"
+                sudo systemctl disable --now "$svc" || true
+              fi
+            done
+
+            # Stop any additional HyperEVM radar service only if it is NOT the protected
+            # canonical service hyperevm-radar.service.
+            systemctl list-unit-files --type=service --no-legend 2>/dev/null \
+              | awk "{print \$1}" \
+              | grep -Ei "hyper.*radar|radar.*hyper" \
+              | while read -r svc; do
+                  [ -z "$svc" ] && continue
+                  if [ "$svc" = "hyperevm-radar.service" ]; then
+                    echo "Protected current service left untouched: $svc"
+                    continue
+                  fi
+                  echo "Stopping extra legacy HyperEVM service: $svc"
+                  sudo systemctl disable --now "$svc" || true
+                done
+
+            sudo systemctl daemon-reload
+
+            echo "=== AFTER ==="
+            systemctl list-units --type=service --all --no-pager | grep -Ei "bnb|bsc|robinhood|hyper.*radar|radar.*hyper" || true
+            echo "=== PROTECTED CURRENT HYPEREVM ==="
+            sudo systemctl status hyperevm-radar.service --no-pager -n 20 || true
+          '
