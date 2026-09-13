@@ -1,0 +1,114 @@
+name: Clean HyperEVM GitBook false identities
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/clean-hyperevm-gitbook-false-identities.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  clean:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Configure SSH
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          touch ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Remove stale GitBook false identities only
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -p "$SERVER_PORT" \
+            -o UserKnownHostsFile=~/.ssh/known_hosts \
+            -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 \
+            "$SERVER_USER@$SERVER_HOST" 'bash -s' <<'REMOTE'
+          set -e
+          DB=/opt/hyperevm-radar/data/radar.db
+          test -f "$DB"
+          sudo cp "$DB" "/opt/hyperevm-radar/data/radar.db.before-gitbook-clean.$(date -u +%Y%m%dT%H%M%SZ)"
+          sudo python3 - <<'PY'
+          import sqlite3
+          p='/opt/hyperevm-radar/data/radar.db'
+          con=sqlite3.connect(p)
+          con.row_factory=sqlite3.Row
+          bad=set()
+          q1="""
+          select family_id from platform_family_intelligence
+          where lower(coalesce(root_domain,''))='gitbook.com'
+             or lower(coalesce(hostname,''))='gitbook.com'
+             or lower(coalesce(core_word,''))='gitbook'
+             or lower(coalesce(project_name,''))='the knowledge layer for ai'
+             or lower(coalesce(official_website,'')) like '%gitbook.com%'
+          """
+          if 'platform_family_intelligence' in {r[0] for r in con.execute('select name from sqlite_master')}:
+              bad.update(r[0] for r in con.execute(q1))
+          if 'platform_families' in {r[0] for r in con.execute('select name from sqlite_master')}:
+              q2="""
+              select id from platform_families
+              where lower(coalesce(domain,''))='gitbook.com'
+                 or lower(coalesce(website_url,'')) like '%gitbook.com%'
+                 or lower(coalesce(confirmed_brand,''))='the knowledge layer for ai'
+              """
+              bad.update(r[0] for r in con.execute(q2))
+          bad={int(x) for x in bad if x is not None}
+          print('AFFECTED_FAMILY_IDS=', sorted(bad))
+          tables={r[0] for r in con.execute('select name from sqlite_master')}
+          if bad:
+              marks=','.join('?' for _ in bad)
+              ids=tuple(sorted(bad))
+              if 'platform_family_intelligence' in tables:
+                  con.execute(f'delete from platform_family_intelligence where family_id in ({marks})', ids)
+              if 'platform_identity_investigations' in tables:
+                  con.execute(f'delete from platform_identity_investigations where family_id in ({marks})', ids)
+              if 'platform_families' in tables:
+                  con.execute(f"""update platform_families
+                              set status='NEW', website_url='', domain='', confirmed_brand='', updated_at=strftime('%s','now')
+                              where id in ({marks})""", ids)
+          if 'platform_brands' in tables:
+              brand_ids=[r[0] for r in con.execute("""
+                  select id from platform_brands
+                  where lower(coalesce(domain,''))='gitbook.com'
+                     or lower(coalesce(normalized_brand,''))='gitbook'
+                     or lower(coalesce(platform_name,''))='the knowledge layer for ai'
+                     or lower(coalesce(website_url,'')) like '%gitbook.com%'
+              """)]
+              if brand_ids and 'platform_token_matches' in tables:
+                  marks=','.join('?' for _ in brand_ids)
+                  con.execute(f'delete from platform_token_matches where platform_id in ({marks})', tuple(brand_ids))
+              if brand_ids:
+                  marks=','.join('?' for _ in brand_ids)
+                  con.execute(f'delete from platform_brands where id in ({marks})', tuple(brand_ids))
+              print('REMOVED_BRAND_IDS=', brand_ids)
+          con.commit()
+          left=0
+          if 'platform_family_intelligence' in tables:
+              left=con.execute("""
+                  select count(*) from platform_family_intelligence
+                  where lower(coalesce(root_domain,''))='gitbook.com'
+                     or lower(coalesce(hostname,''))='gitbook.com'
+                     or lower(coalesce(core_word,''))='gitbook'
+                     or lower(coalesce(project_name,''))='the knowledge layer for ai'
+                     or lower(coalesce(official_website,'')) like '%gitbook.com%'
+              """).fetchone()[0]
+          print('FALSE_GITBOOK_IDENTITIES_LEFT=', left)
+          assert left == 0
+          con.close()
+          PY
+          sudo systemctl is-active hyperevm-radar.service
+          sudo grep -q SHARED_IDENTITY_HOSTS /opt/hyperevm-radar/platform_family_intelligence.py
+          echo 'HYPEREVM_GITBOOK_CLEANUP_OK=YES'
+          REMOTE
