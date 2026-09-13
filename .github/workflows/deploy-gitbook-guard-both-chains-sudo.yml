@@ -1,0 +1,99 @@
+name: Deploy GitBook Guard Both Chains Sudo
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/deploy-gitbook-guard-both-chains-sudo.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: python3 -m pip install --disable-pip-version-check aiohttp requests web3
+      - name: Patch and test source copy
+        run: |
+          python3 hyperevm-radar/tools/apply_gitbook_identity_guard.py hyperevm-radar/platform_family_intelligence.py
+          cd hyperevm-radar
+          PYTHONPATH=. python3 -m unittest discover -s tests -v
+          python3 -m compileall -q .
+          PYTHONPATH=. python3 - <<'PY'
+          from platform_family_intelligence import derive_core_words
+          assert derive_core_words('tumble') == ['tum','tumb','tumbl']
+          PY
+      - name: Configure SSH
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          touch ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts
+      - name: Stage files
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          SCP="scp -i $HOME/.ssh/deploy_key -P $SERVER_PORT -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=accept-new"
+          $SCP hyperevm-radar/platform_family_intelligence.py "$SERVER_USER@$SERVER_HOST:/tmp/platform_family_intelligence.hyper.fixed.py"
+          $SCP hyperevm-radar/tools/apply_gitbook_identity_guard.py "$SERVER_USER@$SERVER_HOST:/tmp/apply_gitbook_identity_guard.py"
+          $SCP hyperevm-radar/tests/test_gitbook_identity_guard.py "$SERVER_USER@$SERVER_HOST:/tmp/test_gitbook_identity_guard.py"
+      - name: Apply to HyperEVM and Robinhood with rollback
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          SSH="ssh -i $HOME/.ssh/deploy_key -p $SERVER_PORT -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30"
+          $SSH "$SERVER_USER@$SERVER_HOST" '
+            set -euo pipefail
+            H=/opt/hyperevm-radar/platform_family_intelligence.py
+            R=/opt/robinhood-radar/platform_family_intelligence.py
+            test -f "$H" && test -f "$R"
+            sudo cp "$H" /tmp/hyper.before-gitbook-fix.py
+            sudo cp "$R" /tmp/robin.before-gitbook-fix.py
+            sudo chown "$USER":"$(id -gn)" /tmp/hyper.before-gitbook-fix.py /tmp/robin.before-gitbook-fix.py
+            rollback(){ sudo cp /tmp/hyper.before-gitbook-fix.py "$H" || true; sudo cp /tmp/robin.before-gitbook-fix.py "$R" || true; sudo systemctl restart hyperevm-radar.service || true; sudo systemctl restart robinhood-radar.service || true; }
+            trap rollback ERR
+            sudo cp /tmp/platform_family_intelligence.hyper.fixed.py "$H"
+            sudo python3 /tmp/apply_gitbook_identity_guard.py "$R"
+            grep -q SHARED_IDENTITY_HOSTS "$H"
+            grep -q SHARED_IDENTITY_HOSTS "$R"
+            cd /opt/hyperevm-radar
+            .venv/bin/python -m compileall -q .
+            PYTHONPATH=. .venv/bin/python /tmp/test_gitbook_identity_guard.py
+            PYTHONPATH=. .venv/bin/python - <<"PY"
+          from platform_family_intelligence import derive_core_words
+          assert derive_core_words("tumble") == ["tum","tumb","tumbl"]
+          PY
+            cd /opt/robinhood-radar
+            .venv/bin/python -m compileall -q .
+            PYTHONPATH=. .venv/bin/python /tmp/test_gitbook_identity_guard.py
+            PYTHONPATH=. .venv/bin/python - <<"PY"
+          from platform_family_intelligence import derive_core_words
+          assert derive_core_words("tumble") == ["tum","tumb","tumbl"]
+          PY
+            sudo systemctl restart hyperevm-radar.service
+            sudo systemctl restart robinhood-radar.service
+            sleep 10
+            test "$(systemctl is-active hyperevm-radar.service)" = active
+            test "$(systemctl is-active robinhood-radar.service)" = active
+            test "$(systemctl is-enabled hyperevm-radar.service)" = enabled
+            test "$(systemctl is-enabled robinhood-radar.service)" = enabled
+            echo "HYPEREVM"
+            systemctl show hyperevm-radar.service -p ActiveState -p MainPID -p NRestarts --no-pager
+            echo "ROBINHOOD"
+            systemctl show robinhood-radar.service -p ActiveState -p MainPID -p NRestarts --no-pager
+            trap - ERR
+          '
