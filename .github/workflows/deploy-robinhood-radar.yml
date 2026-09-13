@@ -123,123 +123,120 @@ jobs:
               text = text[:start] + block + text[end:]
               p.write_text(text)
 
-          # Robinhood-only chain adapter: keep the protected monitor logic intact,
-          # then extend the generated clone to discover internal CREATE/CREATE2.
+          # Robinhood-only chain adapter: keep protected monitor logic intact,
+          # then extend only the generated clone with internal CREATE/CREATE2 tracing.
           blocks = root/'monitors'/'blocks.py'
           with blocks.open('a') as f:
               f.write(r'''
+          # --- Robinhood Chain deployment adapter: internal CREATE/CREATE2 discovery ---
+          _RH_ORIGINAL_GET_CONTRACT_CREATIONS = HyperEVMBlockMonitor.get_contract_creations
 
-# --- Robinhood Chain deployment adapter: internal CREATE/CREATE2 discovery ---
-_RH_ORIGINAL_GET_CONTRACT_CREATIONS = HyperEVMBlockMonitor.get_contract_creations
+          async def _rh_trace_internal_creations(self, block_number: int):
+              block_hex = hex(int(block_number))
+              found = []
 
-async def _rh_trace_internal_creations(self, block_number: int):
-    block_hex = hex(int(block_number))
-    found = []
+              def add(address, creator, tx_hash=''):
+                  if not address:
+                      return
+                  address = str(address)
+                  if not address.startswith('0x') or len(address) != 42:
+                      return
+                  found.append({
+                      'address': address,
+                      'creator': str(creator or ''),
+                      'block_number': int(block_number),
+                      'tx_hash': str(tx_hash or ''),
+                  })
 
-    def add(address, creator, tx_hash=''):
-        if not address:
-            return
-        address = str(address)
-        if not address.startswith('0x') or len(address) != 42:
-            return
-        found.append({
-            'address': address,
-            'creator': str(creator or ''),
-            'block_number': int(block_number),
-            'tx_hash': str(tx_hash or ''),
-        })
+              def walk_call(node, tx_hash=''):
+                  if not isinstance(node, dict):
+                      return
+                  call_type = str(node.get('type') or '').upper()
+                  if call_type in ('CREATE', 'CREATE2'):
+                      add(node.get('to'), node.get('from'), tx_hash)
+                  for child in node.get('calls') or []:
+                      walk_call(child, tx_hash)
 
-    def walk_call(node, tx_hash=''):
-        if not isinstance(node, dict):
-            return
-        call_type = str(node.get('type') or '').upper()
-        if call_type in ('CREATE', 'CREATE2'):
-            add(node.get('to'), node.get('from'), tx_hash)
-        for child in node.get('calls') or []:
-            walk_call(child, tx_hash)
+              try:
+                  resp = await self.w3.provider.make_request(
+                      'debug_traceBlockByNumber',
+                      [block_hex, {'tracer': 'callTracer', 'timeout': '5s'}],
+                  )
+                  result = resp.get('result') if isinstance(resp, dict) else None
+                  if isinstance(result, list):
+                      for item in result:
+                          if not isinstance(item, dict):
+                              continue
+                          tx_hash = item.get('txHash') or item.get('transactionHash') or ''
+                          root = item.get('result') if isinstance(item.get('result'), dict) else item
+                          walk_call(root, tx_hash)
+                      if found:
+                          print(f'Robinhood internal trace method=debug_traceBlockByNumber block={block_number} creates={len(found)}')
+                          return found
+              except Exception as e:
+                  print(f'Robinhood debug trace unavailable block={block_number}: {type(e).__name__}: {e}')
 
-    # Geth/Nitro debug namespace with callTracer.
-    try:
-        resp = await self.w3.provider.make_request(
-            'debug_traceBlockByNumber',
-            [block_hex, {'tracer': 'callTracer', 'timeout': '5s'}],
-        )
-        result = resp.get('result') if isinstance(resp, dict) else None
-        if isinstance(result, list):
-            for item in result:
-                if not isinstance(item, dict):
-                    continue
-                tx_hash = item.get('txHash') or item.get('transactionHash') or ''
-                root = item.get('result') if isinstance(item.get('result'), dict) else item
-                walk_call(root, tx_hash)
-            if found:
-                print(f'Robinhood internal trace method=debug_traceBlockByNumber block={block_number} creates={len(found)}')
-                return found
-    except Exception as e:
-        print(f'Robinhood debug trace unavailable block={block_number}: {type(e).__name__}: {e}')
+              for method in ('arbtrace_block', 'trace_block'):
+                  try:
+                      resp = await self.w3.provider.make_request(method, [block_hex])
+                      result = resp.get('result') if isinstance(resp, dict) else None
+                      if not isinstance(result, list):
+                          continue
+                      local = []
+                      for item in result:
+                          if not isinstance(item, dict):
+                              continue
+                          if str(item.get('type') or '').lower() != 'create':
+                              continue
+                          action = item.get('action') or {}
+                          output = item.get('result') or {}
+                          address = output.get('address')
+                          if address:
+                              local.append({
+                                  'address': address,
+                                  'creator': action.get('from') or '',
+                                  'block_number': int(block_number),
+                                  'tx_hash': item.get('transactionHash') or '',
+                              })
+                      if local:
+                          print(f'Robinhood internal trace method={method} block={block_number} creates={len(local)}')
+                          return local
+                  except Exception as e:
+                      print(f'Robinhood {method} unavailable block={block_number}: {type(e).__name__}: {e}')
 
-    # Parity/OpenEthereum-style trace APIs exposed by some Nitro providers.
-    for method in ('arbtrace_block', 'trace_block'):
-        try:
-            resp = await self.w3.provider.make_request(method, [block_hex])
-            result = resp.get('result') if isinstance(resp, dict) else None
-            if not isinstance(result, list):
-                continue
-            local = []
-            for item in result:
-                if not isinstance(item, dict):
-                    continue
-                if str(item.get('type') or '').lower() != 'create':
-                    continue
-                action = item.get('action') or {}
-                output = item.get('result') or {}
-                address = output.get('address')
-                if address:
-                    local.append({
-                        'address': address,
-                        'creator': action.get('from') or '',
-                        'block_number': int(block_number),
-                        'tx_hash': item.get('transactionHash') or '',
-                    })
-            if local:
-                print(f'Robinhood internal trace method={method} block={block_number} creates={len(local)}')
-                return local
-        except Exception as e:
-            print(f'Robinhood {method} unavailable block={block_number}: {type(e).__name__}: {e}')
+              return []
 
-    return []
+          async def _rh_get_contract_creations(self, block_number: int):
+              events = await _RH_ORIGINAL_GET_CONTRACT_CREATIONS(self, block_number)
+              seen_addresses = {str(e.get('address') or '').lower() for e in events}
 
-async def _rh_get_contract_creations(self, block_number: int):
-    events = await _RH_ORIGINAL_GET_CONTRACT_CREATIONS(self, block_number)
-    seen_addresses = {str(e.get('address') or '').lower() for e in events}
+              for event in await _rh_trace_internal_creations(self, block_number):
+                  address = str(event.get('address') or '')
+                  if not address or address.lower() in seen_addresses:
+                      continue
+                  try:
+                      code = await self.get_code(address)
+                      if not code:
+                          continue
+                  except Exception:
+                      continue
 
-    for event in await _rh_trace_internal_creations(self, block_number):
-        address = str(event.get('address') or '')
-        if not address or address.lower() in seen_addresses:
-            continue
-        try:
-            code = await self.get_code(address)
-            if not code:
-                continue
-        except Exception:
-            continue
+                  creator = str(event.get('creator') or '')
+                  tx_hash = str(event.get('tx_hash') or '')
+                  save_token_creator(address, creator, block_number, tx_hash)
+                  events.append({
+                      'address': address,
+                      'creator': creator,
+                      'block_number': int(block_number),
+                      'tx_hash': tx_hash,
+                  })
+                  seen_addresses.add(address.lower())
+                  print(f'Robinhood internal contract detected address={address} creator={creator} block={block_number}')
 
-        creator = str(event.get('creator') or '')
-        tx_hash = str(event.get('tx_hash') or '')
-        save_token_creator(address, creator, block_number, tx_hash)
-        events.append({
-            'address': address,
-            'creator': creator,
-            'block_number': int(block_number),
-            'tx_hash': tx_hash,
-        })
-        seen_addresses.add(address.lower())
-        print(f'Robinhood internal contract detected address={address} creator={creator} block={block_number}')
+              return events
 
-    return events
-
-HyperEVMBlockMonitor.get_contract_creations = _rh_get_contract_creations
-''')
+          HyperEVMBlockMonitor.get_contract_creations = _rh_get_contract_creations
+          ''')
           PY
 
           grep -q 'CHAIN_ID = 4663' /tmp/robinhood-radar/config.py
