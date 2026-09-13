@@ -1,0 +1,88 @@
+name: Diagnose Robinhood Telegram
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/diagnose-robinhood-telegram.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Configure SSH
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          touch ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts
+
+      - name: Diagnose Robinhood Telegram path read-only
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          SSH="ssh -i $HOME/.ssh/deploy_key -p $SERVER_PORT -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30"
+          $SSH "$SERVER_USER@$SERVER_HOST" 'bash -s' <<'REMOTE'
+          set -u
+          echo "=== SERVICE ==="
+          systemctl is-active robinhood-radar.service || true
+          systemctl is-enabled robinhood-radar.service || true
+          systemctl show robinhood-radar.service -p MainPID -p NRestarts -p ExecMainStartTimestamp --no-pager || true
+
+          echo "=== ENV PRESENCE ONLY ==="
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/opt/robinhood-radar/.env')
+          vals={}
+          if p.exists():
+              for line in p.read_text(errors='ignore').splitlines():
+                  line=line.strip()
+                  if not line or line.startswith('#') or '=' not in line: continue
+                  k,v=line.split('=',1)
+                  vals[k.strip()]=v.strip()
+          for k in ['TELEGRAM_BOT_TOKEN','TELEGRAM_CHAT_ID','ROBINHOOD_SEARCH_API_URL','ROBINHOOD_SEARCH_API_KEY']:
+              print(f'{k}_CONFIGURED={bool(vals.get(k))}')
+          PY
+
+          echo "=== TELEGRAM/CANDIDATE LOGS LAST 6H ==="
+          journalctl -u robinhood-radar.service --since '6 hours ago' --no-pager 2>/dev/null \
+            | grep -Ei 'telegram|candidate|contract error|platform|family|Factory token creation|internal contract detected|B-level contract recorded' \
+            | tail -300 || true
+
+          echo "=== RECENT ERRORS LAST 6H ==="
+          journalctl -u robinhood-radar.service --since '6 hours ago' --no-pager 2>/dev/null \
+            | grep -Ei 'error|exception|traceback|failed|timeout|429|400|401|403' \
+            | tail -200 || true
+
+          echo "=== DB SUMMARY ==="
+          python3 - <<'PY'
+          import sqlite3, os
+          p='/opt/robinhood-radar/data/radar.db'
+          print('DB_EXISTS=',os.path.exists(p))
+          if not os.path.exists(p): raise SystemExit
+          con=sqlite3.connect(p)
+          tables=[r[0] for r in con.execute('select name from sqlite_master where type="table" order by name')]
+          print('TABLES=',','.join(tables))
+          for t in ['contracts','platform_candidates','platform_families','platform_family_intelligence','platform_token_matches']:
+              if t in tables:
+                  try:
+                      print(f'{t}_COUNT=',con.execute(f'select count(*) from {t}').fetchone()[0])
+                  except Exception as e:
+                      print(f'{t}_COUNT_ERROR={type(e).__name__}:{e}')
+          if 'contracts' in tables:
+              try:
+                  rows=con.execute('select * from contracts order by rowid desc limit 5').fetchall()
+                  print('CONTRACTS_LAST5_ROWS=',len(rows))
+              except Exception as e:
+                  print('CONTRACTS_LAST5_ERROR=',type(e).__name__,str(e))
+          PY
+          REMOTE
