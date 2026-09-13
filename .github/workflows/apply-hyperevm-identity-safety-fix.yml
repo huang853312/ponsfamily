@@ -26,6 +26,7 @@ jobs:
           python -m pip install --disable-pip-version-check requests aiohttp web3
           cd hyperevm-radar
           PYTHONPATH=. python -m unittest discover -s tests -p test_identity_candidate_safety.py -v
+          PYTHONPATH=. python -m unittest discover -s tests -p test_search_quality.py -v
           python -m compileall -q platform_family_intelligence.py
       - name: Extract search-only patch
         run: |
@@ -34,12 +35,12 @@ jobs:
           from pathlib import Path
           s=Path('hyperevm-radar/platform_family_intelligence.py').read_text()
           import ast, subprocess
-          def method(source):
-              cls=next(n for n in ast.parse(source).body if isinstance(n,ast.ClassDef) and n.name=='FamilyIntelligenceEngine')
-              n=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='enrich')
+          def method(source,classname='FamilyIntelligenceEngine',methodname='enrich'):
+              cls=next(n for n in ast.parse(source).body if isinstance(n,ast.ClassDef) and n.name==classname)
+              n=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name==methodname)
               return ''.join(source.splitlines(keepends=True)[n.lineno-1:n.end_lineno])
-          baseline=subprocess.check_output(['git','show','a5d29f8866389ca937d667ebb6d92e09e847d2e1^:hyperevm-radar/platform_family_intelligence.py'],text=True)
-          Path('search-patch.json').write_text(json.dumps({'block':method(s),'baseline':method(baseline)}))
+          baseline=subprocess.check_output(['git','show','4ccacb06f29dd51aa3551604a145dc43a41ccbc1^:hyperevm-radar/platform_family_intelligence.py'],text=True)
+          Path('search-patch.json').write_text(json.dumps({'block':method(s),'baseline':method(baseline),'search':method(s,'CompositeSearchProvider','search'),'search_baseline':method(baseline,'CompositeSearchProvider','search')}))
           PY
       - name: Configure SSH
         env:
@@ -74,14 +75,21 @@ jobs:
           import difflib
           base=payload['baseline'].splitlines(keepends=True);target=payload['block'].splitlines(keepends=True)
           print(''.join(difflib.unified_diff(base,old_method.splitlines(keepends=True),fromfile='baseline',tofile='production')),flush=True)
-          patched=old_method.replace('x_url=next((url for url in dict.fromkeys(x_urls) if not _is_shared_provider_x(url)),"")','x_url=next(iter(dict.fromkeys(x_urls)),"")')
+          patched=old_method
           for tag,i,j,k,l in reversed(difflib.SequenceMatcher(None,base,target,autojunk=False).get_opcodes()):
               if tag=='equal':continue
               before=''.join(base[i:j]);after=''.join(target[k:l])
               assert before and patched.count(before)==1,'Patch context differs from production'
               patched=patched.replace(before,after,1)
-          patched=patched.replace('for candidate in list(dict.fromkeys(x_urls))[:6]:','for candidate in [u for u in dict.fromkeys(x_urls) if not _is_shared_provider_x(u)][:6]:')
+
           lines[node.lineno-1:node.end_lineno]=[patched+'\n'];fixed=''.join(lines)
+          cls=next(n for n in ast.parse(fixed).body if isinstance(n,ast.ClassDef) and n.name=='CompositeSearchProvider')
+          searchnode=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='search')
+          searchlines=fixed.splitlines(keepends=True)
+          current=''.join(searchlines[searchnode.lineno-1:searchnode.end_lineno])
+          assert ast.dump(ast.parse(textwrap.dedent(current)),include_attributes=False)==ast.dump(ast.parse(textwrap.dedent(payload['search_baseline'])),include_attributes=False),'Search baseline differs'
+          searchlines[searchnode.lineno-1:searchnode.end_lineno]=[payload['search']+'\n']
+          fixed=''.join(searchlines)
           compile(fixed,str(p),'exec')
           backup=p.with_name(p.name+'.before_identity_safety_fix_'+time.strftime('%Y%m%dT%H%M%SZ',time.gmtime()))
           import shutil
@@ -99,6 +107,11 @@ jobs:
               print('ROLLED_BACK_IDENTITY_PATCH',flush=True)
               raise
           payload_path.unlink(missing_ok=True)
+          import sqlite3
+          with sqlite3.connect('/opt/hyperevm-radar/data/radar.db') as c:
+              # One-time retry only for failed family investigations; keep history.
+              cursor=c.execute("UPDATE platform_identity_investigations SET next_retry_at=0 WHERE verification_status IN ('NO_DATA','PARTIAL') AND subject_key LIKE 'family:%'")
+              print('FAILED_FAMILIES_REQUEUED',cursor.rowcount,flush=True)
           print('DEPLOYMENT_VERIFIED',flush=True)
           PY
       - name: Read post-restart Radar logs
