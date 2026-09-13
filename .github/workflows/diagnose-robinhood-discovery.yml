@@ -1,0 +1,109 @@
+name: Diagnose Robinhood Contract Discovery
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/diagnose-robinhood-discovery.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Configure SSH
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          touch ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts
+
+      - name: Diagnose Robinhood discovery sources read-only
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          SSH="ssh -i $HOME/.ssh/deploy_key -p $SERVER_PORT -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30"
+          $SSH "$SERVER_USER@$SERVER_HOST" 'python3 - <<"PY"
+          import json
+          import urllib.request
+          import urllib.error
+
+          RPC="https://rpc.mainnet.chain.robinhood.com"
+          SCOUT="https://robinhoodchain.blockscout.com"
+          UA="Mozilla/5.0 RobinhoodRadar-Diagnostic/1.0"
+
+          def rpc(method, params):
+              body=json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode()
+              req=urllib.request.Request(RPC,data=body,headers={"Content-Type":"application/json","User-Agent":UA})
+              try:
+                  with urllib.request.urlopen(req,timeout=20) as r:
+                      return json.loads(r.read().decode())
+              except Exception as e:
+                  return {"transport_error":repr(e)}
+
+          def get(url):
+              req=urllib.request.Request(url,headers={"User-Agent":UA,"Accept":"application/json"})
+              try:
+                  with urllib.request.urlopen(req,timeout=20) as r:
+                      raw=r.read().decode(errors="replace")
+                      return r.status, raw
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read().decode(errors="replace")
+              except Exception as e:
+                  return 0, repr(e)
+
+          cid=rpc("eth_chainId",[])
+          latest_resp=rpc("eth_blockNumber",[])
+          print("CHAIN",json.dumps(cid)[:500])
+          print("LATEST",json.dumps(latest_resp)[:500])
+          latest=int(latest_resp.get("result","0x0"),16)
+          block_hex=hex(latest)
+          print("BLOCK",latest,block_hex)
+
+          for method,params in [
+              ("debug_traceBlockByNumber",[block_hex,{"tracer":"callTracer","timeout":"5s"}]),
+              ("arbtrace_block",[block_hex]),
+              ("trace_block",[block_hex]),
+          ]:
+              out=rpc(method,params)
+              summary={"keys":list(out.keys()),"error":out.get("error"),"transport_error":out.get("transport_error")}
+              result=out.get("result")
+              if isinstance(result,list):
+                  summary["result_type"]="list"
+                  summary["result_len"]=len(result)
+                  summary["sample"]=result[:1]
+              elif result is not None:
+                  summary["result_type"]=type(result).__name__
+                  summary["sample"]=result
+              print("TRACE",method,json.dumps(summary,default=str)[:3000])
+
+          top_level=[]
+          tx_total=0
+          for n in range(max(0,latest-40),latest+1):
+              b=rpc("eth_getBlockByNumber",[hex(n),True])
+              obj=b.get("result") or {}
+              txs=obj.get("transactions") or []
+              tx_total += len(txs)
+              for tx in txs:
+                  if tx.get("to") is None:
+                      top_level.append((n,tx.get("hash"),tx.get("from")))
+          print("TOP_LEVEL_SCAN blocks=41 txs=%d creations=%d sample=%s" % (tx_total,len(top_level),top_level[:5]))
+
+          urls=[
+              f"{SCOUT}/api/v2/blocks/{latest}",
+              f"{SCOUT}/api/v2/blocks/{latest}/transactions",
+              f"{SCOUT}/api/v2/main-page/blocks",
+              f"{SCOUT}/api?module=block&action=getblockreward&blockno={latest}",
+          ]
+          for url in urls:
+              status,raw=get(url)
+              print("SCOUT",status,url,raw[:2000].replace("\n"," "))
+          PY'
