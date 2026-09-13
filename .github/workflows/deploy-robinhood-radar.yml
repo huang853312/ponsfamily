@@ -58,6 +58,15 @@ jobs:
           s = s.replace('https://rpc.hyperliquid.xyz/evm', 'https://rpc.mainnet.chain.robinhood.com')
           cfg.write_text(s)
 
+          # Chain-adapter-only startup guard. Keep canonical HyperEVM source untouched.
+          main = root / 'main.py'
+          s = main.read_text()
+          old = 'if chain_id != 999:'
+          new = 'if chain_id != 4663:'
+          if old not in s:
+              raise RuntimeError('Expected HyperEVM chain-id guard not found in protected snapshot')
+          main.write_text(s.replace(old, new, 1))
+
           exact = [
               ('https://hyperevmscan.io/address/', 'https://robinhoodchain.blockscout.com/address/'),
               ('https://rpc.hyperliquid.xyz/evm', 'https://rpc.mainnet.chain.robinhood.com'),
@@ -117,6 +126,7 @@ jobs:
 
           grep -q 'CHAIN_ID = 4663' /tmp/robinhood-radar/config.py
           grep -q 'https://rpc.mainnet.chain.robinhood.com' /tmp/robinhood-radar/config.py
+          grep -q 'if chain_id != 4663:' /tmp/robinhood-radar/main.py
           grep -q 'derive_core_words' /tmp/robinhood-radar/platform_family_intelligence.py
           cd /tmp/robinhood-radar
           PYTHONPATH=. python3 -m unittest discover -s tests -v
