@@ -1,4 +1,4 @@
-name: Diagnose All Radar APIs
+name: Diagnose HyperEVM APIs
 on:
   push:
     branches: [main]
@@ -18,7 +18,7 @@ jobs:
           install -d -m 700 ~/.ssh
           printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-      - name: Inventory and probe both Radar environments without secrets
+      - name: Inventory and probe HyperEVM environment without secrets
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
@@ -59,7 +59,7 @@ jobs:
               rows=p.get('results') or p.get('organic') or (p.get('web') or {}).get('results') or (data.get('webPages') or {}).get('value') or []
               return sum(1 for x in rows if isinstance(x,dict) and (x.get('url') or x.get('link'))) if isinstance(rows,list) else 0
           seen=set()
-          for chain in ['hyperevm','robinhood']:
+          for chain in ['hyperevm']:
               root=Path('/opt/'+chain+'-radar')
               stored=dotenv(root/'.env')
               proc={}
