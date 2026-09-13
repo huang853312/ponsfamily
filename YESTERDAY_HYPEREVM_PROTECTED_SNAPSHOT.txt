@@ -1,0 +1,3 @@
+Protected snapshot marker for the canonical HyperEVM logic preserved before legacy radar shutdown.
+Source commit: 1414b35c86e09a7073f4bd5e17f564f29191706f
+Do not use legacy BNB/Robinhood/old HyperEVM logic to overwrite this canonical HyperEVM logic.
