@@ -56,6 +56,8 @@ jobs:
           def count(p):
               if not isinstance(p,dict):return 0
               data=p.get('data') or {}
+              if isinstance(p.get('results'),dict):
+                  return sum(1 for x in p['results'].get('web',[]) if isinstance(x,dict) and x.get('url'))
               rows=p.get('results') or p.get('organic') or (p.get('web') or {}).get('results') or (data.get('webPages') or {}).get('value') or []
               return sum(1 for x in rows if isinstance(x,dict) and (x.get('url') or x.get('link'))) if isinstance(rows,list) else 0
           seen=set()
@@ -92,6 +94,9 @@ jobs:
               for name,value in env.items():
                   if not value or not re.search(r'KEY|TOKEN',name,re.I):continue
                   spec=None
+                  if name=='EXA_API_KEY':spec=('EXA','POST','https://api.exa.ai/search',{'headers':{'x-api-key':value},'json':{'query':'HyperLend HyperEVM official','numResults':3}})
+                  elif name=='YDC_API_KEY':spec=('YOU','POST','https://ydc-index.io/v1/search',{'headers':{'X-API-Key':value},'json':{'query':'HyperLend HyperEVM official','count':3}})
+                  elif name=='TINYFISH_API_KEY':spec=('TINYFISH','GET','https://api.search.tinyfish.ai',{'headers':{'X-API-Key':value},'params':{'q':'HyperLend HyperEVM official','query':'HyperLend HyperEVM official'}})
                   if 'BRAVE' in name.upper():spec=('BRAVE','GET','https://api.search.brave.com/res/v1/web/search',{'headers':{'X-Subscription-Token':value},'params':{'q':'HyperLend HyperEVM official','count':3}})
                   elif 'SERPER' in name.upper():spec=('SERPER','POST','https://google.serper.dev/search',{'headers':{'X-API-KEY':value},'json':{'q':'HyperLend HyperEVM official','num':3}})
                   elif 'TAVILY' in name.upper():spec=('TAVILY','POST','https://api.tavily.com/search',{'headers':{'Authorization':'Bearer '+value},'json':{'query':'HyperLend HyperEVM official','max_results':3}})
