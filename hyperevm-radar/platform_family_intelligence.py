@@ -71,31 +71,73 @@ class SearchProvider:
         raise NotImplementedError
 
 class ConfiguredJsonSearchProvider(SearchProvider):
-    """Optional structured search API configured by environment variables."""
+    """Configured API, with explicit LangSearch request/response adaptation."""
     name = "configured_search_api"
     def __init__(self, endpoint=None, api_key=None):
         self.endpoint = endpoint or os.getenv("HYPEREVM_SEARCH_API_URL", "")
         self.api_key = api_key or os.getenv("HYPEREVM_SEARCH_API_KEY", "")
+    @staticmethod
+    def _hits(rows, source):
+        if not isinstance(rows, list):
+            raise ValueError("Search API result list is invalid")
+        return [SearchHit(str(x.get("url") or x.get("link")), str(x.get("title") or x.get("name") or ""),
+            str(x.get("snippet") or x.get("description") or " ".join(x.get("snippets") or []) or ""), source)
+            for x in rows if isinstance(x, dict) and (x.get("url") or x.get("link"))]
     def search(self, query, timeout):
         if not self.endpoint:
             return []
-        url = self.endpoint.format(query=quote_plus(query))
         headers = {"Accept": "application/json", "User-Agent": "HyperEVM-Radar/3.0"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        response = requests.get(url, headers=headers, timeout=timeout)
+        if urlparse(self.endpoint).hostname == "api.langsearch.com":
+            response = requests.post(self.endpoint, headers=headers,
+                json={"query": query, "count": 5, "freshness": "noLimit", "summary": False}, timeout=timeout)
+            response.raise_for_status()
+            payload = response.json()
+            rows = (payload.get("data") or {}).get("webPages", {}).get("value") or []
+        else:
+            response = requests.get(self.endpoint.format(query=quote_plus(query)), headers=headers, timeout=timeout)
+            response.raise_for_status()
+            payload = response.json()
+            rows = payload.get("results") or payload.get("organic") or payload.get("web", {}).get("results") or []
+        return self._hits(rows, self.name)
+
+class YouSearchProvider(SearchProvider):
+    name = "you_search_api"
+    def __init__(self):
+        self.api_key = os.getenv("YDC_API_KEY", "")
+    def search(self, query, timeout):
+        if not self.api_key:
+            return []
+        response = requests.post("https://ydc-index.io/v1/search", headers={"X-API-Key": self.api_key},
+            json={"query": query, "count": 5}, timeout=timeout)
         response.raise_for_status()
-        payload = response.json()
-        rows = payload.get("results") or payload.get("organic") or payload.get("web", {}).get("results") or []
-        return [
-            SearchHit(
-                str(x.get("url") or x.get("link") or ""),
-                str(x.get("title") or ""),
-                str(x.get("snippet") or x.get("description") or ""),
-                self.name,
-            )
-            for x in rows if x.get("url") or x.get("link")
-        ]
+        return ConfiguredJsonSearchProvider._hits((response.json().get("results") or {}).get("web") or [], self.name)
+
+class ExaSearchProvider(SearchProvider):
+    name = "exa_search_api"
+    def __init__(self):
+        self.api_key = os.getenv("EXA_API_KEY", "")
+    def search(self, query, timeout):
+        if not self.api_key:
+            return []
+        response = requests.post("https://api.exa.ai/search", headers={"x-api-key": self.api_key},
+            json={"query": query, "numResults": 5}, timeout=timeout)
+        response.raise_for_status()
+        return ConfiguredJsonSearchProvider._hits(response.json().get("results") or [], self.name)
+
+class TinyFishSearchProvider(SearchProvider):
+    name = "tinyfish_search_api"
+    def __init__(self):
+        self.api_key = os.getenv("TINYFISH_API_KEY", "")
+    def search(self, query, timeout):
+        if not self.api_key:
+            return []
+        response = requests.get("https://api.search.tinyfish.ai", headers={"X-API-Key": self.api_key},
+            params={"q": query, "query": query}, timeout=timeout)
+        response.raise_for_status()
+        return ConfiguredJsonSearchProvider._hits(response.json().get("results") or [], self.name)
+
 
 class _Links(HTMLParser):
     def __init__(self):
@@ -195,7 +237,7 @@ class BingSearchProvider(SearchProvider):
 
 class CompositeSearchProvider(SearchProvider):
     def __init__(self, providers=None):
-        self.providers=providers or (ConfiguredJsonSearchProvider(), DuckDuckGoSearchProvider(), BingSearchProvider())
+        self.providers=providers or (ConfiguredJsonSearchProvider(), YouSearchProvider(), ExaSearchProvider(), TinyFishSearchProvider(), DuckDuckGoSearchProvider(), BingSearchProvider())
     def search(self, query, timeout):
         hits=[]; seen=set()
         for provider in self.providers:
