@@ -148,3 +148,5 @@ jobs:
           # manual diagnostic trigger: 2026-09-13T04:00+08:00
 
 # Read-only post-search-fix diagnostic: 2026-09-14
+
+# User-requested runtime verification after API repair
