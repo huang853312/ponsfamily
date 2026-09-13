@@ -1,0 +1,101 @@
+name: Apply HyperEVM Identity Safety Fix
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/apply-hyperevm-identity-safety-fix.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: deploy-hyperevm-radar-production
+  cancel-in-progress: false
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test adapter request formats
+        run: |
+          python -m pip install --disable-pip-version-check requests aiohttp web3
+          cd hyperevm-radar
+          PYTHONPATH=. python -m unittest discover -s tests -p test_identity_candidate_safety.py -v
+          python -m compileall -q platform_family_intelligence.py
+      - name: Extract search-only patch
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          s=Path('hyperevm-radar/platform_family_intelligence.py').read_text()
+          import ast, subprocess
+          def method(source):
+              cls=next(n for n in ast.parse(source).body if isinstance(n,ast.ClassDef) and n.name=='FamilyIntelligenceEngine')
+              n=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='enrich')
+              return ''.join(source.splitlines(keepends=True)[n.lineno-1:n.end_lineno])
+          baseline=subprocess.check_output(['git','show','a5d29f8866389ca937d667ebb6d92e09e847d2e1^:hyperevm-radar/platform_family_intelligence.py'],text=True)
+          Path('search-patch.json').write_text(json.dumps({'block':method(s),'baseline':method(baseline)}))
+          PY
+      - name: Configure SSH
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+      - name: Apply search-only patch and verify live APIs
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          scp -i ~/.ssh/deploy_key -P "$SERVER_PORT" -o StrictHostKeyChecking=accept-new search-patch.json "$SERVER_USER@$SERVER_HOST:/tmp/hyperevm-search-patch-$GITHUB_RUN_ID.json"
+          ssh -i ~/.ssh/deploy_key -p "$SERVER_PORT" -o StrictHostKeyChecking=accept-new "$SERVER_USER@$SERVER_HOST" "sudo /opt/hyperevm-radar/.venv/bin/python - /tmp/hyperevm-search-patch-$GITHUB_RUN_ID.json" <<'PY'
+          import ast,copy,importlib.util,json,os,subprocess,sys,time
+          from pathlib import Path
+          sys.dont_write_bytecode=True
+          pid=subprocess.check_output(['systemctl','show','hyperevm-radar.service','-p','MainPID','--value'],text=True).strip()
+          if not pid.isdigit() or pid=='0':raise RuntimeError('Radar process unavailable')
+          for raw in Path('/proc/'+pid+'/environ').read_bytes().split(b'\0'):
+              if b'=' in raw:
+                  k,v=raw.split(b'=',1);os.environ[k.decode()]=v.decode()
+          p=Path('/opt/hyperevm-radar/platform_family_intelligence.py')
+          old=p.read_text()
+          import textwrap
+          payload_path=Path(sys.argv[1]);payload=json.loads(payload_path.read_text())
+          cls=next(n for n in ast.parse(old).body if isinstance(n,ast.ClassDef) and n.name=='FamilyIntelligenceEngine')
+          node=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='enrich')
+          lines=old.splitlines(keepends=True);old_method=''.join(lines[node.lineno-1:node.end_lineno])
+          assert ast.dump(ast.parse(textwrap.dedent(old_method)),include_attributes=False)==ast.dump(ast.parse(textwrap.dedent(payload['baseline'])),include_attributes=False),'Production enrich differs from baseline'
+          lines[node.lineno-1:node.end_lineno]=[payload['block']+'\n'];fixed=''.join(lines)
+          compile(fixed,str(p),'exec')
+          backup=p.with_name(p.name+'.before_identity_safety_fix_'+time.strftime('%Y%m%dT%H%M%SZ',time.gmtime()))
+          import shutil
+          shutil.copy2(p,backup);st=p.stat()
+          temp=p.with_name(p.name+'.searchfix.tmp')
+          temp.write_text(fixed);os.chmod(temp,st.st_mode);os.chown(temp,st.st_uid,st.st_gid);os.replace(temp,p)
+          print('IDENTITY_METHOD_PATCH_APPLIED BACKUP',backup.name,flush=True)
+          try:
+              subprocess.run(['systemctl','restart','hyperevm-radar.service'],check=True)
+              time.sleep(15)
+              subprocess.run(['systemctl','is-active','--quiet','hyperevm-radar.service'],check=True)
+              print(subprocess.check_output(['systemctl','show','hyperevm-radar.service','-p','ActiveState','-p','SubState','-p','NRestarts'],text=True),flush=True)
+          except Exception:
+              shutil.copy2(backup,p);subprocess.run(['systemctl','restart','hyperevm-radar.service'])
+              print('ROLLED_BACK_IDENTITY_PATCH',flush=True)
+              raise
+          payload_path.unlink(missing_ok=True)
+          print('DEPLOYMENT_VERIFIED',flush=True)
+          PY
+      - name: Read post-restart Radar logs
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -p "$SERVER_PORT" -o StrictHostKeyChecking=accept-new "$SERVER_USER@$SERVER_HOST" 'sudo journalctl -u hyperevm-radar.service --since "3 minutes ago" -n 100 --no-pager'
