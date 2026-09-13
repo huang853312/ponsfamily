@@ -34,11 +34,22 @@ jobs:
       - name: Install test dependencies
         run: python3 -m pip install --disable-pip-version-check aiohttp requests web3
 
+      - name: Apply GitBook identity false-positive guard
+        run: |
+          python3 hyperevm-radar/tools/apply_gitbook_identity_guard.py hyperevm-radar/platform_family_intelligence.py
+          grep -q SHARED_IDENTITY_HOSTS hyperevm-radar/platform_family_intelligence.py
+          grep -q REJECTED_SHARED_PROVIDER_X hyperevm-radar/platform_family_intelligence.py
+
       - name: Test HyperEVM Radar
         working-directory: hyperevm-radar
         run: |
           PYTHONPATH=. python3 -m unittest discover -s tests -v
           python3 -m compileall -q .
+          PYTHONPATH=. python3 - <<'PY'
+          from platform_family_intelligence import derive_core_words, extract_core_word
+          assert derive_core_words('tumble') == ['tum','tumb','tumbl']
+          assert extract_core_word('https://www.gitbook.com/') == ''
+          PY
 
       - name: Configure SSH
         env:
@@ -106,6 +117,7 @@ jobs:
 
             sudo systemctl status hyperevm-radar.service --no-pager || true
             sudo systemctl show hyperevm-radar.service -p Environment --no-pager | grep -F "PYTHONUNBUFFERED=1"
+            grep -q SHARED_IDENTITY_HOSTS /opt/hyperevm-radar/platform_family_intelligence.py
             sudo journalctl -u hyperevm-radar.service -n 40 --no-pager
             test "$service_active" = true
           '
