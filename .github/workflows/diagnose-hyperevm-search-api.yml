@@ -46,7 +46,7 @@ jobs:
           print('QUERY_PLACEHOLDER_PRESENT=', '{query}' in endpoint)
           provider_host=urlparse(endpoint).hostname or ''
           known_hosts={'google.serper.dev','api.tavily.com','api.search.brave.com','serpapi.com','api.bing.microsoft.com'}
-          print('SEARCH_PROVIDER=',provider_host if provider_host in known_hosts else 'OTHER')
+          print('SEARCH_PROVIDER=',provider_host)
           for name in sorted(env):
               if any(word in name.upper() for word in ['SEARCH','SERPER','TAVILY','BRAVE','SERPAPI']):
                   print('SEARCH_ENV_NAME=',name,'PRESENT=',bool(env[name]))
