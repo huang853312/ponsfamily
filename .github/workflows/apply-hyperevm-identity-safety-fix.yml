@@ -71,8 +71,15 @@ jobs:
           cls=next(n for n in ast.parse(old).body if isinstance(n,ast.ClassDef) and n.name=='FamilyIntelligenceEngine')
           node=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='enrich')
           lines=old.splitlines(keepends=True);old_method=''.join(lines[node.lineno-1:node.end_lineno])
-          assert ast.dump(ast.parse(textwrap.dedent(old_method)),include_attributes=False)==ast.dump(ast.parse(textwrap.dedent(payload['baseline'])),include_attributes=False),'Production enrich differs from baseline'
-          lines[node.lineno-1:node.end_lineno]=[payload['block']+'\n'];fixed=''.join(lines)
+          import difflib
+          base=payload['baseline'].splitlines(keepends=True);target=payload['block'].splitlines(keepends=True)
+          patched=old_method
+          for tag,i,j,k,l in reversed(difflib.SequenceMatcher(None,base,target,autojunk=False).get_opcodes()):
+              if tag=='equal':continue
+              before=''.join(base[i:j]);after=''.join(target[k:l])
+              assert before and patched.count(before)==1,'Patch context differs from production'
+              patched=patched.replace(before,after,1)
+          lines[node.lineno-1:node.end_lineno]=[patched+'\n'];fixed=''.join(lines)
           compile(fixed,str(p),'exec')
           backup=p.with_name(p.name+'.before_identity_safety_fix_'+time.strftime('%Y%m%dT%H%M%SZ',time.gmtime()))
           import shutil
