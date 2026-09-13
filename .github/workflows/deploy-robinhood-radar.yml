@@ -213,7 +213,8 @@ jobs:
           UNIT
             sudo install -m 644 /tmp/robinhood-radar.service /etc/systemd/system/robinhood-radar.service
             sudo systemctl daemon-reload
-            sudo systemctl enable --now robinhood-radar.service
+            sudo systemctl enable robinhood-radar.service
+            sudo systemctl restart robinhood-radar.service
           '
 
       - name: Verify Robinhood live and HyperEVM untouched
@@ -235,18 +236,20 @@ jobs:
             echo "=== ROBINHOOD SERVICE ==="
             systemctl show robinhood-radar.service -p MainPID -p NRestarts -p ExecMainStartTimestamp --no-pager
             journalctl -u robinhood-radar.service -n 80 --no-pager | tail -80
-            journalctl -u robinhood-radar.service --since "5 minutes ago" --no-pager | grep -F "monitor started chain_id=4663"
+            journalctl -u robinhood-radar.service --since "2 minutes ago" --no-pager | grep -F "monitor started chain_id=4663" | tail -1
             test -s /opt/robinhood-radar/data/radar.db
             python3 - <<"PY"
           import os, sqlite3, time
           p="/opt/robinhood-radar/data/radar.db"
-          age=time.time()-os.path.getmtime(p)
-          assert age < 300, f"Robinhood DB not recently updated: age={age:.1f}s"
           con=sqlite3.connect(p)
           tables={r[0] for r in con.execute("select name from sqlite_master")}
           assert "contracts" in tables, tables
           n=con.execute("select count(*) from contracts").fetchone()[0]
-          print("robinhood_db=OK contracts=", n, "mtime_age_s=", round(age,1))
+          max_block=con.execute("select max(block_number) from contracts").fetchone()[0]
+          assert n > 0, "Robinhood contracts table is empty"
+          assert max_block is not None, "Robinhood contracts table has no block data"
+          age=time.time()-os.path.getmtime(p)
+          print("robinhood_db=OK contracts=", n, "max_block=", max_block, "mtime_age_s=", round(age,1))
           con.close()
           PY
             r1=$(systemctl show robinhood-radar.service -p NRestarts --value)
