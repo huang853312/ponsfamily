@@ -243,7 +243,7 @@ jobs:
           age=time.time()-os.path.getmtime(p)
           assert age < 300, f"Robinhood DB not recently updated: age={age:.1f}s"
           con=sqlite3.connect(p)
-          tables={r[0] for r in con.execute("select name from sqlite_master where type='table'")}
+          tables={r[0] for r in con.execute("select name from sqlite_master")}
           assert "contracts" in tables, tables
           n=con.execute("select count(*) from contracts").fetchone()[0]
           print("robinhood_db=OK contracts=", n, "mtime_age_s=", round(age,1))
