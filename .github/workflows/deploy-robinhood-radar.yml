@@ -52,10 +52,6 @@ jobs:
           import ast, io, tokenize
 
           root = Path('/tmp/robinhood-radar')
-
-          # Chain adapter only. Python identifiers/module names are deliberately
-          # left unchanged so the protected detection/Family/identity/token logic
-          # remains 1:1 with the source snapshot.
           cfg = root / 'config.py'
           s = cfg.read_text()
           s = s.replace('CHAIN_ID = 999', 'CHAIN_ID = 4663')
@@ -78,8 +74,6 @@ jobs:
               ('hyperliquid', 'robinhood'),
           ]
 
-          # Rewrite string literals only; never rewrite Python identifiers such as
-          # HyperEVMBlockMonitor or detectors.hyperevm.
           for p in root.rglob('*.py'):
               src = p.read_text()
               toks = []
@@ -101,7 +95,6 @@ jobs:
               if changed:
                   p.write_text(tokenize.untokenize(toks))
 
-          # Non-Python config/docs may safely receive textual chain-name/env-key replacements.
           for p in [root/'.env.example', root/'README.md']:
               if not p.exists():
                   continue
@@ -110,11 +103,8 @@ jobs:
                   text = text.replace(a, b)
               p.write_text(text)
 
-          # Never seed Robinhood with HyperEVM deployer addresses/state.
           (root/'addresses.json').write_text('{\n  "deployers": []\n}\n')
 
-          # Robinhood official docs are a discovery-only ecosystem hint. Official
-          # verification semantics remain unchanged.
           p = root/'platform_identity_candidates.py'
           text = p.read_text()
           start = text.find('ECOSYSTEM_SOURCES = [')
@@ -128,7 +118,6 @@ jobs:
           grep -q 'CHAIN_ID = 4663' /tmp/robinhood-radar/config.py
           grep -q 'https://rpc.mainnet.chain.robinhood.com' /tmp/robinhood-radar/config.py
           grep -q 'derive_core_words' /tmp/robinhood-radar/platform_family_intelligence.py
-          # The canonical 3/4/5 tests must still pass after chain adaptation.
           cd /tmp/robinhood-radar
           PYTHONPATH=. python3 -m unittest discover -s tests -v
           python3 -m compileall -q .
@@ -160,11 +149,15 @@ jobs:
             systemctl is-enabled hyperevm-radar.service 2>/dev/null || true
             systemctl show hyperevm-radar.service -p MainPID -p NRestarts -p ExecMainStartTimestamp --no-pager 2>/dev/null || true
             echo "=== ROBINHOOD RPC ==="
-            python3 - <<"PY"
-          import json, urllib.request
-          req=urllib.request.Request("https://rpc.mainnet.chain.robinhood.com", data=json.dumps({"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}).encode(), headers={"Content-Type":"application/json"})
-          with urllib.request.urlopen(req, timeout=15) as r:
-              data=json.load(r)
+            body=$(curl -fsS --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 20 \
+              -A "Mozilla/5.0 RobinhoodRadar/1.0" \
+              -H "Content-Type: application/json" \
+              --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_chainId\",\"params\":[]}" \
+              https://rpc.mainnet.chain.robinhood.com)
+            printf "%s\n" "$body"
+            python3 - "$body" <<"PY"
+          import json, sys
+          data=json.loads(sys.argv[1])
           assert int(data["result"],16)==4663, data
           print("chain_id=4663 OK")
           PY
@@ -245,7 +238,7 @@ jobs:
           con.close()
           PY
             echo "=== HYPEREVM READ-ONLY CHECK ==="
-            systemctl is-active hyperevm-radar.service 2>/dev/null || true
-            systemctl is-enabled hyperevm-radar.service 2>/dev/null || true
-            systemctl show hyperevm-radar.service -p MainPID -p NRestarts -p ExecMainStartTimestamp --no-pager 2>/dev/null || true
+            test "$(systemctl is-active hyperevm-radar.service)" = active
+            test "$(systemctl is-enabled hyperevm-radar.service)" = enabled
+            systemctl show hyperevm-radar.service -p MainPID -p NRestarts -p ExecMainStartTimestamp --no-pager
           '
