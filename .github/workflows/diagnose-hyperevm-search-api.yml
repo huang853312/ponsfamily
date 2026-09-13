@@ -1,0 +1,78 @@
+name: Diagnose HyperEVM Search API
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/diagnose-hyperevm-search-api.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Configure SSH
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+      - name: Test production search configuration without changing Radar
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -p "$SERVER_PORT" \
+            -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 \
+            "$SERVER_USER@$SERVER_HOST" 'sudo /opt/hyperevm-radar/.venv/bin/python -' <<'PY'
+          import json, subprocess, sqlite3, time
+          from pathlib import Path
+          from urllib.parse import quote_plus, urlparse
+          import requests
+          pid=subprocess.check_output(['systemctl','show','hyperevm-radar.service','-p','MainPID','--value'],text=True).strip()
+          if not pid.isdigit() or pid=='0':
+              print('SERVICE_PROCESS_UNAVAILABLE')
+              raise SystemExit(1)
+          env={}
+          for entry in Path('/proc/'+pid+'/environ').read_bytes().split(b'\0'):
+              if b'=' in entry:
+                  k,v=entry.split(b'=',1)
+                  env[k.decode(errors='replace')]=v.decode(errors='replace')
+          endpoint=env.get('HYPEREVM_SEARCH_API_URL','')
+          key=env.get('HYPEREVM_SEARCH_API_KEY','')
+          print('SEARCH_URL_PRESENT=',bool(endpoint),'SEARCH_KEY_PRESENT=',bool(key))
+          print('QUERY_PLACEHOLDER_PRESENT=', '{query}' in endpoint)
+          if not endpoint:
+              raise SystemExit(1)
+          queries=[('KNOWN_PROJECT','HyperLend HyperEVM official')]
+          try:
+              conn=sqlite3.connect('file:/opt/hyperevm-radar/data/radar.db?mode=ro',uri=True)
+              row=conn.execute('SELECT address FROM platform_candidates ORDER BY block_number DESC LIMIT 1').fetchone()
+              conn.close()
+              if row: queries.append(('LATEST_CANDIDATE_ADDRESS','"'+row[0]+'"'))
+          except Exception as exc:
+              print('CANDIDATE_READ_ERROR=',type(exc).__name__)
+          for label,query in queries:
+              started=time.monotonic()
+              try:
+                  response=requests.get(endpoint.format(query=quote_plus(query)),headers={'Accept':'application/json','User-Agent':'HyperEVM-Radar/3.0',**({'Authorization':'Bearer '+key} if key else {})},timeout=10)
+                  print(label,'HTTP=',response.status_code,'SECONDS=',round(time.monotonic()-started,2))
+                  try: payload=response.json()
+                  except ValueError:
+                      print(label,'JSON_VALID=False')
+                      continue
+                  if not isinstance(payload,dict):
+                      print(label,'JSON_OBJECT=False')
+                      continue
+                  for field in ['results','organic','web','error','message','detail']:
+                      if field in payload: print(label,'FIELD_PRESENT=',field)
+                  web=payload.get('web')
+                  rows=payload.get('results') or payload.get('organic') or (web.get('results') if isinstance(web,dict) else None) or []
+                  usable=sum(1 for item in rows if isinstance(item,dict) and (item.get('url') or item.get('link'))) if isinstance(rows,list) else 0
+                  print(label,'PARSED_URL_COUNT=',usable)
+              except Exception as exc:
+                  print(label,'REQUEST_ERROR=',type(exc).__name__)
+          print('DIAGNOSTIC_COMPLETE_NO_RADAR_CHANGES')
+          PY
