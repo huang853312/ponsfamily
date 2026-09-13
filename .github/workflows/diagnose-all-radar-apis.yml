@@ -123,4 +123,4 @@ jobs:
           for label,url in [('DEFILLAMA','https://api.llama.fi/protocols'),('DEXSCREENER','https://api.dexscreener.com/latest/dex/tokens/0x5555555555555555555555555555555555555555'),('HYPEREVMSCAN_PUBLIC','https://hyperevmscan.io/address/0x5555555555555555555555555555555555555555'),('HYPERECO','https://hypereco.io/'),('DDG_HTML','https://html.duckduckgo.com/html/?q=HyperLend+HyperEVM'),('DDG_LITE','https://lite.duckduckgo.com/lite/?q=HyperLend+HyperEVM'),('BING_HTML','https://www.bing.com/search?q=HyperLend+HyperEVM')]:
               call(label,'GET',url,headers={'User-Agent':'Mozilla/5.0'})
           emit(diagnostic_complete=True,no_radar_changes=True)
-                    PY
+          PY
