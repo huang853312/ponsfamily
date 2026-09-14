@@ -1,0 +1,228 @@
+name: 一次性完成钱包雷达低内存部署
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/finalize-wallet-radar.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 本地完整检查
+        run: |
+          set -eu
+          python3 -m py_compile wallet-radar/main.py wallet-radar/main_fast.py wallet-radar/telegram_bot.py wallet-radar/telegram_console.py
+          grep -q "真实阶段中文进度提示已启用" wallet-radar/telegram_console.py
+          grep -q "find_prefunders_streaming" wallet-radar/main_fast.py
+          grep -q "find_returns_streaming" wallet-radar/main_fast.py
+          if grep -nE '(/opt/hyperevm-radar|systemctl (restart|stop|start) hyperevm-radar)' wallet-radar/main.py wallet-radar/main_fast.py wallet-radar/telegram_bot.py wallet-radar/telegram_console.py; then
+            echo "发现对现有 HyperEVM Radar 的修改依赖，拒绝部署。"
+            exit 1
+          fi
+
+      - name: 配置服务器连接
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          set -eu
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          touch ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: 等待服务器并只停止旧钱包分析
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -eu
+          SSH="ssh -i $HOME/.ssh/deploy_key -p $SERVER_PORT -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=accept-new -o ConnectTimeout=12 -o ServerAliveInterval=5 -o ServerAliveCountMax=2"
+          ok=0
+          for i in $(seq 1 30); do
+            if $SSH "$SERVER_USER@$SERVER_HOST" 'echo SSH_OK' >/tmp/ssh.out 2>/tmp/ssh.err; then
+              ok=1
+              break
+            fi
+            echo "第 $i 次等待服务器：$(tail -n 1 /tmp/ssh.err || true)"
+            sleep 15
+          done
+          if [ "$ok" != 1 ]; then
+            echo "服务器 7 分钟内仍不可达，未执行任何代码或服务修改。"
+            exit 1
+          fi
+
+          $SSH "$SERVER_USER@$SERVER_HOST" '
+            set -eu
+            echo "=== 部署前钱包雷达 ==="
+            systemctl is-active wallet-radar-bot.service || true
+            ps -eo pid,ppid,etime,%cpu,%mem,stat,cmd | grep -E "^ *[0-9]+ +[0-9]+ .* /opt/wallet-radar/.venv/bin/python /opt/wallet-radar/(main|main_fast)\.py analyze" || true
+
+            # 只终止 wallet-radar 自己的旧分析进程，不碰任何其它 Radar。
+            pids=$(pgrep -f "^/opt/wallet-radar/.venv/bin/python /opt/wallet-radar/(main|main_fast)\.py analyze( |$)" || true)
+            if [ -n "$pids" ]; then
+              echo "停止旧钱包分析进程：$pids"
+              kill $pids || true
+              sleep 3
+              pids2=$(pgrep -f "^/opt/wallet-radar/.venv/bin/python /opt/wallet-radar/(main|main_fast)\.py analyze( |$)" || true)
+              if [ -n "$pids2" ]; then
+                kill -9 $pids2 || true
+              fi
+            fi
+            echo "=== 释放后内存 ==="
+            free -h || true
+          '
+
+      - name: 部署最新钱包雷达文件
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -eu
+          SSH="ssh -i $HOME/.ssh/deploy_key -p $SERVER_PORT -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20"
+
+          $SSH "$SERVER_USER@$SERVER_HOST" '
+            set -eu
+            sudo mkdir -p /opt/wallet-radar
+            sudo chown -R "$USER":"$(id -gn)" /opt/wallet-radar
+            systemctl show hyperevm-radar.service -p MainPID -p NRestarts -p ExecMainStartTimestamp --no-pager 2>/dev/null | sort > /tmp/final-wallet-hyper-before.txt || true
+          '
+
+          rsync -az \
+            --exclude='.venv/' \
+            --exclude='.env' \
+            --exclude='reports/' \
+            --exclude='*.csv' \
+            --exclude='*.sqlite*' \
+            --exclude='__pycache__/' \
+            --exclude='*.pyc' \
+            -e "$SSH" \
+            wallet-radar/ "$SERVER_USER@$SERVER_HOST:/opt/wallet-radar/"
+
+          $SSH "$SERVER_USER@$SERVER_HOST" '
+            set -eu
+            cd /opt/wallet-radar
+            test -x .venv/bin/python || python3 -m venv .venv
+            .venv/bin/python -m pip install --disable-pip-version-check -q -r requirements.txt
+            touch .env
+            chmod 600 .env
+
+            set_env() {
+              key="$1"; value="$2"
+              if grep -q "^${key}=" .env; then
+                sed -i "s|^${key}=.*|${key}=${value}|" .env
+              else
+                printf "%s=%s\n" "$key" "$value" >> .env
+              fi
+            }
+
+            set_env ROBINHOOD_RPC_URL https://rpc.mainnet.chain.robinhood.com
+            set_env HYPEREVM_RPC_URL https://rpc.hyperliquid.xyz/evm
+            BNB_DEFAULT=$(grep -oE "https://bsc-mainnet\.nodereal\.io/v1/[A-Za-z0-9]+" main.py | head -n1)
+            test -n "$BNB_DEFAULT"
+            set_env BNB_RPC_URL "$BNB_DEFAULT"
+            set_env BNB_LOG_CHUNK 500
+            set_env REQUEST_TIMEOUT 30
+            set_env RPC_BATCH_SIZE 20
+            set_env WALLET_LABELS_FILE /opt/wallet-radar/labels.json
+
+            if sudo test -f /etc/robinhood-radar.env; then
+              for key in TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID; do
+                if ! grep -q "^${key}=." .env; then
+                  value=$(sudo grep -m1 "^${key}=" /etc/robinhood-radar.env 2>/dev/null | cut -d= -f2- || true)
+                  if [ -n "$value" ]; then
+                    printf "%s=%s\n" "$key" "$value" >> .env
+                  fi
+                fi
+              done
+            fi
+
+            .venv/bin/python -m py_compile main.py main_fast.py telegram_bot.py telegram_console.py
+            .venv/bin/python main_fast.py selftest --all
+            .venv/bin/python telegram_bot.py --check
+
+            cat > /tmp/wallet-radar-bot.service <<"UNIT"
+          [Unit]
+          Description=多链钱包雷达电报中文控制台
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          WorkingDirectory=/opt/wallet-radar
+          EnvironmentFile=/opt/wallet-radar/.env
+          Environment=PYTHONUNBUFFERED=1
+          ExecStart=/opt/wallet-radar/.venv/bin/python /opt/wallet-radar/telegram_console.py
+          Restart=always
+          RestartSec=5
+          Nice=5
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+            sudo install -m 644 /tmp/wallet-radar-bot.service /etc/systemd/system/wallet-radar-bot.service
+            sudo systemctl daemon-reload
+            sudo systemctl enable wallet-radar-bot.service
+            sudo systemctl restart wallet-radar-bot.service
+            sleep 6
+          '
+
+      - name: 最终实测与隔离验证
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -eu
+          SSH="ssh -i $HOME/.ssh/deploy_key -p $SERVER_PORT -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20"
+          $SSH "$SERVER_USER@$SERVER_HOST" '
+            set -eu
+            echo "=== Wallet Radar 服务 ==="
+            test "$(systemctl is-active wallet-radar-bot.service)" = active
+            test "$(systemctl is-enabled wallet-radar-bot.service)" = enabled
+            systemctl show wallet-radar-bot.service -p MainPID -p NRestarts --no-pager
+
+            echo "=== 低内存和进度版本 ==="
+            grep -q "main_fast.py" /opt/wallet-radar/telegram_console.py
+            grep -q "真实阶段中文进度提示已启用" /opt/wallet-radar/telegram_console.py
+            grep -q "find_prefunders_streaming" /opt/wallet-radar/main_fast.py
+            grep -q "find_returns_streaming" /opt/wallet-radar/main_fast.py
+            echo "低内存入口=已安装"
+            echo "真实中文进度=已安装"
+
+            echo "=== 启动日志 ==="
+            journalctl -u wallet-radar-bot.service --since "3 minutes ago" --no-pager | tail -n 120
+            journalctl -u wallet-radar-bot.service --since "3 minutes ago" --no-pager | grep -q "电报交互控制台已启动"
+            journalctl -u wallet-radar-bot.service --since "3 minutes ago" --no-pager | grep -q "低内存分析入口已启用"
+            journalctl -u wallet-radar-bot.service --since "3 minutes ago" --no-pager | grep -q "真实阶段中文进度提示已启用"
+
+            echo "=== 确认无旧分析残留 ==="
+            if pgrep -f "^/opt/wallet-radar/.venv/bin/python /opt/wallet-radar/main\.py analyze( |$)" >/dev/null; then
+              echo "仍有旧 main.py 分析进程，拒绝通过"
+              exit 1
+            fi
+
+            echo "=== HyperEVM 只读隔离确认 ==="
+            systemctl show hyperevm-radar.service -p MainPID -p NRestarts -p ExecMainStartTimestamp --no-pager 2>/dev/null | sort > /tmp/final-wallet-hyper-after.txt || true
+            if [ -s /tmp/final-wallet-hyper-before.txt ]; then
+              diff -u /tmp/final-wallet-hyper-before.txt /tmp/final-wallet-hyper-after.txt
+            fi
+            systemctl is-active hyperevm-radar.service || true
+
+            echo "=== 资源 ==="
+            free -h
+            uptime
+            echo "FINAL_WALLET_RADAR_OK"
+          '
