@@ -60,10 +60,18 @@ jobs:
           async def audit():
               m=HyperEVMBlockMonitor();chain=await m.chain_id();latest=await m.latest_block()
               assert chain==999
-              end=latest-20;start=end-119;missing=[];total=0;blocks=0
+              end=latest-20;start=end-119;missing=[];total=0;blocks=0;pools=0;missing_pools=[]
               # Sequential independent RPC reads; no production scanner writes.
+              from detectors.pools import detect_pool_event
               for b in range(start,end+1):
                   block=await m.w3.eth.get_block(b,full_transactions=True);blocks+=1
+                  logs=await m.w3.eth.get_logs({'fromBlock':b,'toBlock':b})
+                  for log in logs:
+                      info=detect_pool_event(log)
+                      if not info:continue
+                      pools+=1
+                      exists=c.execute('select 1 from contract_relations where lower(parent)=? and lower(child)=? and block_number=? limit 1',(info['factory'].lower(),info['pool'].lower(),b)).fetchone()
+                      if not exists:missing_pools.append({'block':b,'pool':info['pool'],'factory':info['factory']})
                   for tx in block.transactions:
                       if tx.get('to') is not None:continue
                       receipt=await m.w3.eth.get_transaction_receipt(tx['hash'])
@@ -73,7 +81,9 @@ jobs:
                       present=c.execute('select 1 from token_creators where lower(token_address)=? limit 1',(ca.lower(),)).fetchone()
                       contract=c.execute('select 1 from contracts where lower(address)=? limit 1',(ca.lower(),)).fetchone()
                       if not present or not contract:missing.append({'block':b,'address':ca,'creator_record':bool(present),'contract_record':bool(contract)})
-              print('BLOCK_AUDIT',json.dumps({'chain':chain,'start':start,'end':end,'blocks':blocks,'deployments':total,'missing':missing}),flush=True)
+              print('BLOCK_AUDIT',json.dumps({'chain':chain,'start':start,'end':end,'blocks':blocks,'deployments':total,'missing':missing,'configured_factory_pools':pools,'missing_pools':missing_pools}),flush=True)
           asyncio.run(audit())
           PY
           REMOTE
+
+# Pool completeness check 1789350560968
