@@ -10,6 +10,24 @@ from platform_family_intelligence import (CompositeSearchProvider, FamilyIntelli
 
 
 class BudgetTests(unittest.TestCase):
+    def test_failed_provider_cools_down_while_backup_remains_available(self):
+        clock=[0.0]
+        primary=Mock(); backup=Mock()
+        primary.search.side_effect=intelligence.requests.ConnectTimeout()
+        backup.search.return_value=[SearchHit('https://backup.example')]
+        provider=CompositeSearchProvider([primary,backup])
+        with patch.object(intelligence.time,'monotonic',side_effect=lambda:clock[0]):
+            self.assertEqual(provider.search('first',6),backup.search.return_value)
+            clock[0]=10
+            self.assertEqual(provider.search('second',6),backup.search.return_value)
+            primary.search.assert_called_once()
+            primary.search.side_effect=None
+            primary.search.return_value=[SearchHit('https://primary.example')]
+            clock[0]=61
+            self.assertEqual(provider.search('third',6),primary.search.return_value)
+        self.assertEqual(primary.search.call_count,2)
+        self.assertEqual(backup.search.call_count,2)
+
     def test_fallback_observes_shared_deadline(self):
         clock=[0.0]
         primary=Mock(); backup=Mock()

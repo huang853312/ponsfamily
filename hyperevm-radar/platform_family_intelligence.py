@@ -250,13 +250,17 @@ class BingSearchProvider(SearchProvider):
 class CompositeSearchProvider(SearchProvider):
     def __init__(self, providers=None):
         self.providers=providers or (ConfiguredJsonSearchProvider(), YouSearchProvider(), ExaSearchProvider(), TinyFishSearchProvider(), DuckDuckGoSearchProvider(), BingSearchProvider())
+        self._provider_retry_after={}
     def search(self, query, timeout, deadline=None):
         hits=[]; seen=set()
-        completed=0; failures=0
+        completed=0; failures=0; cooling=0
         targets={a.lower() for a in ADDRESS_RE.findall(query)}
         for provider in self.providers:
             if isinstance(provider,ConfiguredJsonSearchProvider) and not provider.endpoint: continue
             if isinstance(provider,(YouSearchProvider,ExaSearchProvider,TinyFishSearchProvider)) and not provider.api_key: continue
+            if self._provider_retry_after.get(id(provider),0)>time.monotonic():
+                cooling+=1
+                continue
             remaining=timeout if deadline is None else min(timeout,deadline-time.monotonic())
             if remaining<=0: raise IdentityBudgetExceeded('search_fallback_budget_exhausted')
             try:
@@ -264,6 +268,7 @@ class CompositeSearchProvider(SearchProvider):
                 completed+=1
             except (requests.RequestException, ValueError, KeyError, TypeError):
                 failures+=1
+                self._provider_retry_after[id(provider)]=time.monotonic()+60
                 continue
             # Address queries require address evidence in the returned metadata.
             # Nonempty unrelated results must not prevent fallback providers.
@@ -277,7 +282,7 @@ class CompositeSearchProvider(SearchProvider):
             # needlessly hitting every engine and burning the identity time budget.
             if rows:
                 break
-        if failures and not completed:
+        if (failures or cooling) and not completed:
             raise SearchUnavailable('all_search_providers_failed')
         return hits
 

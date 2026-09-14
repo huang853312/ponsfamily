@@ -79,7 +79,7 @@ with tempfile.TemporaryDirectory(prefix='hyper-execution-check-') as tmp:
     assert not reports[0]['errors'], 'Baseline test error requires investigation'
     assert not reports[1]['errors'], 'Proposed test error'
     assert set(reports[1]['failures']).issubset(reports[0]['failures']), 'New regression'
-    assert reports[1]['count'] == reports[0]['count'] + 10, 'Missing execution tests'
+    assert reports[1]['count'] == reports[0]['count'] + 11, 'Missing execution tests'
     assert not any('test_execution_recovery.' in test or 'test_identity_execution_budget.' in test for test in reports[1]['failures'])
 
 backup = Path('/opt/hyperevm-radar.execution-backup.' + time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()))
@@ -111,6 +111,13 @@ try:
             os.chmod(temporary, 0o644)
         temporary.replace(path)
     subprocess.run([sys.executable, '-c', 'from execution_state import init_execution_db; init_execution_db(); init_execution_db()'], cwd=root, check=True)
+    # Recheck unresolved legacy investigations once after the execution repair.
+    # Keep attempt history; new execution failures have their own bounded retry.
+    with sqlite3.connect(root / 'data/radar.db') as conn:
+        old=conn.execute("SELECT subject_key,result FROM platform_identity_investigations WHERE verification_status!='VERIFIED'").fetchall()
+        keys=[(row[0],) for row in old if not json.loads(row[1]).get('execution_status')]
+        conn.executemany('UPDATE platform_identity_investigations SET next_retry_at=0 WHERE subject_key=?',keys)
+        print('LEGACY_INVESTIGATIONS_REQUEUED',len(keys),flush=True)
     command('systemctl', 'start', service)
     stopped = False
     samples = []
