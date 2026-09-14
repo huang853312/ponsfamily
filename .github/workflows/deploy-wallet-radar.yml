@@ -89,20 +89,22 @@ jobs:
             grep -q "Robinhood Chain wallet cluster MVP" /tmp/wallet-radar-help.txt
 
             .venv/bin/python - <<"PY"
-          import json, os, requests
+          import os
+          import requests
           from dotenv import load_dotenv
-          load_dotenv('/opt/wallet-radar/.env')
-          rpc=os.environ['ROBINHOOD_RPC_URL']
-          r=requests.post(rpc,json={'jsonrpc':'2.0','id':1,'method':'eth_chainId','params':[]},timeout=20)
+          load_dotenv("/opt/wallet-radar/.env")
+          rpc = os.environ["ROBINHOOD_RPC_URL"]
+          payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []}
+          r = requests.post(rpc, json=payload, timeout=20)
           r.raise_for_status()
-          data=r.json()
-          chain_id=int(data['result'],16)
+          data = r.json()
+          chain_id = int(data["result"], 16)
           assert chain_id == 4663, data
-          print('ROBINHOOD_CHAIN_ID_OK=4663')
-          api=os.environ['BLOCKSCOUT_API_BASE'].rstrip('/')
-          r=requests.get(api + '/stats', timeout=20)
+          print("ROBINHOOD_CHAIN_ID_OK=4663")
+          api = os.environ["BLOCKSCOUT_API_BASE"].rstrip("/")
+          r = requests.get(api + "/stats", timeout=20)
           r.raise_for_status()
-          print('BLOCKSCOUT_API_OK')
+          print("BLOCKSCOUT_API_OK")
           PY
 
             echo "WALLET_RADAR_INSTALL_OK"
