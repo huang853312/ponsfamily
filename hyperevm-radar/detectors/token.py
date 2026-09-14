@@ -1,6 +1,6 @@
 import asyncio
 
-from web3.exceptions import BadFunctionCallOutput, ContractLogicError
+from rpc_errors import is_contract_execution_failure
 
 
 class TokenMetadataUnavailable(RuntimeError):
@@ -11,10 +11,9 @@ async def _call(w3, checksum, selector):
     try:
         return bytes(await asyncio.wait_for(
             w3.eth.call({'to': checksum, 'data': selector}), timeout=10))
-    except (BadFunctionCallOutput, ContractLogicError):
-        # The contract deterministically does not support this ERC-20 method.
-        return b''
     except Exception as exc:
+        if is_contract_execution_failure(exc):
+            return b''
         raise TokenMetadataUnavailable(type(exc).__name__) from exc
 
 

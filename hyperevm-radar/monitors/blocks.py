@@ -3,7 +3,7 @@ import asyncio
 import sqlite3
 import time
 from web3 import AsyncWeb3, AsyncHTTPProvider
-from web3.exceptions import ContractLogicError
+from rpc_errors import is_contract_execution_failure
 from config import RPC_URL, POLL_INTERVAL
 from address_book import load_deployers
 from database import DB_PATH, save_token_creator, save_relation
@@ -80,7 +80,9 @@ class HyperEVMBlockMonitor:
             selector=self.w3.keccak(text=signature)[:4]
             try:
                 raw=bytes(await self.w3.eth.call({"to":address,"data":selector},block_identifier=block_number))
-            except ContractLogicError:return ""
+            except Exception as exc:
+                if is_contract_execution_failure(exc):return ""
+                raise
             if len(raw)!=32 or any(raw[:12]):return ""
             return "0x"+raw[-20:].hex()
         factory=await read_address("factory()")
@@ -94,7 +96,9 @@ class HyperEVMBlockMonitor:
         if info["type"]=="V3_POOL":data+=int(info["fee"]).to_bytes(32,"big")
         try:
             raw=bytes(await self.w3.eth.call({"to":factory_address,"data":data},block_identifier=block_number))
-        except ContractLogicError:return False
+        except Exception as exc:
+            if is_contract_execution_failure(exc):return False
+            raise
         return len(raw)==32 and not any(raw[:12]) and raw[-20:].hex()==info["pool"][2:].lower()
 
     async def scan_block(self, current, handler):

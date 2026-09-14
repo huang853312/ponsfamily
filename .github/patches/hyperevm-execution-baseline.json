@@ -6,7 +6,8 @@
     "detectors/token.py": "4b7f1c9a62b07a71bb009e9b87087a6c515fdcea151eb036e6bee48bf9faf57b",
     "platform_family_intelligence.py": "12217e88d119d840fd1cfd17e646d629df8b99e2f24187ad4da6e28058a5743c",
     "execution_state.py": "e4b4ac9bc16234dd4a468107aa0fcffeeecf5160d61634b5b511085804cb5f0f",
-    "monitors/blocks.py": "5b388585bc924cb033878dd29a7547186b61ff62de723f293c364d917f61cada"
+    "monitors/blocks.py": "5b388585bc924cb033878dd29a7547186b61ff62de723f293c364d917f61cada",
+    "rpc_errors.py": null
   },
   "files": [
     "main.py",
@@ -14,6 +15,8 @@
     "notifier.py",
     "detectors/token.py",
     "platform_family_intelligence.py",
-    "execution_state.py"
+    "execution_state.py",
+    "rpc_errors.py",
+    "monitors/blocks.py"
   ]
 }

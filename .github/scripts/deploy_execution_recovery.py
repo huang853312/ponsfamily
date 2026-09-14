@@ -79,7 +79,7 @@ with tempfile.TemporaryDirectory(prefix='hyper-execution-check-') as tmp:
     assert not reports[0]['errors'], 'Baseline test error requires investigation'
     assert not reports[1]['errors'], 'Proposed test error'
     assert set(reports[1]['failures']).issubset(reports[0]['failures']), 'New regression'
-    assert reports[1]['count'] == reports[0]['count'] + 11, 'Missing execution tests'
+    assert reports[1]['count'] == reports[0]['count'] + 13, 'Missing execution tests'
     assert not any('test_execution_recovery.' in test or 'test_identity_execution_budget.' in test for test in reports[1]['failures'])
 
 backup = Path('/opt/hyperevm-radar.execution-backup.' + time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()))

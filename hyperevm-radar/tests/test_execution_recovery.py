@@ -13,7 +13,7 @@ import main
 import notifier
 from detectors.token import detect_erc20, TokenMetadataUnavailable
 from monitors import blocks
-from web3.exceptions import ContractLogicError
+from web3.exceptions import ContractLogicError, Web3RPCError
 
 ADDRESS = '0x' + '1' * 40
 CREATOR = '0x' + '2' * 40
@@ -111,6 +111,32 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await detect_erc20(w3, ADDRESS))
         w3.eth.call = AsyncMock(side_effect=[number(100), number(18), ContractLogicError('execution reverted'), b'Name'.ljust(32,b'\0')])
         self.assertEqual((await detect_erc20(w3, ADDRESS))['name'], 'Name')
+
+    async def test_captured_invalid_opcode_does_not_stall_block_but_rate_limit_does(self):
+        self.contract_mocks()
+        monitor=blocks.HyperEVMBlockMonitor()
+        monitor.get_code=AsyncMock(return_value=b'x')
+        monitor.get_contract_creations=AsyncMock(return_value=[EVENT])
+        monitor.scan_position(100)
+        monitor.w3.eth.call=AsyncMock(side_effect=Web3RPCError("{'code': -32003, 'message': 'EVM error: InvalidFEOpcode'}"))
+        with patch.object(main,'detect_erc20',detect_erc20):
+            await monitor.scan_block(100,main.handle_contract)
+        self.assertEqual(monitor.scan_position(999),101)
+        self.assertTrue(database.seen(ADDRESS))
+        for error in ["{'code': -32005, 'message': 'rate limited'}", "{'code': -32003, 'message': 'node unavailable'}"]:
+            monitor.w3.eth.call=AsyncMock(side_effect=Web3RPCError(error))
+            with self.assertRaises(TokenMetadataUnavailable):
+                await detect_erc20(monitor.w3,ADDRESS)
+
+    async def test_invalid_opcode_pool_stays_unverified_and_rpc_failure_propagates(self):
+        monitor=blocks.HyperEVMBlockMonitor()
+        info=dict(pool=ADDRESS,factory=CREATOR,token0='0x'+'3'*40,token1='0x'+'4'*40,type='V2_PAIR')
+        monitor.w3.eth.get_code=AsyncMock(return_value=b'x')
+        monitor.w3.eth.call=AsyncMock(side_effect=Web3RPCError("{'code': -32003, 'message': 'EVM error: InvalidFEOpcode'}"))
+        self.assertFalse(await monitor.validate_pool(info,100))
+        monitor.w3.eth.call=AsyncMock(side_effect=Web3RPCError("{'code': -32005, 'message': 'rate limited'}"))
+        with self.assertRaises(Web3RPCError):
+            await monitor.validate_pool(info,100)
 
     async def test_match_and_notification_commit_together(self):
         args = dict(platform_id=1, token_address=ADDRESS, token_name='Test', token_symbol='TEST',
