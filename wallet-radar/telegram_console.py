@@ -6,8 +6,10 @@
 - 授权群管理员可在机器人私聊中操作；
 - 电报端不显示 Python/HTTP 英文堆栈；
 - 分析子进程改走 main_fast.py，避免活跃链完整区块批量扫描拖死小服务器；
-- 长分析期间定时发送中文进度，不再长时间无反应。
+- 直接读取分析子进程的真实阶段输出，把进度实时发到当前聊天；
+- 长分析期间继续发送中文心跳，不再长时间无反应。
 """
+import queue
 import threading
 import time
 from pathlib import Path
@@ -20,6 +22,7 @@ _original_handle = bot.handle_message
 _original_send = bot.send
 _original_subprocess_run = bot.subprocess.run
 _admin_cache = {"expires": 0.0, "ids": set()}
+_progress_chat_id = ""
 
 
 def _admin_ids():
@@ -84,18 +87,109 @@ def safe_send(text: str, chat_id: str = ""):
     return _original_send(cleaned, chat_id or bot.AUTHORIZED_CHAT)
 
 
+def _progress_send(text: str):
+    chat_id = _progress_chat_id or bot.AUTHORIZED_CHAT
+    if not chat_id:
+        return
+    try:
+        safe_send(text, chat_id)
+    except Exception as exc:
+        print(f"发送阶段进度失败：{type(exc).__name__}: {exc}", flush=True)
+
+
 def low_memory_subprocess_run(cmd, *args, **kwargs):
-    """只把 wallet-radar 的 analyze 子进程切到低内存入口，其它 subprocess 调用保持原样。"""
-    if isinstance(cmd, (list, tuple)) and "analyze" in cmd:
-        rewritten = list(cmd)
-        for i, item in enumerate(rewritten):
-            if str(item).endswith("/main.py") or str(item) == "main.py":
-                fast = ROOT / "main_fast.py"
-                if fast.exists():
-                    rewritten[i] = str(fast)
-                break
-        cmd = rewritten
-    return _original_subprocess_run(cmd, *args, **kwargs)
+    """wallet-radar analyze 走低内存入口，并把真实阶段输出实时转成中文进度。"""
+    if not (isinstance(cmd, (list, tuple)) and "analyze" in cmd):
+        return _original_subprocess_run(cmd, *args, **kwargs)
+
+    rewritten = list(cmd)
+    for i, item in enumerate(rewritten):
+        if str(item).endswith("/main.py") or str(item) == "main.py":
+            fast = ROOT / "main_fast.py"
+            if fast.exists():
+                rewritten[i] = str(fast)
+            break
+
+    timeout = kwargs.get("timeout")
+    cwd = kwargs.get("cwd")
+    env = kwargs.get("env")
+    started = time.time()
+    lines = []
+    sent = set()
+
+    _progress_send("📊 正在读取持币结构……\n正在重建代币转账历史和当前持仓，请稍候。")
+    sent.add("start")
+
+    proc = bot.subprocess.Popen(
+        rewritten,
+        cwd=cwd,
+        env=env,
+        text=True,
+        stdout=bot.subprocess.PIPE,
+        stderr=bot.subprocess.STDOUT,
+        bufsize=1,
+    )
+    q = queue.Queue()
+
+    def reader():
+        try:
+            for line in proc.stdout:
+                q.put(line)
+        finally:
+            q.put(None)
+
+    threading.Thread(target=reader, daemon=True).start()
+    reader_done = False
+
+    while True:
+        if timeout is not None and time.time() - started > float(timeout):
+            proc.kill()
+            proc.wait()
+            output = "".join(lines)
+            raise bot.subprocess.TimeoutExpired(rewritten, timeout, output=output)
+
+        try:
+            item = q.get(timeout=0.5)
+        except queue.Empty:
+            item = "__NO_LINE__"
+
+        if item is None:
+            reader_done = True
+        elif item != "__NO_LINE__":
+            lines.append(item)
+            text = item.strip()
+            print(text, flush=True)
+
+            if "正在查找" in text and "资金来源" in text and "funders" not in sent:
+                _progress_send(
+                    "✅ 已完成 50%：持币结构、外部账户和同步买卖初筛已完成。\n"
+                    "🔗 正在分析共同资金来源……"
+                )
+                sent.add("funders")
+            elif "已找到" in text and "资金来源" in text and "returns" not in sent:
+                _progress_send(
+                    "✅ 已完成 75%：共同资金来源分析完成。\n"
+                    "↩️ 正在检查卖出后资金回流……"
+                )
+                sent.add("returns")
+            elif "检测到" in text and "资金回流" in text and "summary" not in sent:
+                _progress_send(
+                    "✅ 已完成 90%：资金回流检查完成。\n"
+                    "🧩 正在汇总关联持仓比例、同步行为和综合风险……"
+                )
+                sent.add("summary")
+
+        if proc.poll() is not None and reader_done and q.empty():
+            break
+
+    rc = proc.wait()
+    output = "".join(lines)
+    return bot.subprocess.CompletedProcess(
+        rewritten,
+        rc,
+        stdout=output,
+        stderr="" if rc == 0 else output,
+    )
 
 
 def _heartbeat(chat_id: str, started: float):
@@ -118,7 +212,7 @@ def _heartbeat(chat_id: str, started: float):
                 f"链：{chain_name}\n"
                 f"合约地址：{token}\n"
                 f"已运行：{elapsed // 60} 分 {elapsed % 60} 秒\n"
-                "正在深挖持币钱包、共同资金来源和资金回流；完成后会自动发送中文报告。",
+                "系统仍在读取真实链上数据，没有卡死。完成后会自动发送中文报告。",
                 chat_id,
             )
         except Exception as exc:
@@ -128,6 +222,7 @@ def _heartbeat(chat_id: str, started: float):
 
 
 def handle_message(message: dict):
+    global _progress_chat_id
     if not _allowed(message):
         chat = message.get("chat") or {}
         sender = message.get("from") or {}
@@ -141,6 +236,9 @@ def handle_message(message: dict):
 
     chat = message.get("chat") or {}
     chat_id = str(chat.get("id") or "")
+    if chat_id:
+        _progress_chat_id = chat_id
+
     with bot._busy_lock:
         was_running = bool(bot._busy.get("running"))
 
@@ -168,7 +266,7 @@ def main():
     print("电报私聊授权适配已启用。", flush=True)
     print("电报中文错误适配已启用。", flush=True)
     print("低内存分析入口已启用。", flush=True)
-    print("长任务中文进度提示已启用。", flush=True)
+    print("真实阶段中文进度提示已启用。", flush=True)
     bot.poll_forever()
 
 
