@@ -1,0 +1,127 @@
+name: 安装独立钱包雷达
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "wallet-radar/**"
+      - ".github/workflows/deploy-wallet-radar.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-wallet-radar
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  install-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 本地语法检查
+        run: |
+          set -eu
+          python3 -m py_compile wallet-radar/main.py
+          test -f wallet-radar/requirements.txt
+          test -f wallet-radar/.env.example
+          if grep -RniE '(/opt/hyperevm-radar|hyperevm-radar\.service|systemctl .*hyperevm|HYPEREVM_)' wallet-radar; then
+            echo '钱包雷达目录出现 HyperEVM 运行时引用，拒绝安装。'
+            exit 1
+          fi
+
+      - name: 配置服务器连接
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          set -eu
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          touch ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: 安装到独立目录
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -eu
+          SSH="ssh -i $HOME/.ssh/deploy_key -p $SERVER_PORT -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30"
+
+          $SSH "$SERVER_USER@$SERVER_HOST" '
+            set -eu
+            sudo mkdir -p /opt/wallet-radar
+            sudo chown -R "$USER":"$(id -gn)" /opt/wallet-radar
+          '
+
+          rsync -az --delete \
+            --exclude='.venv/' \
+            --exclude='.env' \
+            --exclude='*.csv' \
+            --exclude='__pycache__/' \
+            --exclude='*.pyc' \
+            -e "$SSH" \
+            wallet-radar/ "$SERVER_USER@$SERVER_HOST:/opt/wallet-radar/"
+
+          $SSH "$SERVER_USER@$SERVER_HOST" '
+            set -eu
+            cd /opt/wallet-radar
+            python3 -m venv .venv
+            .venv/bin/python -m pip install --disable-pip-version-check -q -r requirements.txt
+
+            if [ ! -f .env ]; then
+              cat > .env <<"ENV"
+          ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com
+          BLOCKSCOUT_API_BASE=https://robinhoodchain.blockscout.com/api/v2
+          REQUEST_TIMEOUT=30
+          ENV
+              chmod 600 .env
+            fi
+
+            .venv/bin/python -m py_compile main.py
+            .venv/bin/python main.py --help >/tmp/wallet-radar-help.txt
+            grep -q "Robinhood Chain wallet cluster MVP" /tmp/wallet-radar-help.txt
+
+            .venv/bin/python - <<"PY"
+          import json, os, requests
+          from dotenv import load_dotenv
+          load_dotenv('/opt/wallet-radar/.env')
+          rpc=os.environ['ROBINHOOD_RPC_URL']
+          r=requests.post(rpc,json={'jsonrpc':'2.0','id':1,'method':'eth_chainId','params':[]},timeout=20)
+          r.raise_for_status()
+          data=r.json()
+          chain_id=int(data['result'],16)
+          assert chain_id == 4663, data
+          print('ROBINHOOD_CHAIN_ID_OK=4663')
+          api=os.environ['BLOCKSCOUT_API_BASE'].rstrip('/')
+          r=requests.get(api + '/stats', timeout=20)
+          r.raise_for_status()
+          print('BLOCKSCOUT_API_OK')
+          PY
+
+            echo "WALLET_RADAR_INSTALL_OK"
+            echo "PATH=/opt/wallet-radar"
+            echo "PYTHON=/opt/wallet-radar/.venv/bin/python"
+          '
+
+      - name: 最终边界检查
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -eu
+          SSH="ssh -i $HOME/.ssh/deploy_key -p $SERVER_PORT -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30"
+          $SSH "$SERVER_USER@$SERVER_HOST" '
+            set -eu
+            test -d /opt/wallet-radar
+            test -x /opt/wallet-radar/.venv/bin/python
+            test -f /opt/wallet-radar/main.py
+            echo "安装完成：仅 /opt/wallet-radar"
+          '
