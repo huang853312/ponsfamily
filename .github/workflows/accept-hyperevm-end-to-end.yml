@@ -1,0 +1,77 @@
+name: HyperEVM End-to-End Acceptance
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/accept-hyperevm-end-to-end.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Configure SSH
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Read-only server health check
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -p "$SERVER_PORT" \
+            -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 \
+            "$SERVER_USER@$SERVER_HOST" 'bash -s' <<'REMOTE'
+          set -e
+          SERVICE=hyperevm-radar.service
+          echo '=== SERVICE ==='
+          sudo systemctl is-active "$SERVICE" || true
+          sudo systemctl show "$SERVICE" -p ActiveState -p SubState -p MainPID -p ExecMainStartTimestamp -p NRestarts || true
+          PID=$(sudo systemctl show "$SERVICE" -p MainPID --value 2>/dev/null)
+
+          sudo /opt/hyperevm-radar/.venv/bin/python - <<'PY'
+          import os,sys,json,time,sqlite3,subprocess,asyncio,requests
+          from pathlib import Path
+          pid=subprocess.check_output(['systemctl','show','hyperevm-radar.service','-p','MainPID','--value'],text=True).strip()
+          for raw in Path('/proc/'+pid+'/environ').read_bytes().split(b'\0'):
+              if b'=' in raw:
+                  k,v=raw.split(b'=',1);os.environ[k.decode()]=v.decode()
+          os.chdir('/opt/hyperevm-radar');sys.path.insert(0,os.getcwd())
+          import platform_family_intelligence as m
+          from notifier import send_telegram,format_family_intelligence_message
+          c=sqlite3.connect('file:/opt/hyperevm-radar/data/radar.db?mode=ro',uri=True);c.row_factory=sqlite3.Row
+          row=c.execute('select * from platform_families where id=6').fetchone()
+          family=dict(row)
+          family['member_addresses']=[r[0] for r in c.execute('select candidate_address from platform_family_members where family_id=? limit 6',(family['id'],))]
+          print('REAL_FAMILY',json.dumps(family,ensure_ascii=False),flush=True)
+          addr=family['creator']
+          for cls in [m.ConfiguredJsonSearchProvider,m.YouSearchProvider,m.ExaSearchProvider,m.TinyFishSearchProvider]:
+              started=time.monotonic()
+              try:
+                  hits=cls().search('"'+addr+'"',5)
+                  print('RAW_SEARCH',cls.__name__,'SECONDS',round(time.monotonic()-started,2),'HITS',json.dumps([{'url':h.url,'address_in_metadata':addr.lower() in (h.url+' '+h.title+' '+h.snippet).lower()} for h in hits],ensure_ascii=False),flush=True)
+              except Exception as e:print('RAW_SEARCH_FAIL',cls.__name__,type(e).__name__,round(time.monotonic()-started,2),flush=True)
+          started=time.monotonic()
+          result=m.FamilyIntelligenceEngine(request_timeout=4,total_timeout=90).enrich(family)
+          print('REAL_IDENTITY_SECONDS',round(time.monotonic()-started,2),flush=True)
+          print('REAL_IDENTITY_RESULT',json.dumps(result,ensure_ascii=False),flush=True)
+          # Explicitly labelled transport test; no project identity assertion.
+          text='HyperEVM 雷达验收测试：服务器到 Telegram 的实际发送测试。此消息不是项目告警。'
+          print('TELEGRAM_TRANSPORT_SENT',asyncio.run(send_telegram(text)),flush=True)
+          if result.get('verification_status')=='VERIFIED':
+              print('REAL_PROJECT_NOTIFICATION_SENT',asyncio.run(send_telegram(format_family_intelligence_message(result,family))),flush=True)
+          else:print('REAL_PROJECT_NOTIFICATION_BLOCKED',result.get('verification_status'),flush=True)
+          print('SERVICE_AFTER',subprocess.check_output(['systemctl','is-active','hyperevm-radar.service'],text=True).strip(),flush=True)
+          PY
+          REMOTE
