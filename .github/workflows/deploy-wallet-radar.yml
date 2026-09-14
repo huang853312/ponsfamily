@@ -105,10 +105,13 @@ jobs:
               fi
             }
 
-            # Robinhood 使用官方 RPC。PublicNode 的历史 eth_getLogs 会要求个人归档令牌并返回 403。
+            # Robinhood 使用官方 RPC。BNB 默认节点从 main.py 中已经验证过的 NodeReal 地址读取，避免部署时又写回 PublicNode。
             set_env ROBINHOOD_RPC_URL https://rpc.mainnet.chain.robinhood.com
             set_env HYPEREVM_RPC_URL https://rpc.hyperliquid.xyz/evm
-            set_env BNB_RPC_URL https://bsc-rpc.publicnode.com
+            BNB_DEFAULT=$(grep -oE "https://bsc-mainnet\.nodereal\.io/v1/[A-Za-z0-9]+" main.py | head -n1)
+            test -n "$BNB_DEFAULT"
+            set_env BNB_RPC_URL "$BNB_DEFAULT"
+            set_env BNB_LOG_CHUNK 500
             set_env REQUEST_TIMEOUT 30
             set_env RPC_BATCH_SIZE 50
             set_env WALLET_LABELS_FILE /opt/wallet-radar/labels.json
