@@ -1,0 +1,79 @@
+name: Audit HyperEVM Block Completeness
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/audit-hyperevm-block-completeness.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Configure SSH
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Read-only server health check
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -p "$SERVER_PORT" \
+            -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 \
+            "$SERVER_USER@$SERVER_HOST" 'bash -s' <<'REMOTE'
+          set +e
+          SERVICE=hyperevm-radar.service
+          echo '=== SERVICE ==='
+          sudo systemctl is-active "$SERVICE" || true
+          sudo systemctl show "$SERVICE" -p ActiveState -p SubState -p MainPID -p ExecMainStartTimestamp -p NRestarts || true
+          PID=$(sudo systemctl show "$SERVICE" -p MainPID --value 2>/dev/null)
+
+          sudo /opt/hyperevm-radar/.venv/bin/python - <<'PY'
+          import os,sys,ast,sqlite3,asyncio,json
+          from pathlib import Path
+          os.chdir('/opt/hyperevm-radar');sys.path.insert(0,os.getcwd())
+          for fn in ['monitors/blocks.py','main.py']:
+              source=Path(fn).read_text()
+              if fn.startswith('monitors/'): print('PRODUCTION_MONITOR_SOURCE',source,flush=True)
+              else:
+                  for n in ast.walk(ast.parse(source)):
+                      if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name in ['handle_contract','get_contract_creations_with_pools']:
+                          print('PRODUCTION_FUNCTION',n.name,ast.get_source_segment(source,n),flush=True)
+          c=sqlite3.connect('file:data/radar.db?mode=ro',uri=True);c.row_factory=sqlite3.Row
+          tables=[r[0] for r in c.execute("select name from sqlite_master where type='table'")]
+          print('TABLES',tables,flush=True)
+          for t in ['token_creators','relations','contracts']:
+              print('SCHEMA',t,[dict(r) for r in c.execute('pragma table_info('+t+')')],flush=True)
+          from monitors.blocks import HyperEVMBlockMonitor
+          async def audit():
+              m=HyperEVMBlockMonitor();chain=await m.chain_id();latest=await m.latest_block()
+              assert chain==999
+              end=latest-20;start=end-119;missing=[];total=0;blocks=0
+              # Sequential independent RPC reads; no production scanner writes.
+              for b in range(start,end+1):
+                  block=await m.w3.eth.get_block(b,full_transactions=True);blocks+=1
+                  for tx in block.transactions:
+                      if tx.get('to') is not None:continue
+                      receipt=await m.w3.eth.get_transaction_receipt(tx['hash'])
+                      ca=receipt.get('contractAddress')
+                      if not ca:continue
+                      total+=1
+                      present=c.execute('select 1 from token_creators where lower(token_address)=? limit 1',(ca.lower(),)).fetchone()
+                      contract=c.execute('select 1 from contracts where lower(address)=? limit 1',(ca.lower(),)).fetchone()
+                      if not present or not contract:missing.append({'block':b,'address':ca,'creator_record':bool(present),'contract_record':bool(contract)})
+              print('BLOCK_AUDIT',json.dumps({'chain':chain,'start':start,'end':end,'blocks':blocks,'deployments':total,'missing':missing}),flush=True)
+          asyncio.run(audit())
+          PY
+          REMOTE
