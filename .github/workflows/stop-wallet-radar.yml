@@ -1,0 +1,67 @@
+name: 停用钱包雷达
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/stop-wallet-radar.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 配置服务器连接
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          set -eu
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          touch ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: 只停用 Wallet Radar
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -eu
+          SSH="ssh -i $HOME/.ssh/deploy_key -p $SERVER_PORT -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20"
+          $SSH "$SERVER_USER@$SERVER_HOST" '
+            set -eu
+            echo "=== 停用前 ==="
+            systemctl is-active wallet-radar-bot.service || true
+
+            # 只终止 Wallet Radar 自己的分析子进程。
+            pids=$(pgrep -f "^/opt/wallet-radar/.venv/bin/python /opt/wallet-radar/(main|main_fast)\.py analyze( |$)" || true)
+            if [ -n "$pids" ]; then
+              kill $pids || true
+              sleep 2
+              pids2=$(pgrep -f "^/opt/wallet-radar/.venv/bin/python /opt/wallet-radar/(main|main_fast)\.py analyze( |$)" || true)
+              if [ -n "$pids2" ]; then kill -9 $pids2 || true; fi
+            fi
+
+            sudo systemctl stop wallet-radar-bot.service
+            sudo systemctl disable wallet-radar-bot.service
+
+            echo "=== 停用后 ==="
+            test "$(systemctl is-active wallet-radar-bot.service || true)" != active
+            test "$(systemctl is-enabled wallet-radar-bot.service 2>/dev/null || true)" != enabled
+            if pgrep -f "^/opt/wallet-radar/.venv/bin/python /opt/wallet-radar/(main|main_fast)\.py analyze( |$)" >/dev/null; then
+              echo "仍有 Wallet Radar 分析进程"
+              exit 1
+            fi
+
+            echo "Wallet Radar 已停止并禁用开机自启。"
+            echo "=== 原主雷达只读确认 ==="
+            echo -n "HyperEVM: "; systemctl is-active hyperevm-radar.service || true
+            echo -n "Robinhood: "; systemctl is-active robinhood-radar.service || true
+            free -h
+          '
