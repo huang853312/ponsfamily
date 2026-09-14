@@ -70,7 +70,7 @@ jobs:
                       info=detect_pool_event(log)
                       if not info:continue
                       pools+=1
-                      exists=c.execute('select 1 from contract_relations where lower(parent)=? and lower(child)=? and block_number=? limit 1',(info['factory'].lower(),info['pool'].lower(),b)).fetchone()
+                      exists=c.execute('select 1 from contract_relations where lower(parent_address)=? and lower(child_address)=? and block_number=? limit 1',(info['factory'].lower(),info['pool'].lower(),b)).fetchone()
                       if not exists:missing_pools.append({'block':b,'pool':info['pool'],'factory':info['factory']})
                   for tx in block.transactions:
                       if tx.get('to') is not None:continue
