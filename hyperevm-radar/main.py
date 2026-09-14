@@ -829,6 +829,7 @@ async def handle_contract(monitor, event):
 
     except Exception as e:
         print(f"contract error {address}: {e}")
+        raise
 
 
 async def main():
@@ -919,10 +920,15 @@ async def main():
 
             except Exception as e:
                 print(f"factory token log error block={block_number}: {e}")
+                raise
 
             # Existing V2/V3 pool detection.
             pool_info = detect_pool_event(log)
             if not pool_info:
+                continue
+
+            if not await monitor.validate_pool(pool_info, block_number):
+                print(f"POOL_REJECTED block={block_number} pool={pool_info['pool']} reason=chain_relationship_mismatch")
                 continue
 
             factory = pool_info["factory"]
