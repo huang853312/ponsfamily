@@ -5,6 +5,7 @@ import re
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,6 +34,27 @@ CHAIN_ZH = {
     "robinhood": "Robinhood Chain",
     "hyperevm": "HyperEVM",
     "bnb": "BNB Chain",
+}
+CHAIN_ID = {
+    "robinhood": 4663,
+    "hyperevm": 999,
+    "bnb": 56,
+}
+CHAIN_RPC = {
+    "robinhood": tuple(x for x in (
+        os.getenv("ROBINHOOD_RPC_URL", "").strip(),
+        "https://robinhood-rpc.publicnode.com",
+        "https://rpc.mainnet.chain.robinhood.com",
+    ) if x),
+    "hyperevm": tuple(x for x in (
+        os.getenv("HYPEREVM_RPC_URL", "").strip(),
+        "https://rpc.hyperliquid.xyz/evm",
+    ) if x),
+    "bnb": tuple(x for x in (
+        os.getenv("BNB_RPC_URL", "").strip(),
+        "https://bsc-rpc.publicnode.com",
+        "https://bsc-dataseed.bnbchain.org",
+    ) if x),
 }
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 
@@ -77,14 +99,14 @@ def split_text(text: str, limit: int = 3900):
 def help_text():
     return (
         "🛰 多链钱包雷达\n\n"
-        "直接查询：\n"
+        "最简单的用法：\n"
+        "直接粘贴代币 CA，系统自动识别 Robinhood / HyperEVM / BNB。\n"
+        "例如：\n"
+        "0xac46193ff2cb638bcfd02520e124a3e2c9228774\n\n"
+        "也可以手动指定链：\n"
         "/查 robinhood 0x合约地址\n"
         "/查 hyperevm 0x合约地址\n"
         "/查 bnb 0x合约地址\n\n"
-        "也可以不写 /查，直接发送：\n"
-        "robinhood 0x合约地址\n"
-        "hyperevm 0x合约地址\n"
-        "bnb 0x合约地址\n\n"
         "其它命令：\n"
         "/状态  查看当前是否正在分析\n"
         "/链    查看已内置支持的链\n"
@@ -99,18 +121,20 @@ def chain_text():
         "✅ Robinhood Chain\n"
         "✅ HyperEVM\n"
         "✅ BNB Chain\n\n"
-        "底层分析器还支持自定义 EVM 链；电报快捷入口目前先开放以上三条链。"
+        "直接粘贴 CA 时会自动在以上三条链识别。\n"
+        "底层分析器还支持自定义 EVM 链。"
     )
 
 
 def status_text():
     with _busy_lock:
         if not _busy["running"]:
-            return "✅ 当前空闲，可以提交新的代币分析。"
+            return "✅ 当前空闲，可以直接粘贴代币 CA。"
         elapsed = int(time.time() - _busy["started"])
+        chain_name = CHAIN_ZH.get(_busy["chain"], _busy["chain"] or "自动识别中")
         return (
             "⏳ 当前正在分析\n"
-            f"链：{CHAIN_ZH.get(_busy['chain'], _busy['chain'])}\n"
+            f"链：{chain_name}\n"
             f"合约地址：{_busy['token']}\n"
             f"已运行：{elapsed} 秒"
         )
@@ -123,6 +147,8 @@ def parse_query(text: str):
     elif raw.lower().startswith("/analyze"):
         raw = raw[len("/analyze"):].strip()
     parts = raw.split()
+    if len(parts) == 1 and ADDRESS_RE.match(parts[0]):
+        return "auto", parts[0].lower()
     if len(parts) != 2:
         return None
     chain = CHAIN_ALIASES.get(parts[0].lower()) or CHAIN_ALIASES.get(parts[0])
@@ -130,6 +156,52 @@ def parse_query(text: str):
     if not chain or not ADDRESS_RE.match(token):
         return None
     return chain, token.lower()
+
+
+def rpc_call(url: str, method: str, params: list, timeout: int = 6):
+    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    r = requests.post(url, json=payload, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, dict) or data.get("error"):
+        raise RuntimeError(data.get("error") if isinstance(data, dict) else "RPC 返回异常")
+    return data.get("result")
+
+
+def probe_token_on_chain(chain: str, token: str):
+    errors = []
+    for url in CHAIN_RPC.get(chain, ()):
+        try:
+            cid = int(rpc_call(url, "eth_chainId", []), 16)
+            if cid != CHAIN_ID[chain]:
+                continue
+            code = rpc_call(url, "eth_getCode", [token, "latest"])
+            if not isinstance(code, str) or code in ("0x", "0x0", ""):
+                return None
+            total_supply = rpc_call(url, "eth_call", [{"to": token, "data": "0x18160ddd"}, "latest"])
+            decimals = rpc_call(url, "eth_call", [{"to": token, "data": "0x313ce567"}, "latest"])
+            if not isinstance(total_supply, str) or total_supply in ("0x", ""):
+                return None
+            if not isinstance(decimals, str) or decimals in ("0x", ""):
+                return None
+            return chain
+        except Exception as exc:
+            errors.append(str(exc))
+    return None
+
+
+def detect_chain(token: str):
+    matches = []
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {pool.submit(probe_token_on_chain, chain, token): chain for chain in CHAIN_ZH}
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                if result:
+                    matches.append(result)
+            except Exception:
+                pass
+    return sorted(matches)
 
 
 def run_analysis(chain: str, token: str, chat_id: str):
@@ -209,7 +281,42 @@ def handle_message(message: dict):
         if _busy["running"]:
             send("当前已有分析任务在运行。\n\n" + status_text(), chat_id)
             return
-        _busy.update({"running": True, "chain": chain, "token": token, "started": time.time()})
+        _busy.update({"running": True, "chain": chain if chain != "auto" else "", "token": token, "started": time.time()})
+
+    if chain == "auto":
+        send(
+            "🔎 正在自动识别代币所在链\n"
+            f"合约地址：{token}\n"
+            "正在检查 Robinhood Chain、HyperEVM、BNB Chain……",
+            chat_id,
+        )
+        matches = detect_chain(token)
+        if len(matches) == 0:
+            with _busy_lock:
+                _busy.update({"running": False, "chain": "", "token": "", "started": 0.0})
+            send(
+                "❌ 在当前三条内置链没有识别到这个 ERC-20 代币。\n"
+                "如果你知道所在链，请手动发送：\n"
+                "/查 robinhood 0x...\n"
+                "/查 hyperevm 0x...\n"
+                "/查 bnb 0x...",
+                chat_id,
+            )
+            return
+        if len(matches) > 1:
+            with _busy_lock:
+                _busy.update({"running": False, "chain": "", "token": "", "started": 0.0})
+            names = "、".join(CHAIN_ZH[x] for x in matches)
+            send(
+                f"⚠️ 这个地址在多条链都有代币合约：{names}\n"
+                "请手动指定链后再查询。",
+                chat_id,
+            )
+            return
+        chain = matches[0]
+        with _busy_lock:
+            _busy["chain"] = chain
+        send(f"✅ 已自动识别：{CHAIN_ZH[chain]}", chat_id)
 
     send(
         "🔎 已开始链上分析\n"
