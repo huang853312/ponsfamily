@@ -41,161 +41,22 @@ jobs:
           PID=$(sudo systemctl show "$SERVICE" -p MainPID --value 2>/dev/null)
 
           sudo /opt/hyperevm-radar/.venv/bin/python - <<'PY'
-          import asyncio
-          import ast
-          import contextlib
-          import datetime
-          import hashlib
-          import io
-          import json
-          import os
-          import re
-          import sqlite3
-          import subprocess
-          import sys
-          import tempfile
-          import time
+          import base64,gzip,hashlib,json,sqlite3,subprocess,time
           from pathlib import Path
-          from unittest.mock import AsyncMock, Mock, patch
-          
-          
-          def emit(label, data):
-              print(label, json.dumps(data, ensure_ascii=False), flush=True)
-          
-          
-          def command(*args):
-              return subprocess.check_output(list(args), text=True)
-          
-          
-          os.chdir('/opt/hyperevm-radar')
-          sys.path.insert(0, os.getcwd())
-          sys.dont_write_bytecode = True
-          service = 'hyperevm-radar.service'
-          pid = command('systemctl', 'show', service, '-p', 'MainPID', '--value').strip()
-          emit('SERVICE_NOW', command('systemctl', 'show', service, '-p', 'MainPID', '-p', 'NRestarts', '-p', 'ActiveState', '-p', 'SubState', '-p', 'ExecMainStartTimestamp').splitlines())
-          for filename in ['main.py', 'monitors/blocks.py', 'detectors/token.py', 'detectors/pools.py', 'database.py']:
-              source = Path(filename).read_text()
-              emit('SOURCE_SHA256', {'file': filename, 'sha256': hashlib.sha256(source.encode()).hexdigest()})
-              names = {'handle_contract', 'seen', 'save_contract', 'detect_erc20', 'get_code', 'run', 'scan_position', 'scan_block', 'get_contract_creations', 'validate_pool'}
-              for node in ast.walk(ast.parse(source)):
-                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names:
-                      emit('PRODUCTION_FUNCTION', {'file': filename, 'name': node.name, 'line': node.lineno, 'source': ast.get_source_segment(source, node)})
-          
-          current_retries = []
-          current_rejections = []
-          current_errors = []
-          startup_history = []
-          period_start = time.time() - 600
-          errors_last_ten_minutes = 0
-          journal = command('journalctl', '-u', service, '--since', '48 hours ago', '--no-pager', '-o', 'json')
-          for line in journal.splitlines():
-              try:
-                  entry = json.loads(line)
-                  message = str(entry.get('MESSAGE', ''))
-                  ts = int(entry['__REALTIME_TIMESTAMP']) / 1000000
-              except (ValueError, KeyError, TypeError):
-                  continue
-              if 'HyperEVM monitor started' in message:
-                  startup_history.append({'utc': datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).isoformat(), 'message': message})
-              if str(entry.get('_PID')) == pid:
-                  safe = re.sub(r'https?://\S+', '<URL>', message)[:420]
-                  data = {'utc': datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).isoformat(), 'message': safe}
-                  if 'SCAN_RETRY' in message:
-                      current_retries.append(data)
-                  if 'POOL_REJECTED' in message:
-                      current_rejections.append(data)
-                  if any(marker in message for marker in ['rate limited', 'contract error', 'factory token log error']):
-                      current_errors.append(data)
-                      if ts >= period_start:
-                          errors_last_ten_minutes += 1
-          emit('SCANNER_RUNTIME_ERRORS', {'current_pid': pid, 'retry_count': len(current_retries), 'rejection_count': len(current_rejections), 'errors_last_ten_minutes': errors_last_ten_minutes, 'last_retries': current_retries[-8:], 'last_errors': current_errors[-8:], 'last_rejections': current_rejections[-5:]})
-          emit('STARTUP_HISTORY', startup_history)
-          
-          import database
-          import main as radar
-          import monitors.blocks as scanner
-          from detectors.token import detect_erc20
-          
-          
-          async def isolated_faults():
-              event = {'address': '0x' + 'a' * 40, 'creator': '0x' + 'b' * 40, 'block_number': 100, 'tx_hash': '0x' + 'c' * 64}
-              send = AsyncMock(side_effect=RuntimeError('AUDIT_SIMULATED_SEND_FAILURE'))
-              mocked = {
-                  'fingerprint': Mock(return_value={'code_hash': 'audit', 'template_key': 'audit', 'implementation': '', 'code_size': 4, 'is_eip1167': False, 'eip1967_hint': False}),
-                  'extract_words': Mock(return_value={'vault'}),
-                  'classify': Mock(return_value={'level': 'A_CANDIDATE', 'stock_hits': set(), 'infra_hits': {'vault'}}),
-                  'get_relations_for_child': Mock(return_value=[]),
-                  'detect_erc20': AsyncMock(return_value=None),
-                  'classify_platform_words': Mock(return_value={'eligible': False}),
-                  'get_creator_deployment_cluster': Mock(return_value={'contracts': 0, 'templates': 0}),
-                  'add_cluster_member': Mock(),
-                  'recent_cluster': Mock(return_value=[]),
-                  'load_deployers': Mock(return_value={}),
-                  'save_deployer': Mock(),
-                  'send_telegram': send,
-              }
-              with tempfile.TemporaryDirectory(prefix='hyperevm-audit-') as folder:
-                  db_path = Path(folder) / 'radar.db'
-                  with patch.object(database, 'DB_PATH', db_path), patch.object(scanner, 'DB_PATH', db_path), patch.multiple(radar, **mocked):
-                      database.init_db()
-                      monitor = scanner.HyperEVMBlockMonitor()
-                      monitor.get_contract_creations = AsyncMock(return_value=[event])
-                      monitor.get_code = AsyncMock(return_value=b'audit-code')
-                      monitor.scan_position(100)
-                      first_error = ''
-                      with contextlib.redirect_stdout(io.StringIO()):
-                          try:
-                              await monitor.scan_block(100, radar.handle_contract)
-                          except Exception as exc:
-                              first_error = str(exc)
-                          first_cursor = monitor.scan_position(999)
-                          persisted_contract = database.seen(event['address'])
-                          await monitor.scan_block(100, radar.handle_contract)
-                          second_cursor = monitor.scan_position(999)
-                      emit('ISOLATED_SAVE_SEND_REPLAY', {'first_error': first_error, 'contract_saved': persisted_contract, 'cursor_after_failure': first_cursor, 'cursor_after_replay': second_cursor, 'send_attempts_total': send.await_count, 'no_real_telegram_called': True})
-              fake_w3 = Mock()
-              fake_w3.to_checksum_address.side_effect = lambda address: address
-              fake_w3.eth.call = AsyncMock(side_effect=RuntimeError('AUDIT_SIMULATED_RPC_RATE_LIMIT'))
-              result = await detect_erc20(fake_w3, event['address'])
-              emit('ISOLATED_TOKEN_METADATA_RPC_FAILURE', {'returned': result, 'rpc_attempts': fake_w3.eth.call.await_count, 'exception_propagated': False})
-          
-          
-          async def snapshots():
-              monitor = scanner.HyperEVMBlockMonitor()
-              samples = []
-              for index in range(3):
-                  if index:
-                      await asyncio.sleep(20)
-                  head = None
-                  for attempt in range(3):
-                      try:
-                          head = await asyncio.wait_for(monitor.latest_block(), timeout=8)
-                          break
-                      except Exception as exc:
-                          emit('HEAD_READ_RETRY', {'attempt': attempt + 1, 'type': type(exc).__name__})
-                          await asyncio.sleep(1 + attempt)
-                  with sqlite3.connect('file:data/radar.db?mode=ro', uri=True) as connection:
-                      connection.row_factory = sqlite3.Row
-                      cursor = dict(connection.execute('SELECT * FROM radar_scan_progress WHERE chain_id=999').fetchone())
-                      data = {'utc': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'head': head, **cursor}
-                      data['backlog_blocks'] = max(0, head - cursor['next_block'] + 1) if head is not None else None
-                      data['cursor_age_seconds'] = round(time.time() - cursor['updated_at'], 2)
-                      samples.append(data)
-                      emit('SCAN_SNAPSHOT', data)
-                      if index == 0:
-                          emit('DB_TABLES', [r[0] for r in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")])
-                          emit('RECENT_CONTRACT_LEVELS', [dict(r) for r in connection.execute('SELECT level,COUNT(*) AS total FROM contracts GROUP BY level')])
-              if all(s['head'] is not None for s in samples):
-                  emit('SCAN_MOVEMENT', {'chain_blocks': samples[-1]['head'] - samples[0]['head'], 'scanned_blocks': samples[-1]['next_block'] - samples[0]['next_block'], 'initial_backlog': samples[0]['backlog_blocks'], 'final_backlog': samples[-1]['backlog_blocks']})
-          
-          
-          async def run():
-              await isolated_faults()
-              await snapshots()
-          
-          
-          asyncio.run(run())
-          emit('SERVICE_END', command('systemctl', 'show', service, '-p', 'MainPID', '-p', 'NRestarts', '-p', 'ActiveState', '-p', 'SubState').splitlines())
+          root=Path('/opt/hyperevm-radar')
+          for name in ['main.py','database.py','notifier.py','monitors/blocks.py','detectors/token.py','platform_family_intelligence.py']:
+              data=(root/name).read_bytes()
+              print('CODE_SNAPSHOT',json.dumps({'file':name,'sha256':hashlib.sha256(data).hexdigest(),'gzip_b64':base64.b64encode(gzip.compress(data)).decode()}),flush=True)
+          with sqlite3.connect('file:'+str(root/'data/radar.db')+'?mode=ro',uri=True) as c:
+              c.row_factory=sqlite3.Row
+              for t in ['radar_scan_progress','platform_identity_investigations']:
+                  if t=='radar_scan_progress':
+                      rows=[dict(r) for r in c.execute('SELECT * FROM '+t)]
+                  else:
+                      rows=[dict(r) for r in c.execute('SELECT subject_key,verification_status,attempt_count,backoff_seconds,updated_at,next_retry_at FROM '+t+' ORDER BY updated_at DESC LIMIT 6')]
+                  print('CURRENT_STATE',json.dumps({'table':t,'rows':rows}),flush=True)
+              print('IDENTITY_COUNTS',json.dumps([list(r) for r in c.execute('SELECT verification_status,count(*) FROM platform_identity_investigations GROUP BY verification_status')]),flush=True)
+          print('SNAPSHOT_COMPLETE',int(time.time()),flush=True)
           PY
           REMOTE
 
