@@ -41,22 +41,7 @@ jobs:
           PID=$(sudo systemctl show "$SERVICE" -p MainPID --value 2>/dev/null)
 
           sudo /opt/hyperevm-radar/.venv/bin/python - <<'PY'
-          import base64,gzip,hashlib,json,sqlite3,subprocess,time
-          from pathlib import Path
-          root=Path('/opt/hyperevm-radar')
-          for name in ['main.py','database.py','notifier.py','monitors/blocks.py','detectors/token.py','platform_family_intelligence.py']:
-              data=(root/name).read_bytes()
-              print('CODE_SNAPSHOT',json.dumps({'file':name,'sha256':hashlib.sha256(data).hexdigest(),'gzip_b64':base64.b64encode(gzip.compress(data)).decode()}),flush=True)
-          with sqlite3.connect('file:'+str(root/'data/radar.db')+'?mode=ro',uri=True) as c:
-              c.row_factory=sqlite3.Row
-              for t in ['radar_scan_progress','platform_identity_investigations']:
-                  if t=='radar_scan_progress':
-                      rows=[dict(r) for r in c.execute('SELECT * FROM '+t)]
-                  else:
-                      rows=[dict(r) for r in c.execute('SELECT subject_key,verification_status,attempt_count,backoff_seconds,updated_at,next_retry_at FROM '+t+' ORDER BY updated_at DESC LIMIT 6')]
-                  print('CURRENT_STATE',json.dumps({'table':t,'rows':rows}),flush=True)
-              print('IDENTITY_COUNTS',json.dumps([list(r) for r in c.execute('SELECT verification_status,count(*) FROM platform_identity_investigations GROUP BY verification_status')]),flush=True)
-          print('SNAPSHOT_COMPLETE',int(time.time()),flush=True)
+          cat: /workspace/scratch/b0511f4be9c3/live_execution_audit.py: No such file or directory
           PY
           REMOTE
 
