@@ -52,9 +52,12 @@ jobs:
             echo "=== 恢复前 ==="
             systemctl is-active wallet-radar-bot.service || true
             ps -eo pid,ppid,etime,stat,cmd | grep -E "main.py analyze|wallet-radar/telegram_console.py" | grep -v grep || true
-            # 只停止 wallet-radar 自己启动的分析子进程，不碰其它 Radar。
-            pkill -f "/opt/wallet-radar/main.py analyze" 2>/dev/null || true
-            sleep 2
+            # 只停止 wallet-radar 自己的分析子进程。锚定完整命令开头，避免匹配当前 SSH shell 自己。
+            pids=$(pgrep -f "^/opt/wallet-radar/.venv/bin/python /opt/wallet-radar/main.py analyze( |$)" || true)
+            if [ -n "$pids" ]; then
+              kill $pids || true
+              sleep 2
+            fi
             sudo systemctl restart wallet-radar-bot.service
             sleep 5
             echo "=== 恢复后 ==="
