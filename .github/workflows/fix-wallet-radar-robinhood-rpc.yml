@@ -1,0 +1,95 @@
+name: 修复钱包雷达Robinhood历史RPC
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/fix-wallet-radar-robinhood-rpc.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: 配置服务器连接
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          set -eu
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          touch ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: 切换官方RPC并重启钱包雷达电报服务
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -eu
+          SSH="ssh -i $HOME/.ssh/deploy_key -p $SERVER_PORT -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30"
+          $SSH "$SERVER_USER@$SERVER_HOST" '
+            set -eu
+            cd /opt/wallet-radar
+            test -f .env
+            if grep -q "^ROBINHOOD_RPC_URL=" .env; then
+              sed -i "s|^ROBINHOOD_RPC_URL=.*|ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com|" .env
+            else
+              printf "%s\n" "ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com" >> .env
+            fi
+            chmod 600 .env
+            sudo systemctl restart wallet-radar-bot.service
+            sleep 4
+            test "$(systemctl is-active wallet-radar-bot.service)" = active
+            echo "钱包雷达电报服务已使用Robinhood官方RPC重新启动"
+          '
+
+      - name: 验证历史日志并实测用户代币
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -eu
+          SSH="ssh -i $HOME/.ssh/deploy_key -p $SERVER_PORT -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30"
+          $SSH "$SERVER_USER@$SERVER_HOST" '
+            set -eu
+            cd /opt/wallet-radar
+            . ./.env
+            export ROBINHOOD_RPC_URL
+            .venv/bin/python - <<"PY"
+          import os, requests
+          rpc=os.environ["ROBINHOOD_RPC_URL"]
+          token="0xac46193ff2cb638bcfd02520e124a3e2c9228774"
+          topic="0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+          def call(method, params):
+              r=requests.post(rpc,json={"jsonrpc":"2.0","id":1,"method":method,"params":params},timeout=30)
+              print(method, "HTTP", r.status_code)
+              r.raise_for_status()
+              d=r.json()
+              if d.get("error"):
+                  raise RuntimeError(d["error"])
+              return d.get("result")
+          latest=int(call("eth_blockNumber", []),16)
+          logs=call("eth_getLogs", [{"fromBlock":hex(max(0,latest-2000)),"toBlock":hex(latest),"address":token,"topics":[topic]}])
+          print("历史日志验证成功，最近2000区块事件数=", len(logs or []))
+          PY
+            timeout 180 .venv/bin/python main.py analyze --chain robinhood --token 0xac46193ff2cb638bcfd02520e124a3e2c9228774 --top 20 --scan-hours 0.5 --funding-minutes 10 --return-minutes 10 --max-groups 3 --output /tmp/wallet-radar-rpc-test.csv >/tmp/wallet-radar-rpc-test.log 2>&1 || rc=$?
+            rc=${rc:-0}
+            cat /tmp/wallet-radar-rpc-test.log
+            if grep -q "403 Client Error" /tmp/wallet-radar-rpc-test.log; then
+              echo "仍出现403，修复失败"
+              exit 1
+            fi
+            if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+              echo "实测分析异常，退出码=$rc"
+              exit "$rc"
+            fi
+            echo "Robinhood历史RPC 403问题已排除"
+          '
