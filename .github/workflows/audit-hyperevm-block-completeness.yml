@@ -33,7 +33,7 @@ jobs:
           ssh -i ~/.ssh/deploy_key -p "$SERVER_PORT" \
             -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 \
             "$SERVER_USER@$SERVER_HOST" 'bash -s' <<'REMOTE'
-          set +e
+          set -e
           SERVICE=hyperevm-radar.service
           echo '=== SERVICE ==='
           sudo systemctl is-active "$SERVICE" || true
@@ -57,40 +57,69 @@ jobs:
           for t in ['token_creators','relations','contracts']:
               print('SCHEMA',t,[dict(r) for r in c.execute('pragma table_info('+t+')')],flush=True)
           from monitors.blocks import HyperEVMBlockMonitor
+          import subprocess
+          logs=subprocess.check_output(['journalctl','-u','hyperevm-radar.service','--since','48 hours ago','--no-pager'],text=True)
+          for line in logs.splitlines():
+              if any(x in line for x in ['monitor started','log error block=','contract error','factory token log error','Stopping hyperevm','Started hyperevm']):
+                  print('HISTORICAL_SCAN_LOG',line,flush=True)
+          for name in ['seen','save_contract','save_relation']:
+              source=Path('database.py').read_text()
+              node=next(n for n in ast.parse(source).body if isinstance(n,ast.FunctionDef) and n.name==name)
+              print('DATABASE_FUNCTION',ast.get_source_segment(source,node),flush=True)
           async def audit():
-              m=HyperEVMBlockMonitor();chain=await m.chain_id();latest=await m.latest_block()
-              assert chain==999
-              end=latest-20;start=end-119;missing=[];total=0;blocks=0;pools=0;missing_pools=[]
+              m=HyperEVMBlockMonitor();assert await m.chain_id()==999
               async def rpc(call):
                   for attempt in range(6):
                       try:return await call()
                       except Exception:
                           if attempt==5:raise
                           await asyncio.sleep(min(8,2**attempt))
-              # Sequential independent RPC reads; no production scanner writes.
               from detectors.pools import detect_pool_event
-              for b in range(start,end+1):
-                  block=await rpc(lambda:m.w3.eth.get_block(b,full_transactions=True));blocks+=1
-                  await asyncio.sleep(0.3)
-                  logs=await rpc(lambda:m.w3.eth.get_logs({'fromBlock':b,'toBlock':b}))
-                  for log in logs:
-                      info=detect_pool_event(log)
-                      if not info:continue
-                      pools+=1
-                      exists=c.execute('select 1 from contract_relations where lower(parent_address)=? and lower(child_address)=? and block_number=? limit 1',(info['factory'].lower(),info['pool'].lower(),b)).fetchone()
-                      if not exists:missing_pools.append({'block':b,'pool':info['pool'],'factory':info['factory']})
+              from unittest.mock import AsyncMock,Mock,patch
+              import monitors.blocks as production
+              test=HyperEVMBlockMonitor();test.w3=Mock()
+              test.w3.eth.get_logs=AsyncMock(side_effect=RuntimeError('AUDIT_INJECTED_RATE_LIMIT'))
+              print('FAULT_LOG_RETURN',await test.get_logs(1),flush=True)
+              block=Mock();block.transactions=[{'from':'0x'+'a'*40,'to':None,'hash':b'1'*32}]
+              test.w3.eth.get_block=AsyncMock(return_value=block)
+              test.w3.eth.get_transaction_receipt=AsyncMock(side_effect=RuntimeError('AUDIT_INJECTED_RECEIPT_FAILURE'))
+              with patch.object(production,'load_deployers',return_value={}):
+                  print('FAULT_RECEIPT_RETURN',await test.get_contract_creations(1),flush=True)
+              poolblocks=[r[0] for r in c.execute("select distinct block_number from contract_relations where relation_type in ('V2_PAIR','V3_POOL') order by block_number desc limit 12")]
+              restarts=[]
+              import re
+              for line in logs.splitlines():
+                  match=re.search(r'from_block=(\d+)',line)
+                  if match:restarts.append(int(match.group(1)))
+              selected=set(poolblocks)
+              for n in restarts[-6:]:
+                  selected.update(range(n-3,n+3))
+              print('AUDIT_SELECTION',json.dumps({'pool_blocks':poolblocks,'restart_heads':restarts,'selected_blocks':sorted(selected)}),flush=True)
+              missing=[];missingpools=[];deployments=0;pools=0
+              for number in sorted(selected):
+                  await asyncio.sleep(0.4)
+                  block=await rpc(lambda:m.w3.eth.get_block(number,full_transactions=True))
                   for tx in block.transactions:
                       if tx.get('to') is not None:continue
                       receipt=await rpc(lambda:m.w3.eth.get_transaction_receipt(tx['hash']))
                       ca=receipt.get('contractAddress')
                       if not ca:continue
-                      total+=1
-                      present=c.execute('select 1 from token_creators where lower(token_address)=? limit 1',(ca.lower(),)).fetchone()
-                      contract=c.execute('select 1 from contracts where lower(address)=? limit 1',(ca.lower(),)).fetchone()
-                      if not present or not contract:missing.append({'block':b,'address':ca,'creator_record':bool(present),'contract_record':bool(contract)})
-              print('BLOCK_AUDIT',json.dumps({'chain':chain,'start':start,'end':end,'blocks':blocks,'deployments':total,'missing':missing,'configured_factory_pools':pools,'missing_pools':missing_pools}),flush=True)
+                      deployments+=1
+                      creator=c.execute('select 1 from token_creators where lower(token_address)=?',(ca.lower(),)).fetchone()
+                      contract=c.execute('select 1 from contracts where lower(address)=?',(ca.lower(),)).fetchone()
+                      if not creator or not contract:missing.append({'block':number,'address':ca,'creator_record':bool(creator),'contract_record':bool(contract)})
+                  events=await rpc(lambda:m.w3.eth.get_logs({'fromBlock':number,'toBlock':number}))
+                  for event in events:
+                      info=detect_pool_event(event)
+                      if not info:continue
+                      pools+=1
+                      found=c.execute('select 1 from contract_relations where lower(parent_address)=? and lower(child_address)=? and relation_type=? and block_number=?',(info['factory'].lower(),info['pool'].lower(),info['type'],number)).fetchone()
+                      if not found:missingpools.append({'block':number,**info})
+              print('TARGETED_COMPLETENESS',json.dumps({'blocks':len(selected),'deployments':deployments,'missing_deployments':missing,'pools':pools,'missing_pools':missingpools}),flush=True)
           asyncio.run(audit())
           PY
           REMOTE
 
 # Pool completeness check 1789350560968
+
+# Extended read-only pool restart and fault audit 1789350787379
