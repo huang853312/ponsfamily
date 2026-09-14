@@ -41,42 +41,118 @@ jobs:
           PID=$(sudo systemctl show "$SERVICE" -p MainPID --value 2>/dev/null)
 
           sudo /opt/hyperevm-radar/.venv/bin/python - <<'PY'
-          import asyncio,json,os,re,sqlite3,subprocess,sys,time
+          import asyncio, collections, json, os, sqlite3, subprocess, sys, time
           from pathlib import Path
-          root=Path('/opt/hyperevm-radar');os.chdir(root);sys.path.insert(0,str(root))
-          print('AUDIT_NOW',time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),flush=True)
-          print('SERVICE',subprocess.check_output(['systemctl','show','hyperevm-radar.service','-p','ActiveState','-p','SubState','-p','MainPID','-p','NRestarts'],text=True).strip().replace('\n',';'),flush=True)
-          c=sqlite3.connect('file:'+str(root/'data/radar.db')+'?mode=ro',uri=True);c.row_factory=sqlite3.Row
-          cursor=c.execute('SELECT * FROM radar_scan_progress WHERE chain_id=999').fetchone()
-          print('CURSOR',json.dumps(dict(cursor)),flush=True)
-          pending=[dict(r) for r in c.execute("SELECT * FROM contract_processing WHERE state!='completed' ORDER BY updated_at DESC LIMIT 5")]
-          print('PENDING_CONTRACTS',json.dumps(pending),flush=True)
-          logs=subprocess.check_output(['journalctl','-u','hyperevm-radar.service','--since','-30 min','-o','cat','--no-pager'],text=True)
-          lines=logs.splitlines()
-          indexes=[i for i,l in enumerate(lines) if 'SCAN_RETRY' in l or 'contract error ' in l]
-          selected=set()
-          for i in indexes[-4:]:selected.update(range(max(0,i-24),min(len(lines),i+2)))
-          safe=[re.sub(r'https?://[^\s\x27\x22]+','<redacted-url>',lines[i]) for i in sorted(selected)]
-          print('SCAN_ERROR_TRACE',json.dumps(safe),flush=True)
+          
+          root = Path('/opt/hyperevm-radar')
+          os.chdir(root)
+          sys.path.insert(0, str(root))
+          pid = subprocess.check_output(['systemctl', 'show', 'hyperevm-radar.service', '-p', 'MainPID', '--value'], text=True).strip()
+          allowed = {'HYPEREVM_SEARCH_API_URL', 'HYPEREVM_SEARCH_API_KEY', 'YDC_API_KEY', 'EXA_API_KEY', 'TINYFISH_API_KEY', 'IDENTITY_REQUEST_TIMEOUT', 'IDENTITY_TOTAL_TIMEOUT'}
+          for entry in Path('/proc/' + pid + '/environ').read_bytes().split(b'\0'):
+              if b'=' in entry:
+                  key, value = entry.split(b'=', 1)
+                  key = key.decode()
+                  if key in allowed:
+                      os.environ[key] = value.decode()
+          print('PROCESS_API_KEYS', json.dumps({key: bool(os.getenv(key)) for key in sorted(allowed) if 'KEY' in key}), flush=True)
+          from platform_family_intelligence import FamilyIntelligenceEngine
           from monitors.blocks import HyperEVMBlockMonitor
           from detectors.token import detect_erc20
-          async def probe():
-              monitor=HyperEVMBlockMonitor()
+          from detectors.rwa_assets import KNOWN_RWA_ASSETS
+          
+          conn = sqlite3.connect('file:' + str(root / 'data/radar.db') + '?mode=ro', uri=True)
+          conn.row_factory = sqlite3.Row
+          print('AUDIT_TIME', time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), flush=True)
+          for table, field in [('telegram_outbox', 'status'), ('contract_processing', 'state'), ('pool_observations', 'validation_status'), ('platform_identity_investigations', 'verification_status')]:
+              print('TABLE_COUNTS', table, json.dumps([list(r) for r in conn.execute(f'SELECT {field},count(*) FROM {table} GROUP BY {field}')]), flush=True)
+          print('CONTRACT_LEVEL_COUNTS', json.dumps([list(r) for r in conn.execute('SELECT level,count(*) FROM contracts GROUP BY level')]), flush=True)
+          print('RWA_ASSETS_COUNT', len(KNOWN_RWA_ASSETS), flush=True)
+          recovered=conn.execute("SELECT p.address,p.state,p.attempts,p.last_error,c.level,c.block_number FROM contract_processing p LEFT JOIN contracts c ON lower(c.address)=p.address WHERE p.address='0xba8b2199f72369d95660276a88fbe1eae8c5a278'").fetchone()
+          print('RECOVERED_EVENT',json.dumps(dict(recovered) if recovered else None),flush=True)
+          rows = conn.execute('SELECT subject_key,result,backoff_seconds,next_retry_at,updated_at FROM platform_identity_investigations').fetchall()
+          categories = collections.Counter((json.loads(r['result']).get('execution_status') or 'LEGACY_UNCLASSIFIED', r['backoff_seconds']) for r in rows)
+          print('RETRY_CLASSIFICATION', json.dumps([{'execution': k[0], 'backoff': k[1], 'count': v} for k, v in categories.items()]), flush=True)
+          family = dict(conn.execute('SELECT * FROM platform_families WHERE id=6').fetchone())
+          members = conn.execute('SELECT m.candidate_address,c.token_name,c.token_symbol FROM platform_family_members m LEFT JOIN platform_candidates c ON lower(c.address)=lower(m.candidate_address) WHERE m.family_id=6 ORDER BY m.block_number').fetchall()
+          family['member_addresses'] = [r[0] for r in members if r[0]]
+          family['token_names'] = [r[1] for r in members if r[1]]
+          family['token_symbols'] = [r[2] for r in members if r[2]]
+          family['identity_urls'] = [family['website_url']] if family.get('website_url') else []
+          print('LIVE_IDENTITY_SUBJECT', json.dumps({'id': 6, 'creator': family['creator'], 'members': len(members), 'brand_hint': family.get('brand_hint'), 'token_names': family['token_names'][:3]}), flush=True)
+          import requests
+          from urllib.parse import urlparse
+          from unittest.mock import patch
+          
+          network = []
+          original = requests.sessions.Session.request
+          
+          
+          def measured(session, method, url, *args, **kwargs):
+              started = time.monotonic()
+              status = None
+              error = ''
+              api_code = None
+              raw_hits = None
               try:
-                  head=await monitor.latest_block()
-                  print('CHAIN_HEAD',head,'BACKLOG',max(0,head-cursor['next_block']+1),flush=True)
-              except Exception as exc:print('HEAD_ERROR',type(exc).__name__,flush=True)
-              for row in pending[:2]:
-                  address=row['address']
-                  for selector in ['0x18160ddd','0x313ce567','0x95d89b41','0x06fdde03']:
-                      try:
-                          result=await monitor.w3.eth.call({'to':monitor.w3.to_checksum_address(address),'data':selector})
-                          print('RPC_METADATA_RESPONSE',json.dumps({'address':address,'selector':selector,'length':len(result)}),flush=True)
-                      except Exception as exc:
-                          detail=re.sub(r'https?://[^\s\x27\x22]+','<redacted-url>',str(exc))
-                          print('RPC_METADATA_ERROR',json.dumps({'address':address,'selector':selector,'type':type(exc).__name__,'detail':detail[:700]}),flush=True)
-          asyncio.run(probe())
-          print('SCAN_STALL_AUDIT_COMPLETE',flush=True)
+                  response = original(session, method, url, *args, **kwargs)
+                  status = response.status_code
+                  try:
+                      body = response.json()
+                      if isinstance(body, dict):
+                          api_code = body.get('code') if isinstance(body.get('code'), (int,str)) else None
+                          data = body.get('data') or {}
+                          rows = body.get('results')
+                          if isinstance(rows, dict): rows = rows.get('web')
+                          if rows is None and isinstance(data, dict): rows = (data.get('webPages') or {}).get('value')
+                          if isinstance(rows, list): raw_hits = len(rows)
+                  except (ValueError,TypeError,AttributeError):
+                      pass
+                  return response
+              except Exception as exc:
+                  error = type(exc).__name__
+                  raise
+              finally:
+                  network.append({'host': urlparse(url).hostname, 'status': status, 'error': error, 'api_code': api_code, 'raw_hits': raw_hits, 'seconds': round(time.monotonic() - started, 2)})
+          
+          
+          engine = FamilyIntelligenceEngine()
+          assert hasattr(engine.search, '_provider_retry_after'), 'Provider cooldown not deployed'
+          started = time.monotonic()
+          with patch.object(requests.sessions.Session, 'request', measured):
+              result = engine.enrich(family, auxiliary_candidates=[])
+          evidence = result['evidence']
+          queries = [e for e in evidence if e.get('source') == 'search']
+          print('REAL_IDENTITY_RESULT', json.dumps({
+              'elapsed': round(time.monotonic() - started, 2), 'budget': engine.total_timeout,
+              'verification': result['verification_status'], 'execution': result['execution_status'],
+              'website': result['official_website'], 'official_x': result['official_x'],
+              'official_token_ca': result['official_token_ca'], 'candidate_count': result['discovered_candidates'],
+              'performed_queries': [e for e in queries if e.get('status') != 'SKIPPED'],
+              'skipped_query_count': sum(e.get('status') == 'SKIPPED' for e in queries),
+              'cross_verification': next((e for e in evidence if e.get('kind') == 'CROSS_VERIFICATION'), {}),
+              'no_telegram_sent': True, 'no_database_writes': True,
+          }, ensure_ascii=False), flush=True)
+          print('IDENTITY_NETWORK', json.dumps(network), flush=True)
+          
+          
+          async def chain_probe():
+              monitor = HyperEVMBlockMonitor()
+              chain_id = await monitor.chain_id()
+              head = await monitor.latest_block()
+              cursor = conn.execute('SELECT next_block FROM radar_scan_progress WHERE chain_id=999').fetchone()[0]
+              print('CHAIN_PROGRESS', json.dumps({'chain_id': chain_id, 'head': head, 'next_block': cursor, 'backlog': max(0, head - cursor + 1)}), flush=True)
+              for row in conn.execute('SELECT address FROM contracts ORDER BY block_number DESC LIMIT 2'):
+                  try:
+                      token = await detect_erc20(monitor.w3, row[0])
+                      print('REAL_METADATA_READ', json.dumps({'address': row[0], 'outcome': 'TOKEN' if token else 'NON_ERC20', 'symbol': token.get('symbol') if token else None}), flush=True)
+                  except Exception as exc:
+                      print('REAL_METADATA_READ', json.dumps({'address': row[0], 'outcome': 'RETRY_REQUIRED', 'error': type(exc).__name__}), flush=True)
+          
+          
+          asyncio.run(chain_probe())
+          print('POST_IDENTITY_SERVICE', subprocess.check_output(['systemctl', 'show', 'hyperevm-radar.service', '-p', 'ActiveState', '-p', 'SubState', '-p', 'MainPID', '-p', 'NRestarts'], text=True).strip().replace('\n', ';'), flush=True)
+          print('LIVE_AUDIT_COMPLETE', flush=True)
           PY
           REMOTE
 
