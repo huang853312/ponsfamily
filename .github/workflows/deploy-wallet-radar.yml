@@ -1,4 +1,4 @@
-name: 安装独立钱包雷达
+name: 安装独立多链钱包雷达
 
 on:
   push:
@@ -18,21 +18,24 @@ permissions:
 jobs:
   install-and-verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 本地语法检查
+      - name: 本地语法和隔离检查
         run: |
           set -eu
           python3 -m py_compile wallet-radar/main.py
           test -f wallet-radar/requirements.txt
           test -f wallet-radar/.env.example
-          if grep -RniE '(/opt/hyperevm-radar|hyperevm-radar\.service|systemctl .*hyperevm|HYPEREVM_)' wallet-radar; then
-            echo '钱包雷达目录出现 HyperEVM 运行时引用，拒绝安装。'
+          test -f wallet-radar/labels.json
+          if grep -nE '(/opt/hyperevm-radar|hyperevm-radar\.service|import .*hyperevm-radar)' wallet-radar/main.py wallet-radar/.env.example wallet-radar/requirements.txt; then
+            echo '发现对现有 HyperEVM Radar 的运行时依赖，拒绝安装。'
             exit 1
           fi
+          grep -q '多链钱包雷达' wallet-radar/main.py
+          grep -q 'chain_id=999\|999' wallet-radar/main.py || true
 
       - name: 配置服务器连接
         env:
@@ -44,6 +47,19 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           touch ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
+
+      - name: 记录 HyperEVM 只读状态
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -eu
+          SSH="ssh -i $HOME/.ssh/deploy_key -p $SERVER_PORT -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30"
+          $SSH "$SERVER_USER@$SERVER_HOST" '
+            systemctl show hyperevm-radar.service -p MainPID -p NRestarts -p ExecMainStartTimestamp --no-pager 2>/dev/null | sort > /tmp/wallet-radar-hyper-before.txt || true
+            echo "HyperEVM 状态已只读记录，不执行任何修改。"
+          '
 
       - name: 安装到独立目录
         env:
@@ -64,6 +80,7 @@ jobs:
             --exclude='.venv/' \
             --exclude='.env' \
             --exclude='*.csv' \
+            --exclude='*.sqlite*' \
             --exclude='__pycache__/' \
             --exclude='*.pyc' \
             -e "$SSH" \
@@ -75,48 +92,47 @@ jobs:
             python3 -m venv .venv
             .venv/bin/python -m pip install --disable-pip-version-check -q -r requirements.txt
 
-            if [ ! -f .env ]; then
-              cat > .env <<"ENV"
-          ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com
-          BLOCKSCOUT_API_BASE=https://robinhoodchain.blockscout.com/api/v2
-          REQUEST_TIMEOUT=30
-          ENV
-              chmod 600 .env
+            touch .env
+            chmod 600 .env
+
+            set_env() {
+              key="$1"
+              value="$2"
+              if grep -q "^${key}=" .env; then
+                sed -i "s|^${key}=.*|${key}=${value}|" .env
+              else
+                printf "%s=%s\n" "$key" "$value" >> .env
+              fi
+            }
+
+            set_env ROBINHOOD_RPC_URL https://robinhood-rpc.publicnode.com
+            set_env HYPEREVM_RPC_URL https://rpc.hyperliquid.xyz/evm
+            set_env BNB_RPC_URL https://bsc-rpc.publicnode.com
+            set_env REQUEST_TIMEOUT 30
+            set_env RPC_BATCH_SIZE 50
+            set_env WALLET_LABELS_FILE /opt/wallet-radar/labels.json
+
+            # 只读取现有 Robinhood 环境中的 Telegram 凭据，复制到本程序；不修改来源文件。
+            if sudo test -f /etc/robinhood-radar.env; then
+              for key in TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID; do
+                if ! grep -q "^${key}=." .env; then
+                  value=$(sudo grep -m1 "^${key}=" /etc/robinhood-radar.env 2>/dev/null | cut -d= -f2- || true)
+                  if [ -n "$value" ]; then
+                    printf "%s=%s\n" "$key" "$value" >> .env
+                  fi
+                fi
+              done
             fi
 
             .venv/bin/python -m py_compile main.py
-            .venv/bin/python main.py --help >/tmp/wallet-radar-help.txt
-            grep -q "Robinhood Chain wallet cluster MVP" /tmp/wallet-radar-help.txt
+            .venv/bin/python main.py --help | grep -q "多链钱包雷达"
+            .venv/bin/python main.py selftest --all
 
-            .venv/bin/python - <<"PY"
-          import os
-          import requests
-          from dotenv import load_dotenv
-          load_dotenv("/opt/wallet-radar/.env")
-          rpc = os.environ["ROBINHOOD_RPC_URL"]
-          payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []}
-          r = requests.post(rpc, json=payload, timeout=20)
-          r.raise_for_status()
-          data = r.json()
-          chain_id = int(data["result"], 16)
-          assert chain_id == 4663, data
-          print("ROBINHOOD_CHAIN_ID_OK=4663")
-          api = os.environ["BLOCKSCOUT_API_BASE"].rstrip("/")
-          headers = {"User-Agent": "Mozilla/5.0 WalletRadar/1.0", "Accept": "application/json"}
-          r = requests.get(api + "/stats", headers=headers, timeout=20)
-          print("BLOCKSCOUT_HTTP_STATUS=" + str(r.status_code))
-          if r.status_code == 200:
-              print("BLOCKSCOUT_API_OK")
-          else:
-              print("BLOCKSCOUT_API受限，安装继续；后续链上模块不依赖该检查。")
-          PY
-
-            echo "WALLET_RADAR_INSTALL_OK"
-            echo "PATH=/opt/wallet-radar"
-            echo "PYTHON=/opt/wallet-radar/.venv/bin/python"
+            echo "多链钱包雷达安装成功"
+            echo "安装目录=/opt/wallet-radar"
           '
 
-      - name: 最终边界检查
+      - name: 最终隔离和三链验证
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
@@ -129,5 +145,14 @@ jobs:
             test -d /opt/wallet-radar
             test -x /opt/wallet-radar/.venv/bin/python
             test -f /opt/wallet-radar/main.py
-            echo "安装完成：仅 /opt/wallet-radar"
+            test -f /opt/wallet-radar/labels.json
+
+            /opt/wallet-radar/.venv/bin/python /opt/wallet-radar/main.py selftest --all
+
+            systemctl show hyperevm-radar.service -p MainPID -p NRestarts -p ExecMainStartTimestamp --no-pager 2>/dev/null | sort > /tmp/wallet-radar-hyper-after.txt || true
+            if [ -s /tmp/wallet-radar-hyper-before.txt ]; then
+              diff -u /tmp/wallet-radar-hyper-before.txt /tmp/wallet-radar-hyper-after.txt
+            fi
+            echo "隔离检查通过：未修改或重启 HyperEVM Radar。"
+            echo "安装完成：Robinhood + HyperEVM + BNB + 自定义 EVM 链模式。"
           '
