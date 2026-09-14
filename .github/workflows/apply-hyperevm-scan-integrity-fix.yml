@@ -1,0 +1,111 @@
+name: Apply HyperEVM Scan Integrity Fix
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/apply-hyperevm-scan-integrity-fix.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: deploy-hyperevm-radar-production
+  cancel-in-progress: false
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 7d6a333eb25360bb04c70c223b896b6fc074fc99
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test scan integrity
+        run: |
+          pip install -q requests aiohttp web3
+          cd hyperevm-radar
+          PYTHONPATH=. python -m unittest discover -s tests -p test_scan_integrity.py -v
+      - name: SSH setup
+        env:
+          KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+      - name: Patch and verify production
+        env:
+          HOST: ${{ secrets.SERVER_HOST }}
+          USERNAME: ${{ secrets.SERVER_USER }}
+          PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          scp -i ~/.ssh/deploy_key -P "$PORT" -o StrictHostKeyChecking=accept-new hyperevm-radar/monitors/blocks.py "$USERNAME@$HOST:/tmp/scan-integrity-$GITHUB_RUN_ID.py"
+          ssh -i ~/.ssh/deploy_key -p "$PORT" -o StrictHostKeyChecking=accept-new "$USERNAME@$HOST" "sudo /opt/hyperevm-radar/.venv/bin/python - /tmp/scan-integrity-$GITHUB_RUN_ID.py" <<'PY'
+          import ast,os,sys,time,shutil,sqlite3,asyncio,subprocess,importlib.util
+          from pathlib import Path
+          os.chdir('/opt/hyperevm-radar');sys.path.insert(0,os.getcwd());sys.dont_write_bytecode=True
+          p=Path('monitors/blocks.py');main=Path('main.py');old=p.read_text();oldmain=main.read_text()
+          assert 'current = await self.latest_block()' in old,'Unexpected scanner baseline'
+          new=Path(sys.argv[1]).read_text()
+          fixed=oldmain
+          edits=[
+              ('print(f"factory token log error block={block_number}: {e}")','print(f"factory token log error block={block_number}: {e}")\n                raise'),
+              ('            factory = pool_info["factory"]','            if not await monitor.validate_pool(pool_info, block_number):\n                print(f"POOL_REJECTED block={block_number} pool={pool_info[\'pool\']} reason=chain_relationship_mismatch")\n                continue\n\n            factory = pool_info["factory"]'),
+              ('print(f"contract error {address}: {e}")','print(f"contract error {address}: {e}")\n        raise')]
+          for before,after in edits:
+              assert fixed.count(before)==1,'Production patch context changed'
+              fixed=fixed.replace(before,after,1)
+          compile(new,str(p),'exec');compile(fixed,str(main),'exec')
+          spec=importlib.util.spec_from_file_location('scan_validation',p);mod=importlib.util.module_from_spec(spec);sys.modules[spec.name]=mod;exec(compile(new,str(p),'exec'),mod.__dict__)
+          async def check_pools():
+              from detectors.pools import detect_pool_event
+              monitor=mod.HyperEVMBlockMonitor();assert await monitor.chain_id()==999
+              with sqlite3.connect('file:data/radar.db?mode=ro',uri=True) as c:
+                  blocks=[r[0] for r in c.execute("select distinct block_number from contract_relations where relation_type in ('V2_PAIR','V3_POOL') order by block_number desc limit 3")]
+              count=0
+              for number in blocks:
+                  for attempt in range(5):
+                      try:
+                          logs=await monitor.get_logs(number)
+                          for log in logs:
+                              info=detect_pool_event(log)
+                              if info:
+                                  valid=await monitor.validate_pool(info,number)
+                                  print('LIVE_POOL_VALIDATION',number,info['pool'],valid,flush=True)
+                                  assert valid,'Existing pool compatibility check failed'
+                                  count+=1
+                          break
+                      except Exception:
+                          if attempt==4:raise
+                          await asyncio.sleep(2**attempt)
+              assert count>0,'No live pools checked'
+          asyncio.run(check_pools())
+          stamp=time.strftime('%Y%m%dT%H%M%S');backups=[]
+          for path,content in [(p,new),(main,fixed)]:
+              backup=path.with_name(path.name+'.before_scanfix_'+stamp);shutil.copy2(path,backup);backups.append((path,backup))
+          try:
+              subprocess.run(['systemctl','stop','hyperevm-radar.service'],check=True)
+              for path,content in [(p,new),(main,fixed)]:
+                  st=path.stat();tmp=path.with_name(path.name+'.scanfix.tmp');tmp.write_text(content);os.chmod(tmp,st.st_mode);os.chown(tmp,st.st_uid,st.st_gid);os.replace(tmp,path)
+              subprocess.run(['systemctl','start','hyperevm-radar.service'],check=True)
+              time.sleep(20)
+              subprocess.run(['systemctl','is-active','--quiet','hyperevm-radar.service'],check=True)
+              with sqlite3.connect('file:data/radar.db?mode=ro',uri=True) as c:
+                  first=c.execute('select next_block from radar_scan_progress where chain_id=999').fetchone()[0]
+              print('PERSISTED_PROGRESS_FIRST',first,flush=True)
+              time.sleep(15)
+              with sqlite3.connect('file:data/radar.db?mode=ro',uri=True) as c:
+                  second=c.execute('select next_block from radar_scan_progress where chain_id=999').fetchone()[0]
+              print('PERSISTED_PROGRESS_SECOND',second,flush=True);assert second>first,'Scanner did not advance'
+              subprocess.run(['systemctl','restart','hyperevm-radar.service'],check=True)
+              time.sleep(15)
+              subprocess.run(['systemctl','is-active','--quiet','hyperevm-radar.service'],check=True)
+              print(subprocess.check_output(['systemctl','show','hyperevm-radar.service','-p','ActiveState','-p','SubState','-p','NRestarts'],text=True),flush=True)
+              print(subprocess.check_output(['journalctl','-u','hyperevm-radar.service','--since','3 minutes ago','--no-pager','-n','80'],text=True),flush=True)
+              print('SCAN_DEPLOYMENT_VERIFIED',flush=True)
+          except Exception:
+              subprocess.run(['systemctl','stop','hyperevm-radar.service'])
+              for path,backup in backups:shutil.copy2(backup,path)
+              subprocess.run(['systemctl','start','hyperevm-radar.service'])
+              print('SCAN_FIX_ROLLED_BACK',flush=True);raise
+          Path(sys.argv[1]).unlink(missing_ok=True)
+          PY
