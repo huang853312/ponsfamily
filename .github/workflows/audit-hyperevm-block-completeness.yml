@@ -75,6 +75,16 @@ jobs:
               log=subprocess.check_output(['journalctl','_PID='+last['service']['MainPID'],'--since','-10 min','-o','cat','--no-pager'],text=True)
               print('PROCESS_ERROR_COUNTS',json.dumps({'scan_retries':log.count('SCAN_RETRY'),'rate_limits':log.count('rate limited'),'invalid_opcode_errors':log.count('InvalidFEOpcode')}),flush=True)
               print('LIVE_SCAN_AUDIT_PASSED',flush=True)
+          print('AUDIT_UTC',time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),flush=True)
+          import main as app
+          selected=app.list_platform_families_for_identity_fair(limit=200)
+          now=int(time.time())
+          retries={r['subject_key']:dict(r) for r in c.execute('SELECT subject_key,next_retry_at,backoff_seconds FROM platform_identity_investigations')}
+          future=[{'family_id':f['id'],'next_retry_at':retries['family:'+str(f['id'])]['next_retry_at']} for f in selected if retries.get('family:'+str(f['id']),{}).get('next_retry_at',0)>now]
+          print('REAL_FUTURE_RETRY_SELECTION',json.dumps({'selected':len(selected),'future_selected':len(future),'examples':future[:5]}),flush=True)
+          import hashlib
+          for name in ['main.py','database.py','monitors/blocks.py','execution_state.py','platform_family_intelligence.py','rpc_errors.py']:
+              print('CURRENT_SOURCE_HASH',name,hashlib.sha256((root/name).read_bytes()).hexdigest(),flush=True)
           asyncio.run(probe())
           PY
           REMOTE
