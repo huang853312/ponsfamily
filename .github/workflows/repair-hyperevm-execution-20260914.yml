@@ -65,3 +65,5 @@ jobs:
             'sudo /opt/hyperevm-radar/.venv/bin/python /tmp/hyper-execution-deploy-${{ github.run_id }}.py /tmp/hyper-execution-payload-${{ github.run_id }}.json'
 
 # Execute reviewed recovery patch 7c5fcb862ab73ab9a5c328534ab78a88a8652beb
+
+# Deploy provider cooldown and requeue legacy execution failures: 528d02555d90939145d745a499660756151e152b
