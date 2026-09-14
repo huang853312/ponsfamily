@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Telegram 私聊授权、中文错误、低内存分析入口与进度提示适配层。
+"""Telegram 私聊授权、中文错误、低内存分析入口与真实阶段进度适配层。
 
-保留 telegram_bot.py 的命令和中文报告逻辑，只扩展：
-- 原先配置的 TELEGRAM_CHAT_ID 继续直接允许；
-- 授权群管理员可在机器人私聊中操作；
-- 电报端不显示 Python/HTTP 英文堆栈；
-- 分析子进程改走 main_fast.py，避免活跃链完整区块批量扫描拖死小服务器；
-- 直接读取分析子进程的真实阶段输出，把进度实时发到当前聊天；
-- 长分析期间继续发送中文心跳，不再长时间无反应。
+只扩展交互与执行方式，不改 main.py 的分析口径：
+- 配置聊天继续允许；授权群管理员可私聊机器人；
+- 电报端隐藏 Python/HTTP 英文堆栈；
+- analyze 子进程统一走 main_fast.py；
+- 读取 main_fast.py 的真实阶段标记，显示 25%/50%/75%/90%；
+- 报告发送回“发起查询的当前聊天”，不会私聊查询却跑到群里；
+- 长任务有中文心跳，避免看起来像卡死。
 """
 import queue
 import threading
@@ -51,7 +51,6 @@ def _allowed(message: dict) -> bool:
     chat_type = str(chat.get("type") or "")
     sender = message.get("from") or {}
     sender_id = str(sender.get("id") or "")
-
     if CONFIGURED_CHAT and chat_id == CONFIGURED_CHAT:
         return True
     if chat_type == "private" and sender_id and sender_id in _admin_ids():
@@ -60,7 +59,6 @@ def _allowed(message: dict) -> bool:
 
 
 def _chinese_error_message(text: str) -> str:
-    """把底层英文异常压缩成电报端中文原因；完整异常仍保留在服务日志。"""
     raw = str(text or "")
     low = raw.lower()
     if not ("分析失败" in raw or "分析任务异常" in raw):
@@ -74,7 +72,7 @@ def _chinese_error_message(text: str) -> str:
     elif "timeout" in low or "timed out" in low or "超过 30 分钟" in raw:
         reason = "链上查询超时。该代币交易量较大或节点较慢，任务已安全停止，请重新提交。"
     elif "traceback" in low or 'file "/opt/wallet-radar/' in low or "rpc 请求失败" in raw:
-        reason = "链上查询出现内部异常。详细技术日志已保存在服务器，电报端不再显示英文错误堆栈。"
+        reason = "链上查询出现内部异常。详细技术日志已保存在服务器，电报端不显示英文错误堆栈。"
     else:
         reason = "分析过程中出现链上查询异常。详细技术日志已保存在服务器。"
     if not prefix:
@@ -97,8 +95,46 @@ def _progress_send(text: str):
         print(f"发送阶段进度失败：{type(exc).__name__}: {exc}", flush=True)
 
 
+def _extract_report(output: str) -> str:
+    marker = "🛰 多链钱包雷达报告"
+    if marker not in output:
+        return ""
+    report = output[output.index(marker):]
+    for end_marker in ("\n明细文件：", "\n实际扫描起始区块：", "\n本次实际使用 RPC："):
+        if end_marker in report:
+            report = report.split(end_marker, 1)[0]
+    return report.strip()
+
+
+def _send_stage_marker(text: str, sent: set):
+    if text.startswith("进度标记：25") and 25 not in sent:
+        _progress_send(
+            "✅ 已完成 25%：历史转账读取完成。\n"
+            "📊 正在重建持币结构、识别外部账户和主动买卖……"
+        )
+        sent.add(25)
+    elif text.startswith("进度标记：50") and 50 not in sent:
+        _progress_send(
+            "✅ 已完成 50%：持币结构、外部账户和主动买卖初筛完成。\n"
+            "🔗 正在分析共同资金来源……"
+        )
+        sent.add(50)
+    elif text.startswith("进度标记：75") and 75 not in sent:
+        _progress_send(
+            "✅ 已完成 75%：共同资金来源分析完成。\n"
+            "↩️ 正在检查卖出后资金回流……"
+        )
+        sent.add(75)
+    elif text.startswith("进度标记：90") and 90 not in sent:
+        _progress_send(
+            "✅ 已完成 90%：资金回流检查完成。\n"
+            "🧩 正在汇总关联持仓比例、同步行为和综合风险……"
+        )
+        sent.add(90)
+
+
 def low_memory_subprocess_run(cmd, *args, **kwargs):
-    """wallet-radar analyze 走低内存入口，并把真实阶段输出实时转成中文进度。"""
+    """analyze 统一走 main_fast.py，并把真实阶段输出实时发到当前查询聊天。"""
     if not (isinstance(cmd, (list, tuple)) and "analyze" in cmd):
         return _original_subprocess_run(cmd, *args, **kwargs)
 
@@ -106,9 +142,13 @@ def low_memory_subprocess_run(cmd, *args, **kwargs):
     for i, item in enumerate(rewritten):
         if str(item).endswith("/main.py") or str(item) == "main.py":
             fast = ROOT / "main_fast.py"
-            if fast.exists():
-                rewritten[i] = str(fast)
+            if not fast.exists():
+                raise RuntimeError("低内存分析入口 main_fast.py 不存在，拒绝回退到重扫描模式")
+            rewritten[i] = str(fast)
             break
+
+    # 子进程不直接发到固定 TELEGRAM_CHAT_ID；由这里把报告发回真正的请求聊天。
+    rewritten = [item for item in rewritten if str(item) != "--telegram"]
 
     timeout = kwargs.get("timeout")
     cwd = kwargs.get("cwd")
@@ -117,8 +157,7 @@ def low_memory_subprocess_run(cmd, *args, **kwargs):
     lines = []
     sent = set()
 
-    _progress_send("📊 正在读取持币结构……\n正在重建代币转账历史和当前持仓，请稍候。")
-    sent.add("start")
+    _progress_send("📊 正在读取持币结构……\n正在读取真实链上历史数据，请稍候。")
 
     proc = bot.subprocess.Popen(
         rewritten,
@@ -159,31 +198,18 @@ def low_memory_subprocess_run(cmd, *args, **kwargs):
             lines.append(item)
             text = item.strip()
             print(text, flush=True)
-
-            if "正在查找" in text and "资金来源" in text and "funders" not in sent:
-                _progress_send(
-                    "✅ 已完成 50%：持币结构、外部账户和同步买卖初筛已完成。\n"
-                    "🔗 正在分析共同资金来源……"
-                )
-                sent.add("funders")
-            elif "已找到" in text and "资金来源" in text and "returns" not in sent:
-                _progress_send(
-                    "✅ 已完成 75%：共同资金来源分析完成。\n"
-                    "↩️ 正在检查卖出后资金回流……"
-                )
-                sent.add("returns")
-            elif "检测到" in text and "资金回流" in text and "summary" not in sent:
-                _progress_send(
-                    "✅ 已完成 90%：资金回流检查完成。\n"
-                    "🧩 正在汇总关联持仓比例、同步行为和综合风险……"
-                )
-                sent.add("summary")
+            _send_stage_marker(text, sent)
 
         if proc.poll() is not None and reader_done and q.empty():
             break
 
     rc = proc.wait()
     output = "".join(lines)
+    if rc == 0:
+        report = _extract_report(output)
+        if report:
+            _progress_send(report)
+
     return bot.subprocess.CompletedProcess(
         rewritten,
         rc,
@@ -193,10 +219,9 @@ def low_memory_subprocess_run(cmd, *args, **kwargs):
 
 
 def _heartbeat(chat_id: str, started: float):
-    # 给短任务留时间；只有真正变成长任务才提示。
     time.sleep(45)
     count = 0
-    while count < 12:
+    while count < 20:
         with bot._busy_lock:
             running = bool(bot._busy.get("running"))
             same = abs(float(bot._busy.get("started") or 0.0) - float(started)) < 0.01
@@ -212,7 +237,7 @@ def _heartbeat(chat_id: str, started: float):
                 f"链：{chain_name}\n"
                 f"合约地址：{token}\n"
                 f"已运行：{elapsed // 60} 分 {elapsed % 60} 秒\n"
-                "系统仍在读取真实链上数据，没有卡死。完成后会自动发送中文报告。",
+                "系统仍在读取真实链上数据，没有卡死；阶段变化会自动提示。",
                 chat_id,
             )
         except Exception as exc:
@@ -242,7 +267,7 @@ def handle_message(message: dict):
     with bot._busy_lock:
         was_running = bool(bot._busy.get("running"))
 
-    # 原处理器内部还有旧的单 chat_id 检查；仅在本次已授权调用期间关闭。
+    # 原处理器内部还有固定 chat_id 检查；仅在本次已授权调用期间关闭。
     old = bot.AUTHORIZED_CHAT
     bot.AUTHORIZED_CHAT = ""
     try:
@@ -267,6 +292,7 @@ def main():
     print("电报中文错误适配已启用。", flush=True)
     print("低内存分析入口已启用。", flush=True)
     print("真实阶段中文进度提示已启用。", flush=True)
+    print("查询报告回传当前聊天已启用。", flush=True)
     bot.poll_forever()
 
 
