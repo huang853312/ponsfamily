@@ -105,7 +105,8 @@ jobs:
               fi
             }
 
-            set_env ROBINHOOD_RPC_URL https://robinhood-rpc.publicnode.com
+            # Robinhood 使用官方 RPC。PublicNode 的历史 eth_getLogs 会要求个人归档令牌并返回 403。
+            set_env ROBINHOOD_RPC_URL https://rpc.mainnet.chain.robinhood.com
             set_env HYPEREVM_RPC_URL https://rpc.hyperliquid.xyz/evm
             set_env BNB_RPC_URL https://bsc-rpc.publicnode.com
             set_env REQUEST_TIMEOUT 30
@@ -127,6 +128,24 @@ jobs:
             .venv/bin/python -m py_compile main.py
             .venv/bin/python main.py --help | grep -q "多链钱包雷达"
             .venv/bin/python main.py selftest --all
+
+            # 额外验证 Robinhood 历史日志能力，避免只检查最新区块却遗漏归档限制。
+            .venv/bin/python - <<"PY"
+          import os, requests
+          rpc=os.environ.get("ROBINHOOD_RPC_URL", "https://rpc.mainnet.chain.robinhood.com")
+          token="0xac46193ff2cb638bcfd02520e124a3e2c9228774"
+          topic="0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+          def call(method, params):
+              r=requests.post(rpc,json={"jsonrpc":"2.0","id":1,"method":method,"params":params},timeout=20)
+              r.raise_for_status()
+              d=r.json()
+              if d.get("error"):
+                  raise RuntimeError(d["error"])
+              return d.get("result")
+          latest=int(call("eth_blockNumber", []),16)
+          logs=call("eth_getLogs", [{"fromBlock":hex(max(0,latest-2000)),"toBlock":hex(latest),"address":token,"topics":[topic]}])
+          print(f"ROBINHOOD_HISTORY_LOGS_OK={len(logs or [])}")
+          PY
 
             echo "多链钱包雷达安装成功"
             echo "安装目录=/opt/wallet-radar"
