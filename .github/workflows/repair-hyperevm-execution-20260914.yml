@@ -67,3 +67,5 @@ jobs:
 # Execute reviewed recovery patch 7c5fcb862ab73ab9a5c328534ab78a88a8652beb
 
 # Deploy provider cooldown and requeue legacy execution failures: 528d02555d90939145d745a499660756151e152b
+
+# Repair captured InvalidFEOpcode stall and resume persisted block 45872378
