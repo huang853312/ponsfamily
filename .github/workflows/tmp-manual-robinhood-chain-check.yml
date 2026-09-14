@@ -1,0 +1,135 @@
+name: 临时手动链上地址检查
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/tmp-manual-robinhood-chain-check.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 查询 Robinhood Chain 三个地址
+        run: |
+          python3 - <<'PY'
+          import json, urllib.parse, urllib.request
+          from collections import Counter, defaultdict
+
+          BASE='https://robinhoodchain.blockscout.com/api/v2'
+          targets=[
+            '0xe5e702641ea86f4ae6cc3cdaed2b886f976be044',
+            '0xc6ef5989f2e97b41bc01cc33f97cdb29b27d19fb',
+            '0x4d41b5a303024bce506037a2964aedae3ed88f4b',
+          ]
+          tset={x.lower() for x in targets}
+
+          def get(url):
+              req=urllib.request.Request(url, headers={'User-Agent':'Mozilla/5.0'})
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return json.load(r)
+
+          def page_all(path, max_pages=50):
+              url=BASE+path
+              out=[]
+              for _ in range(max_pages):
+                  d=get(url)
+                  out.extend(d.get('items') or [])
+                  nxt=d.get('next_page_params')
+                  if not nxt:
+                      break
+                  url=BASE+path.split('?')[0]+'?'+urllib.parse.urlencode(nxt, doseq=True)
+              return out
+
+          def ah(x):
+              if isinstance(x,dict): return (x.get('hash') or '').lower()
+              return (x or '').lower()
+
+          all_txs={}
+          for a in targets:
+              print('\n'+'='*100)
+              print('ADDRESS',a)
+              try:
+                  info=get(BASE+f'/addresses/{a}')
+                  print('INFO', json.dumps({
+                    'hash':info.get('hash'),
+                    'is_contract':info.get('is_contract'),
+                    'name':info.get('name'),
+                    'coin_balance':info.get('coin_balance'),
+                    'creator_address_hash':info.get('creator_address_hash'),
+                    'creation_transaction_hash':info.get('creation_transaction_hash'),
+                    'is_verified':info.get('is_verified'),
+                  }, ensure_ascii=False))
+              except Exception as e:
+                  print('INFO_ERROR',repr(e)); info={}
+              try:
+                  counters=get(BASE+f'/addresses/{a}/counters')
+                  print('COUNTERS',json.dumps(counters,ensure_ascii=False))
+              except Exception as e:
+                  print('COUNTERS_ERROR',repr(e))
+              try:
+                  txs=page_all(f'/addresses/{a}/transactions', max_pages=100)
+              except Exception as e:
+                  print('TX_ERROR',repr(e)); txs=[]
+              all_txs[a.lower()]=txs
+              print('TX_FETCHED',len(txs))
+              if txs:
+                  ts=[x.get('timestamp') for x in txs if x.get('timestamp')]
+                  print('TX_TIME_RANGE', min(ts) if ts else None, max(ts) if ts else None)
+
+              incoming=[]; outgoing=[]; direct=[]
+              cp=Counter()
+              for tx in txs:
+                  fr=ah(tx.get('from')); to=ah(tx.get('to'))
+                  val=int(tx.get('value') or 0)
+                  me=a.lower()
+                  if fr==me and to: cp[to]+=1
+                  elif to==me and fr: cp[fr]+=1
+                  if fr in tset and to in tset:
+                      direct.append(tx)
+                  if to==me and fr and val>0:
+                      incoming.append((tx.get('timestamp'), fr, val/1e18, tx.get('hash'), tx.get('method')))
+                  if fr==me and to and val>0:
+                      outgoing.append((tx.get('timestamp'), to, val/1e18, tx.get('hash'), tx.get('method')))
+
+              print('TOP_COUNTERPARTIES', json.dumps(cp.most_common(20), ensure_ascii=False))
+              print('INBOUND_NATIVE_ETH_COUNT',len(incoming))
+              for x in sorted(incoming)[:20]: print('INBOUND_NATIVE_ETH',x)
+              print('OUTBOUND_NATIVE_ETH_COUNT',len(outgoing))
+              for x in sorted(outgoing)[:20]: print('OUTBOUND_NATIVE_ETH',x)
+              print('DIRECT_TARGET_TX_COUNT',len(direct))
+              for tx in sorted(direct, key=lambda x:x.get('timestamp') or ''):
+                  print('DIRECT_TARGET_TX', json.dumps({
+                    'timestamp':tx.get('timestamp'),'hash':tx.get('hash'),'from':ah(tx.get('from')),
+                    'to':ah(tx.get('to')),'value_eth':int(tx.get('value') or 0)/1e18,'method':tx.get('method'),'status':tx.get('status')
+                  },ensure_ascii=False))
+
+              print('RECENT_20')
+              for tx in txs[:20]:
+                  print(json.dumps({
+                    'timestamp':tx.get('timestamp'),'hash':tx.get('hash'),'from':ah(tx.get('from')),
+                    'to':ah(tx.get('to')),'value_eth':int(tx.get('value') or 0)/1e18,'method':tx.get('method'),'status':tx.get('status')
+                  },ensure_ascii=False))
+
+          # common counterparties between the two non-hook candidates
+          a2=targets[1].lower(); a3=targets[2].lower()
+          def cps(me):
+              s=Counter()
+              for tx in all_txs.get(me,[]):
+                  fr=ah(tx.get('from')); to=ah(tx.get('to'))
+                  if fr==me and to: s[to]+=1
+                  elif to==me and fr: s[fr]+=1
+              return s
+          c2,c3=cps(a2),cps(a3)
+          common=[]
+          for x in set(c2)&set(c3):
+              common.append((c2[x]+c3[x],x,c2[x],c3[x]))
+          common.sort(reverse=True)
+          print('\n'+'='*100)
+          print('COMMON_COUNTERPARTIES_C6EF_4D41')
+          for row in common[:50]: print(row)
+          PY
