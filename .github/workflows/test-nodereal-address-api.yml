@@ -18,13 +18,17 @@ jobs:
       - name: 测试增强地址查询
         run: |
           python3 - <<'PY'
-          import requests, json
+          import requests
           url='https://bsc-mainnet.nodereal.io/v1/f8728a3265504b998a2f09c83493d76a'
           addr='0xf5a248f6139f0ab0fab0c4dda6043b840f927777'
-          p={'jsonrpc':'2.0','id':1,'method':'nr_getTransactionByAddress','params':[{'category':['external'],'addressType':'to','address':addr,'order':'desc','excludeZeroValue':False,'maxCount':'0x5','toBlock':'latest'}]}
-          r=requests.post(url,json=p,timeout=30)
+          s=requests.Session()
+          latest_req={'jsonrpc':'2.0','id':1,'method':'eth_blockNumber','params':[]}
+          latest=int(s.post(url,json=latest_req,timeout=30).json()['result'],16)
+          q={'category':['external'],'addressType':'to','address':addr,'order':'desc','excludeZeroValue':False,'maxCount':'0x5','fromBlock':hex(max(0,latest-1000)),'toBlock':hex(latest)}
+          p={'jsonrpc':'2.0','id':2,'method':'nr_getTransactionByAddress','params':[q]}
+          r=s.post(url,json=p,timeout=30)
           print('http',r.status_code)
-          print(r.text[:2000])
+          print(r.text[:2500])
           if r.status_code!=200:
               raise SystemExit(1)
           d=r.json()
