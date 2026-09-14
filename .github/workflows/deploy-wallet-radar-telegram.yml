@@ -1,0 +1,93 @@
+name: 安装钱包雷达电报控制台
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "wallet-radar/telegram_bot.py"
+      - ".github/workflows/deploy-wallet-radar-telegram.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-wallet-radar-telegram
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 本地检查
+        run: |
+          set -eu
+          python3 -m py_compile wallet-radar/telegram_bot.py
+          if grep -nE '(/opt/hyperevm-radar|hyperevm-radar\.service)' wallet-radar/telegram_bot.py; then
+            echo '电报控制台不得依赖现有 HyperEVM Radar。'
+            exit 1
+          fi
+
+      - name: 配置服务器连接
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          touch ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: 部署电报控制台
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -eu
+          SSH="ssh -i $HOME/.ssh/deploy_key -p $SERVER_PORT -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30"
+          scp -i "$HOME/.ssh/deploy_key" -P "$SERVER_PORT" -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o StrictHostKeyChecking=accept-new wallet-radar/telegram_bot.py "$SERVER_USER@$SERVER_HOST:/opt/wallet-radar/telegram_bot.py"
+          $SSH "$SERVER_USER@$SERVER_HOST" '
+            set -eu
+            cd /opt/wallet-radar
+            test -x .venv/bin/python
+            test -f .env
+            .venv/bin/python -m py_compile telegram_bot.py
+            .venv/bin/python telegram_bot.py --check
+            cat > /tmp/wallet-radar-bot.service <<"UNIT"
+          [Unit]
+          Description=多链钱包雷达电报中文控制台
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          WorkingDirectory=/opt/wallet-radar
+          EnvironmentFile=/opt/wallet-radar/.env
+          Environment=PYTHONUNBUFFERED=1
+          ExecStart=/opt/wallet-radar/.venv/bin/python /opt/wallet-radar/telegram_bot.py
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+            sudo install -m 644 /tmp/wallet-radar-bot.service /etc/systemd/system/wallet-radar-bot.service
+            sudo systemctl daemon-reload
+            sudo systemctl enable wallet-radar-bot.service
+            sudo systemctl restart wallet-radar-bot.service
+            sleep 5
+            test "$(systemctl is-active wallet-radar-bot.service)" = active
+            test "$(systemctl is-enabled wallet-radar-bot.service)" = enabled
+            journalctl -u wallet-radar-bot.service --since "2 minutes ago" --no-pager > /tmp/wallet-radar-bot.log
+            grep -q "电报交互控制台已启动" /tmp/wallet-radar-bot.log
+            if grep -qiE "409|conflict|webhook.*getUpdates|getUpdates.*webhook" /tmp/wallet-radar-bot.log; then
+              cat /tmp/wallet-radar-bot.log
+              exit 1
+            fi
+            echo "电报控制台安装完成"
+          '
