@@ -566,7 +566,8 @@ def save_platform_token_match(
     deployer,
     match_type,
     block_number,
-    tx_hash=""
+    tx_hash="",
+    notification=None,
 ):
     now = int(time.time())
 
@@ -576,8 +577,8 @@ def save_platform_token_match(
         return False
 
     with sqlite3.connect(DB_PATH) as conn:
-
         # One platform + one token CA = one alert.
+        conn.execute('BEGIN IMMEDIATE')
         existing = conn.execute("""
             SELECT id
             FROM platform_token_matches
@@ -618,6 +619,9 @@ def save_platform_token_match(
                 now
             ))
 
+            if notification is not None:
+                from execution_state import enqueue_notification
+                enqueue_notification(f"pt:{int(platform_id)}:{token_address}", notification, conn=conn)
             conn.commit()
             return True
 
@@ -1050,6 +1054,10 @@ def save_platform_identity_investigation(result):
             attempt_count = prior_attempts + 1
             base = 300 if status == "PARTIAL" else 600
             cap = 7200 if status == "PARTIAL" else 21600
+            if result.get('execution_status') in {'ERROR', 'BUDGET_EXHAUSTED'}:
+                # An unfinished investigation is not a completed no-data search.
+                # Keep attempts for audit, but do not inherit a six-hour delay.
+                base, cap = 60, 300
             backoff_seconds = min(cap, base * (2 ** min(attempt_count - 1, 8)))
             next_retry_at = now + backoff_seconds
             failure_reason = _identity_failure_reason(result)

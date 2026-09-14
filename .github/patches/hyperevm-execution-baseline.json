@@ -1,0 +1,19 @@
+{
+  "baseline": {
+    "main.py": "43562e610fb61a3ce05b53df724886e242ce2e1a37d00d61715c2523c5c2802e",
+    "database.py": "18da954ca4224cd5d20b5d07a67ea901e8b2d1564d586a9d235d5e669d92bec4",
+    "notifier.py": "8982f0c1647050405d91756a471eb87f46881ae8c77094a2970c24abb50800ed",
+    "detectors/token.py": "63eff9b90ac04f4b34e16a2314f293b473050eda401992a3e5eb1b8d63682332",
+    "platform_family_intelligence.py": "4defec4dfa4424380f92182c10a75d0b6f29a827daf8b70cb0fc24b2fb520c8d",
+    "execution_state.py": null,
+    "monitors/blocks.py": "5b388585bc924cb033878dd29a7547186b61ff62de723f293c364d917f61cada"
+  },
+  "files": [
+    "main.py",
+    "database.py",
+    "notifier.py",
+    "detectors/token.py",
+    "platform_family_intelligence.py",
+    "execution_state.py"
+  ]
+}

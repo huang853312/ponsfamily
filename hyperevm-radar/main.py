@@ -9,6 +9,9 @@ from detectors.pools import detect_pool_event
 from detectors.rwa_assets import get_rwa_asset
 from monitors.blocks import HyperEVMBlockMonitor
 from notifier import send_telegram, format_family_intelligence_message
+from execution_state import (init_execution_db, begin_contract_processing,
+    complete_contract_processing, fail_contract_processing, enqueue_notification,
+    notification_worker, record_pool_observation)
 from platform_token_radar import normalize_text, classify_platform_words
 from address_book import load_deployers, save_deployer
 from platform_family import build_platform_families
@@ -192,7 +195,7 @@ def run_platform_identity_pipeline(
             try:
                 result = engine.enrich(family, auxiliary_candidates=auxiliary)
             except Exception as exc:
-                result = {"family_id":family.get("id"),"subject_key":family.get("subject_key") or (f"family:{family.get('id')}" if family.get("id") else ""),"project_name":"","official_x":"","official_website":"","description":"","infrastructure_types":["Other"],"official_token_symbol":"","official_token_ca":"","token_status":"NONE","confidence":0,"verification_status":"NO_DATA","discovered_project_addresses":[],"discovered_candidates":0,"evidence":[{"source":"identity_engine","status":"NO_DATA","detail":type(exc).__name__}]}
+                result = {"family_id":family.get("id"),"subject_key":family.get("subject_key") or (f"family:{family.get('id')}" if family.get("id") else ""),"project_name":"","official_x":"","official_website":"","description":"","infrastructure_types":["Other"],"official_token_symbol":"","official_token_ca":"","token_status":"NONE","confidence":0,"verification_status":"NO_DATA","discovered_project_addresses":[],"discovered_candidates":0,"execution_status":"ERROR","evidence":[{"source":"identity_engine","status":"ERROR","detail":type(exc).__name__}]}
             total_candidates += int(result.get("discovered_candidates", 0) or 0)
             status = str(result.get("verification_status") or "NO_DATA").upper()
             status_counts[status if status in status_counts else "NO_DATA"] += 1
@@ -203,6 +206,15 @@ def run_platform_identity_pipeline(
             if dry_run:
                 print("IDENTITY DRY RUN", "family=", family["id"], "status=", result["verification_status"], "token_status=", result["token_status"])
                 continue
+
+            # Queue the already-eligible message before persisting confirmation.
+            # A crash after confirmation must not erase the only send opportunity.
+            if status == "VERIFIED":
+                init_execution_db()
+                subject = result.get('subject_key') or family.get('subject_key') or f"family:{family.get('id')}"
+                notification = format_family_intelligence_message(result, family)
+                enqueue_notification(f"identity:{subject}:{str(result.get('official_token_ca') or '').lower()}", notification)
+                notifications.append(notification)
 
             if family.get("id"):save_platform_family_intelligence(result)
             retry_state = save_platform_identity_investigation(result)
@@ -220,8 +232,6 @@ def run_platform_identity_pipeline(
                         "reason=", retry_state.get("last_failure_reason"),
                     )
                 continue
-
-            notifications.append(format_family_intelligence_message(result, family))
 
             if family.get("id"):update_platform_family_identity(
                 family["id"],
@@ -340,25 +350,11 @@ async def request_identity_refresh():
             "Platform identity refresh",
             {k:v for k,v in result.items() if k != "notifications"},
         )
-        telegram_success = 0
-        telegram_failed = 0
-        for message in result.get("notifications", []):
-            try:
-                sent = await send_telegram(message)
-                if sent:
-                    telegram_success += 1
-                else:
-                    telegram_failed += 1
-                    print("Platform intelligence Telegram failed: send returned false")
-            except Exception as e:
-                telegram_failed += 1
-                print("Platform intelligence Telegram failed:", repr(e))
         print(
             "Platform identity round summary",
             {
                 **{k:v for k,v in result.items() if k != "notifications"},
-                "telegram_success": telegram_success,
-                "telegram_failed": telegram_failed,
+                "eligible_notifications": len(result.get("notifications", [])),
             },
         )
 
@@ -391,12 +387,13 @@ async def handle_contract(monitor, event):
     creator = event["creator"]
     block_number = event["block_number"]
 
-    if seen(address):
+    if not begin_contract_processing(event, seen(address)):
         return
 
     try:
         code = await monitor.get_code(address)
         if not code:
+            complete_contract_processing(address)
             return
 
         fp = fingerprint(code)
@@ -637,20 +634,6 @@ async def handle_contract(monitor, event):
             )
 
             for platform in pt_matches:
-                is_new = save_platform_token_match(
-                    platform_id=platform["id"],
-                    token_address=address,
-                    token_name=token.get("name", ""),
-                    token_symbol=token.get("symbol", ""),
-                    deployer=creator,
-                    match_type=platform["match_type"],
-                    block_number=block_number,
-                    tx_hash=event.get("tx_hash", ""),
-                )
-
-                if not is_new:
-                    continue
-
                 match_type = platform["match_type"]
 
                 official_mapping_hit = (
@@ -685,12 +668,20 @@ async def handle_contract(monitor, event):
                     f"{signal_text}"
                 )
 
-                ok = await send_telegram(pt_message)
+                is_new = save_platform_token_match(
+                    platform_id=platform["id"], token_address=address,
+                    token_name=token.get("name", ""), token_symbol=token.get("symbol", ""),
+                    deployer=creator, match_type=platform["match_type"],
+                    block_number=block_number, tx_hash=event.get("tx_hash", ""),
+                    notification=pt_message,
+                )
+                if not is_new:
+                    continue
                 print(
                     f"PT_MATCH token={address} "
                     f"platform={platform.get('domain')} "
                     f"type={platform['match_type']} "
-                    f"telegram={ok}"
+                    f"telegram=queued"
                 )
 
         if token:
@@ -821,13 +812,16 @@ async def handle_contract(monitor, event):
                 f"Grade: {'ADDRESS_BOOK' if address_book_hit and level not in ('A_CANDIDATE', 'S_CANDIDATE') else ('S' if level == 'S_CANDIDATE' else 'A')} (early candidate, not investment advice)"
             )
 
-            ok = await send_telegram(message)
-            print(f"A candidate {address} telegram={ok}")
+            enqueue_notification(f"contract:{address.lower()}", message)
+            print(f"A candidate {address} telegram=queued")
 
         else:
             print(f"B-level contract recorded without Telegram alert: {address}")
 
+        complete_contract_processing(address)
+
     except Exception as e:
+        fail_contract_processing(address, e)
         print(f"contract error {address}: {e}")
         raise
 
@@ -841,6 +835,7 @@ async def main():
     init_platform_candidate_db()
     init_platform_family_db()
     init_platform_family_intelligence_db()
+    init_execution_db()
 
     monitor = HyperEVMBlockMonitor()
 
@@ -927,9 +922,12 @@ async def main():
             if not pool_info:
                 continue
 
+            record_pool_observation(pool_info, block_number, 'PENDING')
             if not await monitor.validate_pool(pool_info, block_number):
+                record_pool_observation(pool_info, block_number, 'STANDARD_VALIDATION_FAILED')
                 print(f"POOL_REJECTED block={block_number} pool={pool_info['pool']} reason=chain_relationship_mismatch")
                 continue
+            record_pool_observation(pool_info, block_number, 'VERIFIED')
 
             factory = pool_info["factory"]
             pool = pool_info["pool"]
@@ -1003,8 +1001,8 @@ async def main():
                     f"Grade: A (strong pair evidence, not investment advice)"
                 )
 
-                ok = await send_telegram(message)
-                print(f"RWA pair A candidate {candidate} telegram={ok}")
+                enqueue_notification(f"rwa:{factory.lower()}:{pool.lower()}:{block_number}", message)
+                print(f"RWA pair A candidate {candidate} telegram=queued")
 
             else:
                 print(
@@ -1018,14 +1016,13 @@ async def main():
     monitor.get_contract_creations = get_contract_creations_with_pools
 
     identity_task = asyncio.create_task(identity_refresh_worker())
+    telegram_task = asyncio.create_task(notification_worker(send_telegram))
     try:
         await monitor.run(block_handler)
     finally:
-        identity_task.cancel()
-        try:
-            await identity_task
-        except asyncio.CancelledError:
-            pass
+        for task in (identity_task, telegram_task):
+            task.cancel()
+        await asyncio.gather(identity_task, telegram_task, return_exceptions=True)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 
 import aiohttp
@@ -41,13 +42,17 @@ async def send_telegram(text: str):
                     json=payload,
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
-                    body = (await resp.text())[:500]
-                    if resp.status == 200:
+                    body = await resp.text()
+                    try:
+                        result = json.loads(body)
+                    except (ValueError, TypeError):
+                        result = {}
+                    if resp.status == 200 and isinstance(result, dict) and result.get('ok') is True:
                         return True
 
                     last_error = (
                         f"Telegram API HTTP {resp.status} on attempt "
-                        f"{attempt}/{TELEGRAM_MAX_ATTEMPTS}: {body}"
+                        f"{attempt}/{TELEGRAM_MAX_ATTEMPTS}; acknowledgement missing"
                     )
 
                     # Do not retry permanent client/configuration failures.
@@ -58,7 +63,7 @@ async def send_telegram(text: str):
                 last_error = (
                     f"Telegram transport failure on attempt "
                     f"{attempt}/{TELEGRAM_MAX_ATTEMPTS}: "
-                    f"{type(exc).__name__}: {exc}"
+                    f"{type(exc).__name__}"
                 )
 
             if attempt < TELEGRAM_MAX_ATTEMPTS:

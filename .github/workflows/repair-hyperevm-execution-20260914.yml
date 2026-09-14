@@ -1,0 +1,65 @@
+name: Repair HyperEVM Execution Recovery
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/repair-hyperevm-execution-20260914.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-hyperevm-radar-production
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare exact reviewed patch and tests
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          manifest=json.loads(Path('.github/patches/hyperevm-execution-baseline.json').read_text())
+          root=Path('hyperevm-radar')
+          payload={
+            'baseline':manifest['baseline'],
+            'files':{name:(root/name).read_text() for name in manifest['files']},
+            'tests':{str(path.relative_to(root)):path.read_text() for path in (root/'tests').glob('test_*.py')},
+            'runner':Path('.github/scripts/check_execution_recovery.py').read_text(),
+          }
+          Path('/tmp/hyper-execution-payload.json').write_text(json.dumps(payload))
+          PY
+
+      - name: Configure SSH
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Compare full regression suites, deploy, verify cursor and active service
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          scp -i ~/.ssh/deploy_key -P "$SERVER_PORT" \
+            -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 \
+            /tmp/hyper-execution-payload.json \
+            "$SERVER_USER@$SERVER_HOST:/tmp/hyper-execution-payload-${{ github.run_id }}.json"
+          scp -i ~/.ssh/deploy_key -P "$SERVER_PORT" \
+            -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 \
+            .github/scripts/deploy_execution_recovery.py \
+            "$SERVER_USER@$SERVER_HOST:/tmp/hyper-execution-deploy-${{ github.run_id }}.py"
+          ssh -i ~/.ssh/deploy_key -p "$SERVER_PORT" \
+            -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 \
+            "$SERVER_USER@$SERVER_HOST" \
+            'sudo /opt/hyperevm-radar/.venv/bin/python /tmp/hyper-execution-deploy-${{ github.run_id }}.py /tmp/hyper-execution-payload-${{ github.run_id }}.json'

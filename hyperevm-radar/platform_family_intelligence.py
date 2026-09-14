@@ -70,6 +70,14 @@ class SearchProvider:
     def search(self, query: str, timeout: float) -> list[SearchHit]:
         raise NotImplementedError
 
+
+class IdentityBudgetExceeded(TimeoutError):
+    pass
+
+
+class SearchUnavailable(RuntimeError):
+    pass
+
 class ConfiguredJsonSearchProvider(SearchProvider):
     """Configured API, with explicit LangSearch request/response adaptation."""
     name = "configured_search_api"
@@ -186,9 +194,12 @@ class DuckDuckGoSearchProvider(SearchProvider):
     def search(self, query, timeout):
         headers={"User-Agent":"Mozilla/5.0 (compatible; HyperEVM-Radar/3.0)", "Accept-Language":"en-US,en;q=0.8"}
         last_error=None
+        deadline=time.monotonic()+timeout
         for endpoint in self.endpoints:
+            remaining=deadline-time.monotonic()
+            if remaining<=0: break
             try:
-                response=requests.get(endpoint.format(query=quote_plus(query)),timeout=timeout,headers=headers)
+                response=requests.get(endpoint.format(query=quote_plus(query)),timeout=remaining,headers=headers)
                 response.raise_for_status()
                 parser=_SearchResultsParser(); parser.feed(response.text)
                 hits=[]; seen=set()
@@ -239,13 +250,20 @@ class BingSearchProvider(SearchProvider):
 class CompositeSearchProvider(SearchProvider):
     def __init__(self, providers=None):
         self.providers=providers or (ConfiguredJsonSearchProvider(), YouSearchProvider(), ExaSearchProvider(), TinyFishSearchProvider(), DuckDuckGoSearchProvider(), BingSearchProvider())
-    def search(self, query, timeout):
+    def search(self, query, timeout, deadline=None):
         hits=[]; seen=set()
+        completed=0; failures=0
         targets={a.lower() for a in ADDRESS_RE.findall(query)}
         for provider in self.providers:
+            if isinstance(provider,ConfiguredJsonSearchProvider) and not provider.endpoint: continue
+            if isinstance(provider,(YouSearchProvider,ExaSearchProvider,TinyFishSearchProvider)) and not provider.api_key: continue
+            remaining=timeout if deadline is None else min(timeout,deadline-time.monotonic())
+            if remaining<=0: raise IdentityBudgetExceeded('search_fallback_budget_exhausted')
             try:
-                rows=provider.search(query, timeout)
+                rows=provider.search(query, remaining)
+                completed+=1
             except (requests.RequestException, ValueError, KeyError, TypeError):
+                failures+=1
                 continue
             # Address queries require address evidence in the returned metadata.
             # Nonempty unrelated results must not prevent fallback providers.
@@ -259,7 +277,10 @@ class CompositeSearchProvider(SearchProvider):
             # needlessly hitting every engine and burning the identity time budget.
             if rows:
                 break
+        if failures and not completed:
+            raise SearchUnavailable('all_search_providers_failed')
         return hits
+
 
 class PageProvider:
     def fetch(self, url: str, timeout: float) -> Page:
@@ -287,6 +308,20 @@ class PublicXPageProvider(XContentProvider):
 
 def _host(url): return (urlparse(url).hostname or "").lower().removeprefix("www.")
 def _same_site(a,b): return bool(_host(a) and _host(a)==_host(b))
+
+# Shared documentation infrastructure is useful discovery evidence, but it is not
+# the investigated project itself. Keep this deliberately narrow to the confirmed
+# GitBook false-positive class.
+SHARED_IDENTITY_HOSTS={"gitbook.com","gitbook.io"}
+SHARED_IDENTITY_X_HANDLES={"gitbookio"}
+
+def _is_shared_identity_host(url):
+    host=_host(url)
+    return bool(host and (host in SHARED_IDENTITY_HOSTS or host.endswith(".gitbook.io")))
+
+def _is_shared_provider_x(url):
+    match=X_RE.search(str(url or ""))
+    return bool(match and match.group(1).lower() in SHARED_IDENTITY_X_HANDLES)
 _COUNTRY_SECOND_LEVEL={"co","com","net","org","gov","ac","edu"}
 def domain_parts(url):
     hostname=_host(url); labels=[x for x in hostname.split(".") if x]
@@ -296,6 +331,7 @@ def domain_parts(url):
     return hostname,root,subdomain
 
 def extract_core_word(url, title=""):
+    if _is_shared_identity_host(url): return ""
     _,root,_=domain_parts(url); label=root.split(".")[0] if root else ""
     return "".join(x.lower() for x in re.findall(r"[A-Za-z0-9]+",label) if x)
 
@@ -425,14 +461,25 @@ class FamilyIntelligenceEngine:
         self.search=search or CompositeSearchProvider(); self.pages=pages or PublicPageProvider(); self.x=x_provider or PublicXPageProvider(self.pages)
         self.request_timeout=float(request_timeout or os.getenv("IDENTITY_REQUEST_TIMEOUT","6")); self.total_timeout=float(total_timeout or os.getenv("IDENTITY_TOTAL_TIMEOUT","45")); self.max_hits=max_hits
 
+    def _request_timeout(self, started):
+        remaining=self.total_timeout-(time.monotonic()-started)
+        if remaining<=0: raise IdentityBudgetExceeded('identity_budget_exhausted')
+        return min(self.request_timeout,remaining)
+
     def _search(self, query, started, evidence):
-        if time.monotonic()-started>=self.total_timeout: return []
+        if time.monotonic()-started>=self.total_timeout:
+            evidence.append({'source':'search','query':query[:180],'status':'SKIPPED','detail':'IdentityBudgetExceeded'})
+            return []
         try:
-            rows=self.search.search(query,self.request_timeout)
+            timeout=self._request_timeout(started)
+            if isinstance(self.search,CompositeSearchProvider):
+                rows=self.search.search(query,timeout,deadline=started+self.total_timeout)
+            else:
+                rows=self.search.search(query,timeout)
             evidence.append({"source":"search","query":query[:180],"status":"HITS" if rows else "NO_DATA","hits":len(rows)})
             return rows
         except Exception as exc:
-            evidence.append({"source":"search","query":query[:180],"status":"NO_DATA","detail":type(exc).__name__}); return []
+            evidence.append({"source":"search","query":query[:180],"status":"ERROR","detail":type(exc).__name__}); return []
 
     def _direct_address_identity(self, address, started, evidence):
         """Return non-search-engine website/X candidates and contract-name clues."""
@@ -443,7 +490,7 @@ class FamilyIntelligenceEngine:
         try:
             response=requests.get(
                 f"https://api.dexscreener.com/token-pairs/v1/hyperevm/{address}",
-                timeout=self.request_timeout,
+                timeout=self._request_timeout(started),
                 headers={"Accept":"application/json","User-Agent":"HyperEVM-Radar/3.1"},
             )
             response.raise_for_status(); rows=response.json()
@@ -475,7 +522,7 @@ class FamilyIntelligenceEngine:
         # search clue, never an identity assertion.
         if time.monotonic()-started<self.total_timeout:
             try:
-                page=self.pages.fetch(f"https://hyperevmscan.io/address/{address}",self.request_timeout)
+                page=self.pages.fetch(f"https://hyperevmscan.io/address/{address}",self._request_timeout(started))
                 blob=" ".join((page.title,page.description,page.text[:12000])) if page.status=="AVAILABLE" else ""
                 match=re.search(r"Contract Name\s+([A-Za-z][A-Za-z0-9_.$-]{2,80})",blob,re.I)
                 name=match.group(1).strip() if match else ""
@@ -555,11 +602,17 @@ class FamilyIntelligenceEngine:
         for hit in unique:
             match=X_RE.search(hit.url)
             if match:
-                x_urls.append(match.group(0)); evidence.append({"source":hit.source,"kind":"X_CANDIDATE","url":match.group(0),"title":hit.title[:160]})
+                candidate_x=match.group(0)
+                if _is_shared_provider_x(candidate_x):
+                    evidence.append({"source":hit.source,"kind":"REJECTED_SHARED_PROVIDER_X","url":candidate_x,"title":hit.title[:160]})
+                else:
+                    x_urls.append(candidate_x); evidence.append({"source":hit.source,"kind":"X_CANDIDATE","url":candidate_x,"title":hit.title[:160]})
             elif useful_docs(hit.url):
                 docs_hits.append(hit); evidence.append({"source":hit.source,"kind":"DOCS_CANDIDATE","url":hit.url,"title":hit.title[:160]})
             elif _host(hit.url)=="github.com":
                 github_hits.append(hit); evidence.append({"source":hit.source,"kind":"GITHUB_CANDIDATE","url":hit.url,"title":hit.title[:160]})
+            elif _is_shared_identity_host(hit.url):
+                evidence.append({"source":hit.source,"kind":"REJECTED_SHARED_IDENTITY_HOST","url":hit.url,"title":hit.title[:160]})
             elif _host(hit.url) not in excluded:
                 web_hits.append(hit)
 
@@ -567,14 +620,18 @@ class FamilyIntelligenceEngine:
         # but GitHub alone never upgrades a project to VERIFIED.
         for hit in github_hits[:4]:
             if time.monotonic()-started>=self.total_timeout: break
-            try: page=self.pages.fetch(hit.url,self.request_timeout)
+            try: page=self.pages.fetch(hit.url,self._request_timeout(started))
             except Exception as exc:
                 evidence.append({"source":"github_discovery","url":hit.url,"status":"NO_DATA","detail":type(exc).__name__}); continue
             if page.status!="AVAILABLE": continue
             for link in page.links:
                 match=X_RE.search(link)
                 if match:
-                    x_urls.append(match.group(0)); evidence.append({"source":"github_discovery","kind":"X_CANDIDATE","url":match.group(0)})
+                    candidate_x=match.group(0)
+                    if _is_shared_provider_x(candidate_x):
+                        evidence.append({"source":"github_discovery","kind":"REJECTED_SHARED_PROVIDER_X","url":candidate_x})
+                    else:
+                        x_urls.append(candidate_x); evidence.append({"source":"github_discovery","kind":"X_CANDIDATE","url":candidate_x})
                 elif useful_docs(link):
                     docs_hits.append(SearchHit(link,source="GITHUB_BACKLINK"))
                 elif link.startswith(("http://","https://")) and _host(link) not in excluded:
@@ -590,7 +647,7 @@ class FamilyIntelligenceEngine:
             docs_url=docs_queue.pop(0).split("#",1)[0]
             if not docs_url or docs_url in seen_docs: continue
             seen_docs.add(docs_url)
-            try: page=self.pages.fetch(docs_url,self.request_timeout)
+            try: page=self.pages.fetch(docs_url,self._request_timeout(started))
             except Exception as exc:
                 evidence.append({"source":"direct_docs","url":docs_url,"status":"NO_DATA","detail":type(exc).__name__}); continue
             if page.status!="AVAILABLE": continue
@@ -603,8 +660,12 @@ class FamilyIntelligenceEngine:
                     continue
                 match=X_RE.search(link)
                 if match:
-                    x_urls.append(match.group(0))
-                    evidence.append({"source":"direct_docs","kind":"X_CANDIDATE","url":match.group(0)})
+                    candidate_x=match.group(0)
+                    if _is_shared_provider_x(candidate_x):
+                        evidence.append({"source":"direct_docs","kind":"REJECTED_SHARED_PROVIDER_X","url":candidate_x})
+                    else:
+                        x_urls.append(candidate_x)
+                        evidence.append({"source":"direct_docs","kind":"X_CANDIDATE","url":candidate_x})
                     continue
                 if link.startswith(("http://","https://")) and _host(link) not in excluded and not _is_docs_url(link):
                     web_hits.append(SearchHit(link,source="DOCS_BACKLINK"))
@@ -612,10 +673,12 @@ class FamilyIntelligenceEngine:
         website_page=None; website_candidate=""; best_website_score=-1
         for hit in web_hits[:self.max_hits]:
             if time.monotonic()-started>=self.total_timeout: break
-            try: page=self.pages.fetch(hit.url,self.request_timeout)
+            try: page=self.pages.fetch(hit.url,self._request_timeout(started))
             except Exception as exc:
                 evidence.append({"source":"website","url":hit.url,"status":"NO_DATA","detail":type(exc).__name__}); continue
             if page.status!="AVAILABLE": continue
+            if _is_shared_identity_host(page.url):
+                evidence.append({"source":"website","url":page.url,"status":"REJECTED_SHARED_IDENTITY_HOST"}); continue
             if _is_parked_page(page):
                 evidence.append({"source":"website","url":page.url,"status":"REJECTED_PARKED"}); continue
             page_blob=(page.raw+" "+page.text).lower(); page.address_match=bool(addresses & {x.lower() for x in ADDRESS_RE.findall(page_blob)})
@@ -650,9 +713,9 @@ class FamilyIntelligenceEngine:
             site_x=[m.group(0) for link in website_page.links for m in [X_RE.search(link)] if m]
             x_urls=site_x+x_urls; evidence.append({"source":"website","url":website_page.url,"address_match":bool(getattr(website_page,"address_match",False)),"linked_x":site_x})
         x_url=""; x_page=Page("",status="NO_DATA")
-        for candidate in list(dict.fromkeys(x_urls))[:6]:
+        for candidate in [u for u in dict.fromkeys(x_urls) if not _is_shared_provider_x(u)][:6]:
             if time.monotonic()-started>=self.total_timeout: break
-            try: candidate_page=self.x.fetch(candidate,self.request_timeout)
+            try: candidate_page=self.x.fetch(candidate,self._request_timeout(started))
             except Exception as exc:
                 evidence.append({"source":"x_public","url":candidate,"status":"NO_DATA","detail":type(exc).__name__}); continue
             evidence.append({"source":"x_public","url":candidate,"status":candidate_page.status})
@@ -662,17 +725,21 @@ class FamilyIntelligenceEngine:
                 x_url=candidate; x_page=candidate_page; break
 
         if not website_page and x_page.status=="AVAILABLE":
-            backlink=next((link for link in x_page.links if _host(link) not in {"x.com","twitter.com","t.co"}),"")
+            backlink=next((link for link in x_page.links if _host(link) not in {"x.com","twitter.com","t.co"} and not _is_shared_identity_host(link)),"")
             if backlink:
                 try:
-                    page=self.pages.fetch(backlink,self.request_timeout)
-                    if page.status=="AVAILABLE":
+                    page=self.pages.fetch(backlink,self._request_timeout(started))
+                    if page.status=="AVAILABLE" and not _is_shared_identity_host(page.url):
                         blob=(page.raw+" "+page.text).lower(); page.address_match=bool(addresses & {x.lower() for x in ADDRESS_RE.findall(blob)}); website_page=page; website_candidate=page.url
                 except Exception as exc: evidence.append({"source":"x_website","status":"NO_DATA","detail":type(exc).__name__})
         if website_page and not hostname:
             hostname,root_domain,subdomain=domain_parts(website_page.url); core_word=extract_core_word(website_page.url,website_page.title); derived_words=derive_core_words(core_word)
 
         website=website_page.url if website_page else website_candidate
+        # The website may have been discovered from the X backlink above.
+        # Recompute using that page before applying the unchanged cross-link rule.
+        if website_page:
+            site_x=[m.group(0) for link in website_page.links for m in [X_RE.search(link)] if m]
         x_links_site=bool(website and x_page.status=="AVAILABLE" and any(_same_site(link,website) for link in x_page.links))
         site_links_x=bool(website_page and site_x and x_url in site_x)
         homepage_address=bool(website_page and getattr(website_page,"address_match",False))
@@ -693,7 +760,7 @@ class FamilyIntelligenceEngine:
             if any(page.url==link for page in direct_docs_pages): continue
             linked_by_site=bool(website_page and link in website_page.links); same_root=bool(root_domain and domain_parts(link)[1]==root_domain)
             if not (linked_by_site or same_root): continue
-            try: page=self.pages.fetch(link,self.request_timeout)
+            try: page=self.pages.fetch(link,self._request_timeout(started))
             except Exception as exc: evidence.append({"source":"official_docs","url":link,"status":"NO_DATA","detail":type(exc).__name__}); continue
             if page.status=="AVAILABLE":
                 blob=(page.raw+" "+page.text).lower(); page.address_match=bool(addresses & {x.lower() for x in ADDRESS_RE.findall(blob)}); trusted_docs.append(page); docs_crosslinked=True; evidence.append({"source":"official_docs","url":page.url,"address_match":page.address_match,"crosslinked":True})
@@ -734,7 +801,7 @@ class FamilyIntelligenceEngine:
                 url=token_queue.pop(0).split("#",1)[0]
                 if not url or url in seen_token_pages: continue
                 seen_token_pages.add(url)
-                try: page=self.pages.fetch(url,self.request_timeout)
+                try: page=self.pages.fetch(url,self._request_timeout(started))
                 except Exception as exc:
                     evidence.append({"source":"official_token_page","url":url,"status":"NO_DATA","detail":type(exc).__name__}); continue
                 if page.status!="AVAILABLE": continue
@@ -752,7 +819,7 @@ class FamilyIntelligenceEngine:
             try:
                 response=requests.get(
                     "https://api.dexscreener.com/latest/dex/search",
-                    params={"q": clue}, timeout=self.request_timeout,
+                    params={"q": clue}, timeout=self._request_timeout(started),
                     headers={"Accept":"application/json","User-Agent":"HyperEVM-Radar/3.2"},
                 )
                 response.raise_for_status(); rows=(response.json() or {}).get("pairs") or []
@@ -791,7 +858,7 @@ class FamilyIntelligenceEngine:
             if time.monotonic()-started>=self.total_timeout: break
             is_x=_host(hit.url) in {"x.com","twitter.com"}; same_official_x=bool(is_x and x_url and urlparse(hit.url).path.strip("/").split("/")[0].lower()==urlparse(x_url).path.strip("/").split("/")[0].lower())
             if not (root_domain and domain_parts(hit.url)[1]==root_domain) and not same_official_x: continue
-            try: page=(self.x if is_x else self.pages).fetch(hit.url,self.request_timeout)
+            try: page=(self.x if is_x else self.pages).fetch(hit.url,self._request_timeout(started))
             except Exception: continue
             if page.status=="AVAILABLE": token_pages.append((page,"official_x" if is_x else "official_docs" if "docs" in _host(page.url) or "/docs" in page.url else "website"))
 
@@ -834,7 +901,10 @@ class FamilyIntelligenceEngine:
         for page,source in [(website_page,"website"),(x_page,"x_public")]+[(page,"official_docs") for page in trusted_docs]:
             for item in _project_addresses(page,source):
                 if (item["address"],item["source_url"]) not in {(x["address"],x["source_url"]) for x in discovered_project_addresses}: discovered_project_addresses.append(item)
+        execution_status='BUDGET_EXHAUSTED' if time.monotonic()-started>=self.total_timeout else 'ERROR' if any(e.get('detail')=='SearchUnavailable' for e in evidence) else 'COMPLETE'
+        evidence.append({'source':'identity_execution','status':'ERROR' if execution_status!='COMPLETE' else 'COMPLETE','detail':execution_status,'elapsed_seconds':round(time.monotonic()-started,2)})
         return {
+            'execution_status':execution_status,
             "family_id":family.get("id"),"subject_key":family.get("subject_key") or (f"family:{family.get('id')}" if family.get("id") else ""),"project_name":project_name,"official_x":official_x,"official_website":website,"description":description[:700],"infrastructure_types":types,
             "official_token_symbol":token_symbol,"official_token_ca":token_ca,"token_status":token_status,"source_url":website,"hostname":hostname,"root_domain":root_domain,"subdomain":subdomain,"core_word":core_word,"derived_words":derived_words,
             "discovered_token_name":token_result["discovered_token_name"],"discovered_token_symbol":token_result["discovered_token_symbol"],"discovered_ca":token_result["discovered_ca"],"evidence_source":token_evidence_source,"token_verification_status":token_result["token_verification_status"],"token_evidence":token_result["token_evidence"],"token_source_urls":token_result["token_source_urls"],
