@@ -61,11 +61,18 @@ jobs:
               m=HyperEVMBlockMonitor();chain=await m.chain_id();latest=await m.latest_block()
               assert chain==999
               end=latest-20;start=end-119;missing=[];total=0;blocks=0;pools=0;missing_pools=[]
+              async def rpc(call):
+                  for attempt in range(6):
+                      try:return await call()
+                      except Exception:
+                          if attempt==5:raise
+                          await asyncio.sleep(min(8,2**attempt))
               # Sequential independent RPC reads; no production scanner writes.
               from detectors.pools import detect_pool_event
               for b in range(start,end+1):
-                  block=await m.w3.eth.get_block(b,full_transactions=True);blocks+=1
-                  logs=await m.w3.eth.get_logs({'fromBlock':b,'toBlock':b})
+                  block=await rpc(lambda:m.w3.eth.get_block(b,full_transactions=True));blocks+=1
+                  await asyncio.sleep(0.3)
+                  logs=await rpc(lambda:m.w3.eth.get_logs({'fromBlock':b,'toBlock':b}))
                   for log in logs:
                       info=detect_pool_event(log)
                       if not info:continue
@@ -74,7 +81,7 @@ jobs:
                       if not exists:missing_pools.append({'block':b,'pool':info['pool'],'factory':info['factory']})
                   for tx in block.transactions:
                       if tx.get('to') is not None:continue
-                      receipt=await m.w3.eth.get_transaction_receipt(tx['hash'])
+                      receipt=await rpc(lambda:m.w3.eth.get_transaction_receipt(tx['hash']))
                       ca=receipt.get('contractAddress')
                       if not ca:continue
                       total+=1
