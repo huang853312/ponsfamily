@@ -54,7 +54,9 @@ jobs:
             test "$enabled" = masked
 
             echo "=== Wallet Radar Python 进程 ==="
-            if ps -eo comm=,args= | awk '$1 ~ /^python/ && $0 ~ /\/opt\/wallet-radar\// {print; found=1} END {exit found ? 0 : 1}'; then
+            procs="$( (ps -C python -o args= 2>/dev/null; ps -C python3 -o args= 2>/dev/null) | grep -F "/opt/wallet-radar/" || true )"
+            if [ -n "$procs" ]; then
+              printf "%s\n" "$procs"
               echo "仍存在 Wallet Radar Python 进程"
               exit 1
             fi
