@@ -1,0 +1,61 @@
+name: 测试Robinhood钱包雷达RPC
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/test-robinhood-rpc.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 配置服务器连接
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          set -eu
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          touch ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: 在服务器测试Robinhood RPC
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          set -eu
+          SSH="ssh -i $HOME/.ssh/deploy_key -p $SERVER_PORT -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30"
+          $SSH "$SERVER_USER@$SERVER_HOST" 'python3 - <<"PY"
+          import requests, json
+          token="0xac46193ff2cb638bcfd02520e124a3e2c9228774"
+          topic="0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+          urls=[
+            "https://rpc.mainnet.chain.robinhood.com",
+            "https://robinhood-rpc.publicnode.com",
+          ]
+          for url in urls:
+              print("===",url,"===")
+              s=requests.Session(); s.headers.update({"User-Agent":"WalletRadar/2.1","Content-Type":"application/json"})
+              def rpc(method,params):
+                  r=s.post(url,json={"jsonrpc":"2.0","id":1,"method":method,"params":params},timeout=20)
+                  print(method,"http",r.status_code)
+                  if r.status_code!=200:
+                      print(r.text[:300]); return None
+                  d=r.json(); print("error",d.get("error")); return d.get("result")
+              cid=rpc("eth_chainId",[])
+              latest=rpc("eth_blockNumber",[])
+              if latest:
+                  n=int(latest,16)
+                  for span in (50,500,2000):
+                      res=rpc("eth_getLogs",[{"fromBlock":hex(max(0,n-span)),"toBlock":hex(n),"address":token,"topics":[topic]}])
+                      if isinstance(res,list): print("span",span,"logs",len(res))
+          PY'
