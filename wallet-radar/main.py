@@ -40,8 +40,8 @@ CHAINS = {
         "robinhood", "Robinhood Chain", 4663, "ETH",
         tuple(x for x in (
             os.getenv("ROBINHOOD_RPC_URL", "").strip(),
-            "https://robinhood-rpc.publicnode.com",
             "https://rpc.mainnet.chain.robinhood.com",
+            "https://robinhood-rpc.publicnode.com",
         ) if x),
         float(os.getenv("ROBINHOOD_BLOCK_TIME", "0.10")),
         int(os.getenv("ROBINHOOD_LOG_CHUNK", "2000")),
@@ -59,11 +59,14 @@ CHAINS = {
         "bnb", "BNB Chain", 56, "BNB",
         tuple(x for x in (
             os.getenv("BNB_RPC_URL", "").strip(),
+            # NodeReal 官方文档提供的公开共享 Key。实测支持 BSC 深历史 eth_getLogs。
+            "https://bsc-mainnet.nodereal.io/v1/f8728a3265504b998a2f09c83493d76a",
+            "https://bsc-mainnet.nodereal.io/v1/64a9df0874fb4a93b9d0a3849de012d3",
+            # PublicNode 仅作近端备用；深历史请求会要求个人归档令牌。
             "https://bsc-rpc.publicnode.com",
-            "https://bsc-dataseed.bnbchain.org",
         ) if x),
         float(os.getenv("BNB_BLOCK_TIME", "0.45")),
-        int(os.getenv("BNB_LOG_CHUNK", "2000")),
+        int(os.getenv("BNB_LOG_CHUNK", "500")),
     ),
 }
 
@@ -107,11 +110,13 @@ class RpcError(RuntimeError):
 class RpcClient:
     def __init__(self, chain: ChainConfig, explicit_url: Optional[str] = None):
         self.chain = chain
-        self.urls = (explicit_url,) if explicit_url else chain.rpc_urls
+        # 去重并保持优先级，避免环境变量与内置地址重复。
+        raw_urls = (explicit_url,) if explicit_url else chain.rpc_urls
+        self.urls = tuple(dict.fromkeys(x for x in raw_urls if x))
         self.url = ""
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "WalletRadar/2.0",
+            "User-Agent": "WalletRadar/2.1",
             "Accept": "application/json",
             "Content-Type": "application/json",
         })
@@ -150,9 +155,17 @@ class RpcClient:
                     errors.append(f"{url}: 链ID={cid}")
                     continue
                 latest = h2i(self._single_on(url, "eth_blockNumber", []))
+                # BNB 必须探测真正的历史日志能力，不能只测最新 2 个区块。
+                # PublicNode 在近端可用，但深一点的 eth_getLogs 会 403 要求 Archive Token。
+                if self.chain.key == "bnb":
+                    probe_end = max(0, latest - 10000)
+                    probe_start = max(0, probe_end - 49)
+                else:
+                    probe_end = latest
+                    probe_start = max(0, latest - 2)
                 self._single_on(url, "eth_getLogs", [{
-                    "fromBlock": qhex(max(0, latest - 2)),
-                    "toBlock": qhex(latest),
+                    "fromBlock": qhex(probe_start),
+                    "toBlock": qhex(probe_end),
                     "address": DEAD,
                 }])
                 self.url = url
@@ -162,7 +175,17 @@ class RpcClient:
         raise RpcError(f"{self.chain.name_zh} 没有可用 RPC。{' | '.join(errors)}")
 
     def call(self, method: str, params: list):
-        return self._single_on(self.url, method, params)
+        # 当前端点临时限流/故障时自动切换备用端点；不把单一免费 RPC 当成唯一依赖。
+        errors = []
+        ordered = [self.url] + [u for u in self.urls if u != self.url]
+        for url in ordered:
+            try:
+                result = self._single_on(url, method, params)
+                self.url = url
+                return result
+            except Exception as exc:
+                errors.append(f"{url}: {exc}")
+        raise RpcError(f"{method} 所有 RPC 均失败。{' | '.join(errors)}")
 
     def batch(self, calls: Sequence[Tuple[str, list]], batch_size: int = DEFAULT_BATCH) -> List:
         results = []
@@ -175,9 +198,21 @@ class RpcClient:
                 self._next_id += 1
                 order.append(rid)
                 payload.append({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
-            data = self._post(self.url, payload)
-            if not isinstance(data, list):
-                raise RpcError("批量 RPC 返回格式异常")
+            last_error = None
+            data = None
+            ordered = [self.url] + [u for u in self.urls if u != self.url]
+            for url in ordered:
+                try:
+                    data = self._post(url, payload)
+                    if not isinstance(data, list):
+                        raise RpcError("批量 RPC 返回格式异常")
+                    self.url = url
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    data = None
+            if data is None:
+                raise RpcError(f"批量 RPC 所有端点均失败：{last_error}")
             by_id = {x.get("id"): x for x in data if isinstance(x, dict)}
             for rid in order:
                 item = by_id.get(rid)
@@ -588,195 +623,207 @@ def split_telegram(text: str, limit: int = 3900) -> List[str]:
 
 def send_telegram(text: str):
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-    if not token or not chat:
-        raise RuntimeError("未配置电报机器人令牌或聊天ID")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        raise RuntimeError("未配置 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID")
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     for part in split_telegram(text):
-        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat, "text": part, "disable_web_page_preview": True}, timeout=TIMEOUT)
+        r = requests.post(url, json={"chat_id": chat_id, "text": part, "disable_web_page_preview": True}, timeout=TIMEOUT)
         r.raise_for_status()
+
+
+def build_report(chain: ChainConfig, token: str, meta: dict, scan_note: str, rows: List[dict], groups: List[dict]) -> str:
+    symbol = meta.get("symbol") or "未知"
+    lines = [
+        "🛰 多链钱包雷达报告",
+        f"链：{chain.name_zh}",
+        f"代币：{symbol}",
+        f"合约地址：{token}",
+        f"历史覆盖：{scan_note}",
+        f"已分析持币钱包：{len(rows)}",
+        "",
+    ]
+    if not groups:
+        lines += [
+            "共同资金来源：未发现达到阈值的共同资金组",
+            "综合判断：当前扫描范围内，没有形成足够强的共同资金来源证据。",
+            "提示：这不等于不存在关联钱包；可扩大历史扫描范围后再次确认。",
+        ]
+        return "\n".join(lines)
+
+    for i, g in enumerate(groups, 1):
+        ident = g["identity"]
+        lines += [
+            f"【关联资金组 {i}】",
+            f"共同资金来源：{g['funder']}",
+            f"资金来源类型：{ident['type']}",
+        ]
+        if ident.get("label"):
+            lines.append(f"已知标签：{ident['label']}")
+        lines += [
+            f"交易所/服务地址倾向：{ident.get('service_score', 0)}%",
+            f"协调控制倾向：{ident.get('coord_score', 0)}%",
+            f"获得资金的钱包：{g['funded_count']} 个",
+            f"检测到主动买入的钱包：{g['buy_count']} 个",
+            f"2 分钟内集中买入：{g['buy_tight_count']} 个（跨度 {g['buy_span']} 秒）",
+            f"资金金额相似的钱包：{g['similar_funding_count']} 个",
+            f"检测到主动卖出的钱包：{g['sell_count']} 个",
+            f"5 分钟内集中卖出：{g['sell_tight_count']} 个（跨度 {g['sell_span']} 秒）",
+            f"卖出后直接回流共同资金源：{g['return_count']} 个",
+            f"当前关联持仓占总供应量：{g['supply_pct']:.4f}%",
+            f"综合风险：{g['risk']}",
+            "",
+        ]
+    lines += [
+        "说明：共同资金来源只是关系证据，不单独等于同一实际控制人。",
+        "系统会结合资金来源类型、买入/卖出时间同步、资金金额相似度和资金回流综合判断。",
+    ]
+    return "\n".join(lines)
 
 
 def analyze(args) -> int:
     chain = resolve_chain(args)
     token = norm(args.token)
     if not valid_address(token):
-        print("错误：代币合约地址格式不正确。", file=sys.stderr)
-        return 2
-
-    client = RpcClient(chain, explicit_url=args.rpc_url if args.chain == "custom" else None)
+        raise SystemExit("代币合约地址格式错误")
+    client = RpcClient(chain, args.rpc_url if args.chain == "custom" else None)
     meta = token_metadata(client, token)
-    print(f"链：{chain.name_zh}（链ID {chain.chain_id}）")
-    print(f"RPC：{client.url}")
-    print(f"代币：{meta.get('name') or '?'} ({meta.get('symbol') or '?'})")
-    print("正在直接从链上扫描代币转账事件……", flush=True)
-
-    transfers, _, _, complete, history_note = scan_transfer_history(client, token, args.scan_hours, args.start_block)
+    transfers, actual_start, latest, complete, scan_note = scan_transfer_history(client, token, args.scan_hours, args.start_block)
     if not transfers:
-        print(f"未找到代币转账事件。{history_note}", file=sys.stderr)
+        print(f"未找到 Transfer 事件。{scan_note}")
         return 3
 
     balances = reconstruct_balances(transfers)
     total_supply = int(meta.get("total_supply") or 0)
-    ranked = sorted(balances.items(), key=lambda kv: kv[1], reverse=True)
-    ranked = [(a, v) for a, v in ranked if a not in (ZERO, DEAD)][:args.top]
-    addresses = [a for a, _ in ranked]
-    eoa_map = classify_eoas(client, addresses)
-    eoa_addresses = [a for a in addresses if eoa_map.get(a)]
-
-    print(f"扫描到代币转账：{len(transfers)} 条")
-    print(f"Top 持币地址：{len(ranked)} 个；其中外部账户：{len(eoa_addresses)} 个")
-    print("正在识别主动买入和主动卖出……", flush=True)
+    sorted_holders = sorted(balances.items(), key=lambda kv: kv[1], reverse=True)[:args.top]
+    holder_addresses = [a for a, _ in sorted_holders]
+    eoa_map = classify_eoas(client, holder_addresses)
+    eoa_addresses = [a for a in holder_addresses if eoa_map.get(a)]
     buys, sells = active_trade_times(client, transfers, eoa_addresses)
-    print(f"识别主动买入：{len(buys)} 个；主动卖出：{len(sells)} 个")
+    prefunders, funding_window_txs = find_prefunders(client, buys, args.funding_minutes)
+    returns = find_direct_returns(client, sells, prefunders, args.return_minutes)
 
-    print(f"正在回溯买入前 {args.funding_minutes:g} 分钟的直接原生币资金来源……", flush=True)
-    prefunders, scanned_txs = find_prefunders(client, buys, args.funding_minutes)
-    funder_groups = defaultdict(list)
-    for wallet, info in prefunders.items():
-        if info["funder"]:
-            funder_groups[info["funder"]].append(wallet)
-    common = sorted(funder_groups.items(), key=lambda kv: len(kv[1]), reverse=True)
+    groups_by_funder = defaultdict(list)
+    for wallet, item in prefunders.items():
+        groups_by_funder[item["funder"]].append(wallet)
 
-    returns = {}
-    if sells and prefunders and args.return_minutes > 0:
-        print(f"正在检查卖出后 {args.return_minutes:g} 分钟内是否直接回流原资金源……", flush=True)
-        returns = find_direct_returns(client, sells, prefunders, args.return_minutes)
-
-    pct = {a: (Decimal(v) / Decimal(total_supply) * Decimal(100)) if total_supply > 0 else Decimal(0) for a, v in ranked}
-    rows = []
-    for rank, (a, _) in enumerate(ranked, 1):
-        rows.append({
-            "排名": rank, "钱包地址": a, "当前持仓占比": f"{pct[a]:.6f}%",
-            "是否外部账户": "是" if eoa_map.get(a) else "否",
-            "首次主动买入时间": utc_text((buys.get(a) or {}).get("timestamp", 0)),
-            "首次主动卖出时间": utc_text((sells.get(a) or {}).get("timestamp", 0)),
-            "买入前最近资金来源": (prefunders.get(a) or {}).get("funder", ""),
-            "资金到账时间": utc_text((prefunders.get(a) or {}).get("timestamp", 0)),
-            "资金金额_原始单位": (prefunders.get(a) or {}).get("value", ""),
-            "卖出后是否直接回流": "是" if a in returns else "否",
-        })
-    write_csv(args.output, rows)
-
-    lines = [
-        "🚨 多链钱包关系分析", "", f"链：{chain.name_zh}",
-        f"代币：{meta.get('name') or '?'}（{meta.get('symbol') or '?'}）", f"合约地址：{token}",
-        f"链上历史覆盖：{'较完整' if complete else '有限'}", f"说明：{history_note}",
-        f"分析持币地址：{len(ranked)} 个", f"其中外部账户：{len(eoa_addresses)} 个",
-        f"识别主动买入：{len(buys)} 个", f"识别主动卖出：{len(sells)} 个",
-        f"资金回溯窗口：买入前 {args.funding_minutes:g} 分钟",
-    ]
-
-    shown = 0
-    for funder, wallets in common:
-        if len(wallets) < 2:
+    groups = []
+    for funder, wallets in sorted(groups_by_funder.items(), key=lambda kv: len(kv[1]), reverse=True):
+        if len(wallets) < args.min_common_funder:
             continue
-        shown += 1
-        group_buys = [buys[w]["timestamp"] for w in wallets if w in buys and buys[w].get("timestamp")]
-        group_sells = [sells[w]["timestamp"] for w in wallets if w in sells and sells[w].get("timestamp")]
-        tight_buys, buy_span = tight_count(group_buys, 120)
-        tight_sells, sell_span = tight_count(group_sells, 300)
-        fund_values = [prefunders[w]["value"] for w in wallets if w in prefunders]
-        similar = amount_similarity(fund_values)
-        linked_supply = sum((pct.get(w, Decimal(0)) for w in wallets), Decimal(0))
-        returned = sum(1 for w in wallets if w in returns)
-        identity = funder_identity(client, funder, wallets, scanned_txs, prefunders, buys)
+        buy_times = [buys[w].get("timestamp", 0) for w in wallets if w in buys]
+        sell_times = [sells[w].get("timestamp", 0) for w in wallets if w in sells]
+        buy_tight, buy_span = tight_count(buy_times, 120)
+        sell_tight, sell_span = tight_count(sell_times, 300)
+        similar = amount_similarity([prefunders[w]["value"] for w in wallets if w in prefunders])
+        supply = sum(balances.get(w, 0) for w in wallets)
+        supply_pct = (Decimal(supply) * Decimal(100) / Decimal(total_supply)) if total_supply else Decimal(0)
+        identity = funder_identity(client, funder, wallets, funding_window_txs, prefunders, buys)
+        return_count = sum(1 for w in wallets if w in returns)
+        strength = 0
+        strength += 25 if len(wallets) >= 5 else 10
+        strength += 25 if buy_times and buy_tight / len(buy_times) >= 0.70 else 0
+        strength += 15 if wallets and similar / len(wallets) >= 0.70 else 0
+        strength += 15 if sell_times and sell_tight / len(sell_times) >= 0.60 else 0
+        strength += 20 if return_count >= max(2, len(wallets) // 3) else 0
+        if identity.get("service_score", 0) >= 70:
+            strength = max(0, strength - 35)
+        risk = "🔴 高" if strength >= 65 else ("🟠 中" if strength >= 35 else "🟢 低")
+        groups.append({
+            "funder": funder, "wallets": wallets, "funded_count": len(wallets),
+            "buy_count": len(buy_times), "buy_tight_count": buy_tight, "buy_span": buy_span,
+            "similar_funding_count": similar, "sell_count": len(sell_times),
+            "sell_tight_count": sell_tight, "sell_span": sell_span,
+            "return_count": return_count, "supply_pct": supply_pct,
+            "identity": identity, "risk": risk, "strength": strength,
+        })
+    groups.sort(key=lambda g: (g["strength"], g["funded_count"], g["supply_pct"]), reverse=True)
 
-        risk = 0
-        risk += 20 if len(wallets) >= 5 else 0
-        risk += 15 if len(wallets) >= 10 else 0
-        risk += 25 if group_buys and tight_buys / len(group_buys) >= 0.7 else 0
-        risk += 15 if fund_values and similar / len(fund_values) >= 0.7 else 0
-        risk += 15 if group_sells and tight_sells / len(group_sells) >= 0.6 else 0
-        risk += 10 if returned >= max(2, int(len(wallets) * 0.3)) else 0
-        if identity["type"].startswith("疑似交易所/服务型"):
-            risk = max(0, risk - 35)
-        risk_text = "🔴 高" if risk >= 65 else ("🟠 中" if risk >= 35 else "🟢 低/证据不足")
+    rows = []
+    for rank, (wallet, bal) in enumerate(sorted_holders, 1):
+        buy = buys.get(wallet) or {}
+        sell = sells.get(wallet) or {}
+        fund = prefunders.get(wallet) or {}
+        pct = (Decimal(bal) * Decimal(100) / Decimal(total_supply)) if total_supply else Decimal(0)
+        rows.append({
+            "排名": rank,
+            "钱包地址": wallet,
+            "当前持仓占比": f"{pct:.6f}%",
+            "是否外部账户": "是" if eoa_map.get(wallet) else "否",
+            "首次主动买入时间": utc_text(buy.get("timestamp", 0)),
+            "首次主动卖出时间": utc_text(sell.get("timestamp", 0)),
+            "买入前最近资金来源": fund.get("funder", ""),
+            "资金到账时间": utc_text(fund.get("timestamp", 0)),
+            "资金金额_原始单位": str(fund.get("value", "")),
+            "卖出后是否直接回流": "是" if wallet in returns else "否",
+        })
 
-        lines += [
-            "", f"—— 关联资金组 {shown} ——", f"共同资金来源：{funder}", f"资金来源判断：{identity['type']}",
-        ]
-        if identity.get("label"):
-            lines.append(f"已知标签：{identity['label']}")
-        lines += [
-            f"交易所/服务型特征：{identity.get('service_score', 0)}/100",
-            f"协调控制特征：{identity.get('coord_score', 0)}/100",
-            f"由该地址在买入前直接提供资金：{len(wallets)} 个钱包",
-            f"其中已识别主动买入：{len(group_buys)} 个",
-            f"2 分钟内集中买入：{tight_buys} 个" + (f"（最紧密跨度 {buy_span} 秒）" if tight_buys else ""),
-            f"资金金额相近：{similar}/{len(fund_values)} 个",
-            f"当前合计控制供应量：{linked_supply:.4f}%",
-            f"已识别主动卖出：{len(group_sells)} 个",
-            f"5 分钟内集中卖出：{tight_sells} 个" + (f"（最紧密跨度 {sell_span} 秒）" if tight_sells else ""),
-            f"卖出后直接回流原资金源：{returned} 个", f"综合关联风险：{risk_text}",
-        ]
-        if shown >= args.max_groups:
-            break
-    if shown == 0:
-        lines += ["", "未发现两个以上钱包共享同一个买入前直接资金来源。"]
-
-    lines += [
-        "", "判定口径：共同资金来源只代表链上关联，不等于同一人；系统会结合资金金额、买卖时间、资金回流和服务型地址特征共同判断。",
-        f"明细文件：{args.output}",
-    ]
-    report = "\n".join(lines)
-    print("\n" + report)
+    write_csv(args.output, rows)
+    report = build_report(chain, token, meta, scan_note, rows, groups[:args.max_groups])
+    print(report)
+    print(f"\n明细文件：{args.output}")
+    print(f"实际扫描起始区块：{actual_start}；最新区块：{latest}；完整标记：{'是' if complete else '否'}")
+    print(f"本次实际使用 RPC：{client.url}")
     if args.telegram:
-        try:
-            send_telegram(report)
-            print("\n电报发送成功。")
-        except Exception as exc:
-            print(f"\n电报发送失败：{exc}", file=sys.stderr)
-            return 4
+        send_telegram(report)
+        print("中文电报报告已发送。")
     return 0
 
 
 def selftest(args) -> int:
-    targets = list(CHAINS.values()) if args.all else [CHAINS[args.chain]]
-    failed = 0
-    for chain in targets:
+    keys = list(CHAINS) if args.all else [args.chain]
+    failed = False
+    for key in keys:
+        cfg = CHAINS[key]
         try:
-            c = RpcClient(chain)
-            latest = c.latest_block()
-            c.call("eth_getCode", [ZERO, "latest"])
-            print(f"✅ {chain.name_zh}：链ID={chain.chain_id}，最新区块={latest}，RPC={c.url}，日志查询=可用，合约判断=可用")
+            client = RpcClient(cfg)
+            latest = client.latest_block()
+            logs = client.get_logs(DEAD, max(0, latest - 2), latest)
+            code = client.call("eth_getCode", [DEAD, "latest"])
+            print(f"✅ {cfg.name_zh}：链ID={cfg.chain_id}，最新区块={latest}，RPC={client.url}，日志查询=可用，合约判断=可用")
         except Exception as exc:
-            failed += 1
-            print(f"❌ {chain.name_zh}：{exc}")
+            failed = True
+            print(f"❌ {cfg.name_zh}：{exc}")
     return 1 if failed else 0
 
 
-def build_parser():
-    p = argparse.ArgumentParser(description="多链钱包雷达：共同资金来源、同步买卖、资金回流、关联持仓")
-    sub = p.add_subparsers(dest="command", required=True)
-    s = sub.add_parser("selftest", help="检查链上 RPC 能力")
-    s.add_argument("--all", action="store_true", help="检查全部内置链")
-    s.add_argument("--chain", choices=sorted(CHAINS), default="robinhood")
-    s.set_defaults(func=selftest)
+def parser():
+    p = argparse.ArgumentParser(description="多链钱包雷达：CA → 持仓 → 外部账户 → 共同资金来源 → 同步买卖 → 资金回流 → 中文风险报告")
+    sub = p.add_subparsers(dest="cmd", required=True)
 
     a = sub.add_parser("analyze", help="分析一个 EVM 代币的钱包关系")
-    a.add_argument("--chain", choices=sorted(list(CHAINS) + ["custom"]), required=True)
-    a.add_argument("--token", required=True, help="代币合约地址")
-    a.add_argument("--top", type=int, default=50, help="分析前多少个持币地址")
-    a.add_argument("--scan-hours", type=float, default=24, help="未指定起始区块时最多向前扫描多少小时")
-    a.add_argument("--start-block", type=int, default=None, help="已知代币创建区块时可直接指定")
-    a.add_argument("--funding-minutes", type=float, default=10, help="主动买入前回溯多少分钟寻找直接原生币资金来源")
-    a.add_argument("--return-minutes", type=float, default=10, help="主动卖出后观察多少分钟的直接资金回流")
-    a.add_argument("--max-groups", type=int, default=5, help="最多展示多少个共同资金组")
-    a.add_argument("--output", default="钱包关系报告.csv", help="中文 CSV 明细文件")
-    a.add_argument("--telegram", action="store_true", help="同时发送中文电报报告")
-    a.add_argument("--rpc-url", default=None, help="自定义链 RPC")
-    a.add_argument("--chain-id", type=int, default=None, help="自定义链 Chain ID")
-    a.add_argument("--chain-name", default=None, help="自定义链名称")
-    a.add_argument("--native-symbol", default=None, help="自定义链原生币符号")
-    a.add_argument("--block-time", type=float, default=None, help="自定义链平均出块秒数")
-    a.add_argument("--log-chunk", type=int, default=None, help="自定义链每次日志查询区块跨度")
-    a.set_defaults(func=analyze)
+    a.add_argument("--chain", required=True, choices=["robinhood", "hyperevm", "bnb", "custom"])
+    a.add_argument("--token", required=True)
+    a.add_argument("--top", type=int, default=50)
+    a.add_argument("--scan-hours", type=float, default=24.0)
+    a.add_argument("--start-block", type=int)
+    a.add_argument("--funding-minutes", type=float, default=10.0)
+    a.add_argument("--return-minutes", type=float, default=10.0)
+    a.add_argument("--min-common-funder", type=int, default=2)
+    a.add_argument("--max-groups", type=int, default=5)
+    a.add_argument("--output", default="钱包雷达报告.csv")
+    a.add_argument("--telegram", action="store_true")
+    a.add_argument("--rpc-url")
+    a.add_argument("--chain-id", type=int)
+    a.add_argument("--chain-name")
+    a.add_argument("--native-symbol")
+    a.add_argument("--block-time", type=float)
+    a.add_argument("--log-chunk", type=int)
+
+    s = sub.add_parser("selftest", help="测试链 RPC 是否可用")
+    s.add_argument("--chain", choices=list(CHAINS), default="robinhood")
+    s.add_argument("--all", action="store_true")
     return p
 
 
-def main() -> int:
-    args = build_parser().parse_args()
-    return int(args.func(args))
+def main():
+    p = parser()
+    args = p.parse_args()
+    if args.cmd == "analyze":
+        return analyze(args)
+    if args.cmd == "selftest":
+        return selftest(args)
+    return 2
 
 
 if __name__ == "__main__":
