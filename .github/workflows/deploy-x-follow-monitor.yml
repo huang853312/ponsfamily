@@ -220,7 +220,7 @@ jobs:
               "chat_id": env["TELEGRAM_CHAT_ID"],
               "text": "X关注监控自检成功：机器人发送通道正常。",
           }).encode()
-          url = f"https://api.telegram.org/bot{env['TELEGRAM_BOT_TOKEN']}/sendMessage"
+          url = "https://api.telegram.org/bot{}/sendMessage".format(env["TELEGRAM_BOT_TOKEN"])
           with request.urlopen(url, data=data, timeout=30) as response:
               result = json.loads(response.read().decode())
           if not result.get("ok"):
