@@ -35,11 +35,15 @@ class MonitorTests(unittest.TestCase):
         with patch.object(
             app,
             "newest_following",
-            side_effect=[{"first": "First"}, {"first": "First", "new": "New"}],
+            side_effect=[
+                ({"first": "First"}, "123"),
+                ({"first": "First", "new": "New"}, "123"),
+            ],
         ), patch.object(app, "safe_send", messages.append):
             asyncio.run(app.scan_all(state))
             asyncio.run(app.scan_all(state))
 
+        self.assertEqual(state["ids"]["source"], "123")
         self.assertTrue(any("基线已建立" in item for item in messages))
         self.assertTrue(any("新关注了 @New" in item for item in messages))
 

@@ -3,6 +3,7 @@ import contextlib
 import json
 import os
 import re
+import subprocess
 import time
 from pathlib import Path
 from urllib import error, parse, request
@@ -10,12 +11,11 @@ from urllib import error, parse, request
 
 APP = Path(__file__).resolve().parent
 STATE = APP / "state.json"
+CLI = APP / "node_modules" / ".bin" / "xapi-to"
 BOT = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
-TWITTERAPI_IO_KEY = os.getenv("TWITTERAPI_IO_KEY", "")
-INTERVAL = max(300, int(os.getenv("X_FOLLOW_INTERVAL", "3600")))
+INTERVAL = max(300, int(os.getenv("X_FOLLOW_INTERVAL", "1800")))
 MAX_CONCURRENCY = max(1, int(os.getenv("X_FOLLOW_CONCURRENCY", "3")))
-FOLLOWING_PAGE_SIZE = 20
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
 
 
@@ -76,29 +76,25 @@ def safe_send(text):
         print(f"Telegram send failed: {exc}", flush=True)
 
 
-def twitterapi_get(path, params):
-    query = parse.urlencode(params)
-    call = request.Request(
-        f"https://api.twitterapi.io{path}?{query}",
-        headers={
-            "X-API-Key": TWITTERAPI_IO_KEY,
-            "Accept": "application/json",
-            "User-Agent": "x-follow-monitor/1.0",
-        },
-        method="GET",
-    )
-    try:
-        with request.urlopen(call, timeout=45) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[-300:]
-        raise RuntimeError(f"TwitterAPI.io HTTP {exc.code}: {detail}") from exc
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("TwitterAPI.io 返回的不是 JSON") from exc
+def xapi(action, payload):
+    if not CLI.is_file():
+        raise RuntimeError(f"xapi-to CLI 不存在：{CLI}")
 
-    if payload.get("status") == "error":
-        raise RuntimeError(payload.get("message") or "TwitterAPI.io 查询失败")
-    return payload
+    process = subprocess.run(
+        [str(CLI), "call", action, "--input", json.dumps(payload, ensure_ascii=False)],
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+    )
+    if process.returncode:
+        raise RuntimeError((process.stderr or process.stdout or "xAPI failed")[-500:])
+
+    try:
+        return json.loads(process.stdout)
+    except json.JSONDecodeError as exc:
+        preview = process.stdout[-300:].replace("\n", " ")
+        raise RuntimeError(f"xAPI 返回的不是 JSON：{preview}") from exc
 
 
 def clean(value):
@@ -108,42 +104,66 @@ def clean(value):
     return name.lower()
 
 
-def newest_following(name):
-    data = twitterapi_get(
-        "/twitter/user/followings",
-        {"userName": name, "cursor": "", "pageSize": FOLLOWING_PAGE_SIZE},
-    )
-    rows = data.get("followings") or []
+def resolve_id(name, cached_uid=None):
+    if cached_uid:
+        return str(cached_uid)
+
+    data = xapi(
+        "twitter.user_by_screen_name",
+        {"screen_name": name, "provider": "x"},
+    ).get("data") or {}
+    if not isinstance(data, dict):
+        raise RuntimeError(f"无法解析 @{name}")
+    uid = data.get("rest_id") or data.get("id")
+    if not uid:
+        raise RuntimeError(f"找不到 @{name}")
+    return str(uid)
+
+
+def newest_following(name, cached_uid=None):
+    uid = resolve_id(name, cached_uid)
+    data = xapi(
+        "twitter.following",
+        {"user_id": uid, "provider": "x"},
+    ).get("data") or {}
+    if not isinstance(data, dict):
+        raise RuntimeError(f"@{name} 的关注列表结构异常")
+
+    rows = data.get("users") or []
     if not isinstance(rows, list):
-        raise RuntimeError(f"@{name} 的 followings 字段不是列表")
+        raise RuntimeError(f"@{name} 的 users 字段不是列表")
 
     following = {
-        row["userName"].lower(): row["userName"]
+        row["screen_name"].lower(): row["screen_name"]
         for row in rows
-        if isinstance(row, dict) and row.get("userName")
+        if isinstance(row, dict) and row.get("screen_name")
     }
-    return following
+    return following, uid
 
 
-async def scan_one(name, sem):
+async def scan_one(name, cached_uid, sem):
     async with sem:
-        current = await asyncio.to_thread(newest_following, name)
-        return name, current
+        current, uid = await asyncio.to_thread(newest_following, name, cached_uid)
+        return name, current, uid
 
 
 async def scan_all(state):
     sem = asyncio.Semaphore(MAX_CONCURRENCY)
     results = await asyncio.gather(
-        *(scan_one(name, sem) for name in list(state["accounts"])),
+        *(
+            scan_one(name, state["ids"].get(name), sem)
+            for name in list(state["accounts"])
+        ),
         return_exceptions=True,
     )
 
     for result in results:
         if isinstance(result, Exception):
-            safe_send(f"TwitterAPI.io 查询失败：{str(result)[:250]}")
+            safe_send(f"xAPI 查询失败：{str(result)[:250]}")
             continue
 
-        name, current = result
+        name, current, uid = result
+        state["ids"][name] = uid
         now = set(current)
 
         if name not in state["known"]:
@@ -171,8 +191,8 @@ def help_text():
 
 
 async def main():
-    if not BOT or not CHAT or not TWITTERAPI_IO_KEY:
-        raise SystemExit("Missing Telegram or TWITTERAPI_IO_KEY config")
+    if not BOT or not CHAT or not os.getenv("XAPI_KEY"):
+        raise SystemExit("Missing Telegram or XAPI_KEY config")
 
     state = load()
     scan_task = None
@@ -244,7 +264,7 @@ async def main():
                                 f"状态：{'运行中' if state['running'] else '已停止'}\n"
                                 f"任务：{scan_state}\n"
                                 f"间隔：{INTERVAL} 秒\n"
-                                f"数据源：TwitterAPI.io（最新 {FOLLOWING_PAGE_SIZE} 个）"
+                                "数据源：xAPI.to"
                             )
                         elif cmd.startswith("/"):
                             safe_send("无法识别这个命令。\n\n" + help_text())
