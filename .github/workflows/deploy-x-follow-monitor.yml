@@ -207,18 +207,20 @@ jobs:
           }, ensure_ascii=False))
           PY
 
-            set -a
-            . /home/ubuntu/ponsfamily/x-follow-monitor/.env
-            set +a
-            python3 - <<"PY"
+            sudo python3 - <<"PY"
           import json
-          import os
+          from pathlib import Path
           from urllib import parse, request
+          env = {}
+          for line in Path("/home/ubuntu/ponsfamily/x-follow-monitor/.env").read_text().splitlines():
+              if line and not line.lstrip().startswith("#") and "=" in line:
+                  key, value = line.split("=", 1)
+                  env[key.strip()] = value.strip().strip("\"")
           data = parse.urlencode({
-              "chat_id": os.environ["TELEGRAM_CHAT_ID"],
+              "chat_id": env["TELEGRAM_CHAT_ID"],
               "text": "X关注监控自检成功：机器人发送通道正常。",
           }).encode()
-          url = f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage"
+          url = f"https://api.telegram.org/bot{env['TELEGRAM_BOT_TOKEN']}/sendMessage"
           with request.urlopen(url, data=data, timeout=30) as response:
               result = json.loads(response.read().decode())
           if not result.get("ok"):
