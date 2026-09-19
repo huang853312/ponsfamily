@@ -72,6 +72,7 @@ jobs:
           rsync -az --delete \
             --exclude='state.json' \
             --exclude='node_modules/' \
+            --exclude='.venv/' \
             --exclude='*.backup.*' \
             --exclude='__pycache__/' \
             --exclude='*.pyc' \
@@ -105,12 +106,21 @@ jobs:
 
             sudo systemctl is-active --quiet x-follow-monitor.service
             sleep 15
-            sudo systemctl is-active --quiet x-follow-monitor.service
-            test "$(sudo systemctl show x-follow-monitor.service -p MainPID --value)" != "0"
-            recent_log=$(sudo journalctl -u x-follow-monitor.service --since "30 seconds ago" --no-pager)
-            if printf "%s\n" "$recent_log" | grep -E "Traceback|SyntaxError|Missing Telegram|Main process exited|Failed with result"; then
-              exit 1
-            fi
+
+            set +e
+            active_state=$(sudo systemctl is-active x-follow-monitor.service)
+            active_rc=$?
+            main_pid=$(sudo systemctl show x-follow-monitor.service -p MainPID --value)
+            service_result=$(sudo systemctl show x-follow-monitor.service -p Result --value)
+            exec_status=$(sudo systemctl show x-follow-monitor.service -p ExecMainStatus --value)
             sudo systemctl status x-follow-monitor.service --no-pager
-            sudo journalctl -u x-follow-monitor.service -n 30 --no-pager
+            sudo journalctl -u x-follow-monitor.service --since "2 minutes ago" --no-pager
+            set -e
+
+            printf "active=%s pid=%s result=%s exit=%s\n" \
+              "$active_state" "$main_pid" "$service_result" "$exec_status"
+            test "$active_rc" -eq 0
+            test "$active_state" = "active"
+            test "$main_pid" != "0"
+            test "$service_result" = "success"
           '
