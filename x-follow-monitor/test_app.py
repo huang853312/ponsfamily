@@ -22,6 +22,10 @@ class MonitorTests(unittest.TestCase):
                 state = app.load()
         self.assertEqual(state["accounts"], ["openai"])
 
+    def test_channel_post_is_accepted_as_command_message(self):
+        post = {"chat": {"id": -100123}, "text": "/list"}
+        self.assertEqual(app.update_message({"channel_post": post}), post)
+
     def test_scan_establishes_baseline_then_detects_new_follow(self):
         state = {
             "accounts": ["source"],

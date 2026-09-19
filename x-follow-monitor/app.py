@@ -190,6 +190,11 @@ def help_text():
     )
 
 
+def update_message(update):
+    """Accept commands from either a private/group chat or a Telegram channel."""
+    return update.get("message") or update.get("channel_post") or {}
+
+
 async def main():
     if not BOT or not CHAT or not os.getenv("XAPI_KEY"):
         raise SystemExit("Missing Telegram or XAPI_KEY config")
@@ -208,7 +213,7 @@ async def main():
 
             for update in result.get("result", []):
                 state["offset"] = update["update_id"]
-                msg = update.get("message", {})
+                msg = update_message(update)
                 if str(msg.get("chat", {}).get("id")) != str(CHAT):
                     continue
 
