@@ -98,6 +98,7 @@ jobs:
             set -e
             cd /home/ubuntu/ponsfamily/x-follow-monitor
             python3 -m py_compile app.py
+            sudo systemctl stop x-follow-monitor.service 2>/dev/null || true
             sudo python3 - <<"PY"
           import os
           import re
