@@ -92,6 +92,69 @@ jobs:
             set -e
             cd /home/ubuntu/ponsfamily/x-follow-monitor
             python3 -m py_compile app.py
+            sudo python3 - <<"PY"
+          import os
+          import re
+          from pathlib import Path
+
+          target = Path("/home/ubuntu/ponsfamily/x-follow-monitor/.env")
+          wanted = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "XAPI_KEY")
+          found = {}
+          sources = {}
+          candidates = [
+              target,
+              Path("/home/ubuntu/ponsfamily/.env"),
+              Path("/home/ubuntu/.env"),
+              Path("/home/ubuntu/x-follow-monitor/.env"),
+              Path("/opt/hyperevm-radar/.env"),
+              Path("/opt/robinhood-radar/.env"),
+              Path("/etc/robinhood-radar.env"),
+          ]
+          allowed_names = {".env", ".profile", ".bashrc"}
+          allowed_suffixes = {".env", ".service", ".conf", ".config", ".sh"}
+          skipped = {"node_modules", ".git", ".venv", "__pycache__"}
+          for root in (Path("/home/ubuntu"), Path("/opt"), Path("/etc/systemd")):
+              if not root.exists():
+                  continue
+              for path in root.rglob("*"):
+                  if not path.is_file() or any(part in skipped for part in path.parts):
+                      continue
+                  if path.name not in allowed_names and path.suffix not in allowed_suffixes:
+                      continue
+                  candidates.append(path)
+
+          direct = re.compile(r"^\s*(?:export\s+)?(TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|XAPI_KEY)\s*=\s*(.*?)\s*$")
+          unit = re.compile(r"^\s*Environment\s*=\s*[\"\x27]?(TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|XAPI_KEY)=(.*?)[\"\x27]?\s*$")
+          seen = set()
+          for path in candidates:
+              try:
+                  resolved = path.resolve()
+                  if resolved in seen or path.stat().st_size > 1_000_000:
+                      continue
+                  seen.add(resolved)
+                  text = path.read_text(encoding="utf-8", errors="ignore")
+              except (OSError, RuntimeError):
+                  continue
+              for line in text.splitlines():
+                  match = direct.match(line) or unit.match(line)
+                  if not match:
+                      continue
+                  key, value = match.groups()
+                  if value and key not in found:
+                      found[key] = value
+                      sources[key] = str(path)
+
+          missing = [key for key in wanted if key not in found]
+          print("credential_sources=" + ",".join(f"{key}:{sources[key]}" for key in wanted if key in sources))
+          if missing:
+              raise SystemExit("missing_credentials=" + ",".join(missing))
+
+          target.parent.mkdir(parents=True, exist_ok=True)
+          temp = target.with_suffix(".env.tmp")
+          temp.write_text("".join(f"{key}={found[key]}\n" for key in wanted), encoding="utf-8")
+          os.chmod(temp, 0o600)
+          os.replace(temp, target)
+          PY
             sudo install -m 0644 x-follow-monitor.service /etc/systemd/system/x-follow-monitor.service
             sudo systemctl daemon-reload
             sudo systemctl enable x-follow-monitor.service

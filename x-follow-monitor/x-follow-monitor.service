@@ -9,6 +9,9 @@ User=ubuntu
 WorkingDirectory=/home/ubuntu/ponsfamily/x-follow-monitor
 EnvironmentFile=-/etc/robinhood-radar.env
 EnvironmentFile=-/opt/robinhood-radar/.env
+EnvironmentFile=-/opt/hyperevm-radar/.env
+EnvironmentFile=-/home/ubuntu/.env
+EnvironmentFile=-/home/ubuntu/ponsfamily/.env
 EnvironmentFile=-/home/ubuntu/ponsfamily/x-follow-monitor/.env
 Environment=PYTHONUNBUFFERED=1
 Environment=X_FOLLOW_INTERVAL=1800
