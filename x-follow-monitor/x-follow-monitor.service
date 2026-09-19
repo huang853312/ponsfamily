@@ -1,0 +1,18 @@
+[Unit]
+Description=X follow monitor via TwitterAPI.io
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/ponsfamily/x-follow-monitor
+EnvironmentFile=-/etc/robinhood-radar.env
+EnvironmentFile=/etc/x-follow-monitor.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /home/ubuntu/ponsfamily/x-follow-monitor/app.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
