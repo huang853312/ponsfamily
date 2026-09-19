@@ -195,4 +195,34 @@ jobs:
             test "$active_state" = "active"
             test "$main_pid" != "0"
             test "$service_result" = "success"
+
+            python3 - <<"PY"
+          import json
+          from pathlib import Path
+          state = json.loads(Path("/home/ubuntu/ponsfamily/x-follow-monitor/state.json").read_text())
+          print("monitor_state=" + json.dumps({
+              "account_count": len(state.get("accounts") or []),
+              "running": bool(state.get("running")),
+              "offset": int(state.get("offset", 0)),
+          }, ensure_ascii=False))
+          PY
+
+            set -a
+            . /home/ubuntu/ponsfamily/x-follow-monitor/.env
+            set +a
+            python3 - <<"PY"
+          import json
+          import os
+          from urllib import parse, request
+          data = parse.urlencode({
+              "chat_id": os.environ["TELEGRAM_CHAT_ID"],
+              "text": "X关注监控自检成功：机器人发送通道正常。",
+          }).encode()
+          url = f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage"
+          with request.urlopen(url, data=data, timeout=30) as response:
+              result = json.loads(response.read().decode())
+          if not result.get("ok"):
+              raise SystemExit("telegram_outbound=FAILED")
+          print("telegram_outbound=OK")
+          PY
           '
