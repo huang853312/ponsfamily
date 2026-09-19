@@ -164,6 +164,39 @@ jobs:
           os.replace(temp, target)
           Path("/tmp/x-follow-xapi.env").unlink(missing_ok=True)
           PY
+            sudo python3 - <<"PY"
+          import json
+          from pathlib import Path
+          from urllib import parse, request
+
+          env = {}
+          for line in Path("/home/ubuntu/ponsfamily/x-follow-monitor/.env").read_text().splitlines():
+              if line and not line.lstrip().startswith("#") and "=" in line:
+                  key, value = line.split("=", 1)
+                  env[key.strip()] = value.strip().strip("\"")
+          state = json.loads(Path("/home/ubuntu/ponsfamily/x-follow-monitor/state.json").read_text())
+          base = "https://api.telegram.org/bot{}".format(env["TELEGRAM_BOT_TOKEN"])
+
+          def call(method, payload=None):
+              data = parse.urlencode(payload or {}).encode()
+              with request.urlopen(base + "/" + method, data=data, timeout=30) as response:
+                  return json.loads(response.read().decode())
+
+          me = call("getMe").get("result") or {}
+          webhook = call("getWebhookInfo").get("result") or {}
+          updates = call("getUpdates", {
+              "offset": int(state.get("offset", 0)) + 1,
+              "timeout": 0,
+              "limit": 10,
+          }).get("result") or []
+          matching = sum(
+              str((item.get("message") or {}).get("chat", {}).get("id")) == str(env["TELEGRAM_CHAT_ID"])
+              for item in updates
+          )
+          print("telegram_bot=@{} webhook={} pending_updates={} matching_chat={}".format(
+              me.get("username", "unknown"), bool(webhook.get("url")), len(updates), matching
+          ))
+          PY
             sudo install -m 0644 x-follow-monitor.service /etc/systemd/system/x-follow-monitor.service
             sudo systemctl daemon-reload
             sudo systemctl enable x-follow-monitor.service
