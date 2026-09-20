@@ -208,9 +208,12 @@ async def main():
             result = await asyncio.to_thread(
                 tg,
                 "getUpdates",
-                {\n                    "offset": state["offset"] + 1,\n                    "timeout": 10,\n                    "allowed_updates": json.dumps(["message", "channel_post"]),\n                },
+                {
+                    "offset": state["offset"] + 1,
+                    "timeout": 10,
+                    "allowed_updates": json.dumps(["message", "channel_post"]),
+                },
             )
-
             for update in result.get("result", []):
                 state["offset"] = update["update_id"]
                 msg = update_message(update)
