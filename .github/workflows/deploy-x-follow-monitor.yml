@@ -84,7 +84,7 @@ jobs:
             sudo test -s \"\$TARGET/.env\"
 
             for key in TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID XAPI_KEY; do
-              grep -Eq \"^\${key}=.+\" \"\$TARGET/.env\" || {
+              sudo grep -Eq \"^\${key}=.+\" \"\$TARGET/.env\" || {
                 echo \"Missing \$key in \$TARGET/.env\"
                 exit 1
               }
