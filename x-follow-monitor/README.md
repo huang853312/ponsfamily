@@ -4,9 +4,22 @@ Telegram bot that checks accounts followed by each monitored X account through x
 
 ## Runtime configuration
 
+The service reads only `/home/ubuntu/ponsfamily/x-follow-monitor/.env`:
+
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 - `XAPI_KEY`
-- `X_FOLLOW_INTERVAL=1800` (default)
+- `X_FOLLOW_INTERVAL=1800` (optional; minimum 300 seconds)
+- `X_FOLLOW_CONCURRENCY=3` (optional)
 
-The deployment workflow preserves `state.json`, installs the systemd unit, and keeps secrets outside the repository. The default scan interval is 30 minutes.
+## Safe deployment
+
+The GitHub Actions workflow:
+
+1. compiles and tests the release before upload;
+2. validates the staged copy again on the server;
+3. preserves `.env`, `state.json`, `node_modules`, and timestamped backups;
+4. activates the release only after validation succeeds;
+5. verifies that systemd remains active after startup.
+
+The service is isolated from the HyperEVM and Robinhood Radar configuration files.
