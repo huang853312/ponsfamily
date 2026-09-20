@@ -40,6 +40,8 @@ jobs:
 
           DIAG_B64=$(base64 -w0 <<'PY'
           import json
+          import os
+          import subprocess
           from pathlib import Path
           from urllib import parse, request
 
