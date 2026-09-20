@@ -87,6 +87,15 @@ jobs:
               check=True,
           )
           print("twitter_following_schema=" + action.stdout.replace(chr(10), " "))
+          catalog = subprocess.run(
+              [str(cli), "search", "twitter following", "--sort", "price", "--format", "pretty"],
+              capture_output=True,
+              text=True,
+              timeout=60,
+              env={**os.environ, **env},
+              check=True,
+          )
+          print("twitter_following_catalog=" + catalog.stdout.replace(chr(10), " "))
           PY
           )
 
