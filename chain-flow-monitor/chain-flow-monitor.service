@@ -1,0 +1,23 @@
+[Unit]
+Description=Multi-chain fund observation and bridge flows
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=true
+WorkingDirectory=/opt/chain-flow-monitor/current
+EnvironmentFile=/etc/chain-flow-monitor.env
+Environment=PYTHONUNBUFFERED=1
+StateDirectory=chain-flow-monitor
+ExecStart=/usr/bin/python3 /opt/chain-flow-monitor/current/monitor.py --loop --send --data-dir /var/lib/chain-flow-monitor
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
