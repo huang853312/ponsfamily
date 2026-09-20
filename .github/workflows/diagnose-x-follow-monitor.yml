@@ -71,7 +71,8 @@ jobs:
           print("webhook_enabled=" + str(bool(webhook.get("url"))).lower())
           print("webhook_pending=" + str(webhook.get("pending_update_count", 0)))
           print("state_offset=" + str(state.get("offset", 0)))
-          print("state_accounts=" + str(len(state.get("accounts") or [])))\n          print("monitored_accounts=" + ",".join(state.get("accounts") or []))
+          print("state_accounts=" + str(len(state.get("accounts") or [])))
+          print("monitored_accounts=" + ",".join(state.get("accounts") or []))
           print("state_running=" + str(bool(state.get("running"))).lower())
           print("state_mtime=" + str(int((target / "state.json").stat().st_mtime)))
           PY
