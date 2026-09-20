@@ -41,7 +41,7 @@ jobs:
           DIAG_B64=$(base64 -w0 <<'PY'
           import json
           from pathlib import Path
-          from urllib import request
+          from urllib import parse, request
 
           target = Path("/home/ubuntu/ponsfamily/x-follow-monitor")
           env = {}
@@ -53,17 +53,21 @@ jobs:
           token = env["TELEGRAM_BOT_TOKEN"]
           base = "https://api.telegram.org/bot" + token
 
-          def call(method):
-              req = request.Request(base + "/" + method, data=b"", method="POST")
+          def call(method, payload=None):
+              data = parse.urlencode(payload or {}).encode()
+              req = request.Request(base + "/" + method, data=data, method="POST")
               with request.urlopen(req, timeout=30) as response:
                   return json.loads(response.read().decode())
 
           me = call("getMe").get("result") or {}
           webhook = call("getWebhookInfo").get("result") or {}
           configured_chat = str(env.get("TELEGRAM_CHAT_ID", ""))
+          chat = call("getChat", {"chat_id": configured_chat}).get("result") or {}
           masked_chat = ("*" * max(0, len(configured_chat) - 4)) + configured_chat[-4:]
           print("bot_username=@" + str(me.get("username", "unknown")))
           print("configured_chat=" + masked_chat)
+          print("configured_chat_type=" + str(chat.get("type", "unknown")))
+          print("configured_chat_title=" + str(chat.get("title") or chat.get("username") or chat.get("first_name") or "unknown"))
           print("webhook_enabled=" + str(bool(webhook.get("url"))).lower())
           print("webhook_pending=" + str(webhook.get("pending_update_count", 0)))
           print("state_offset=" + str(state.get("offset", 0)))
