@@ -81,7 +81,7 @@ jobs:
 
             TARGET=/home/ubuntu/ponsfamily/x-follow-monitor
             install -d \"\$TARGET\"
-            test -s \"\$TARGET/.env\"
+            sudo test -s \"\$TARGET/.env\"
 
             for key in TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID XAPI_KEY; do
               grep -Eq \"^\${key}=.+\" \"\$TARGET/.env\" || {
