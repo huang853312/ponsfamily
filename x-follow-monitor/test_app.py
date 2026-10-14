@@ -1,6 +1,7 @@
 import asyncio
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -48,8 +49,9 @@ class MonitorTests(unittest.TestCase):
             asyncio.run(app.scan_all(state))
             asyncio.run(app.scan_all(state))
         self.assertEqual(state["ids"]["source"], "123")
-        self.assertEqual(sum("新关注了 @New" in item for item in messages), 1)
-        self.assertIn("source|new", state["notified_follows"])
+        self.assertEqual(messages, [])  # scanning enqueues; sender worker performs delivery
+        self.assertEqual(sum(item["key"] == "source|new" for item in state["pending_notifications"]), 1)
+        self.assertNotIn("source|new", state["notified_follows"])
         self.assertEqual(state["known"]["source"], ["first", "new"])
         self.assertEqual(sum(item["key"] == "source|new" for item in state["pending_notifications"]), 1)
 
