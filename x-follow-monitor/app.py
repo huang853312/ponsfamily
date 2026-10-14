@@ -32,8 +32,16 @@ def load():
     ids = old.get("ids") or {}
     notices = old.get("notified_follows") or {}
     errors = old.get("error_notices") or {}
+    accounts = list(dict.fromkeys(x for x in accounts if isinstance(x, str)))
+    # Pre-v2 state may contain a single page only. Reconcile before alerting.
+    version = int(old.get("schema_version", 0) or 0)
+    pending = old.get("baseline_reconcile")
+    if not isinstance(pending, list):
+        pending = list(accounts) if version < 2 else []
     return {
-        "accounts": list(dict.fromkeys(x for x in accounts if isinstance(x, str))),
+        "schema_version": 2,
+        "baseline_reconcile": list(dict.fromkeys(x for x in pending if isinstance(x, str))),
+        "accounts": accounts,
         "running": bool(old.get("running", False)),
         "known": known if isinstance(known, dict) else {},
         "ids": ids if isinstance(ids, dict) else {},
@@ -236,6 +244,16 @@ async def scan_all(state):
         state["ids"][name] = uid
         now = set(current)
         _prune_follow_notice_keys(state, name, now)
+
+        # Legacy known lists may cover only the first page. Refresh a complete
+        # baseline once after upgrade, without generating a notification flood.
+        pending = state.setdefault("baseline_reconcile", [])
+        if name in pending:
+            state["known"][name] = sorted(now)
+            state["baseline_reconcile"] = [item for item in pending if item != name]
+            save(state)
+            print(f"BASELINE_RECONCILED account=@{name} follows={len(now)}; alerts_suppressed=upgrade", flush=True)
+            continue
 
         if name not in state["known"]:
             state["known"][name] = sorted(now)

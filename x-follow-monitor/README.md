@@ -20,6 +20,7 @@ The service reads only \`/home/ubuntu/ponsfamily/x-follow-monitor/.env\`:
 - Following data is cursor-paginated through \`data.cursor_bottom\`; malformed, repeated-cursor, or page-cap responses are rejected and do not overwrite a saved baseline.
 - New-follow notification markers are persisted before sending, preventing the same observed relationship from being pushed again after a process interruption.
 - A relationship marker is removed only after a later successful complete scan confirms that the relationship is no longer present; a later re-follow can alert again.
+- Legacy state is migrated once: each monitored account's first complete paginated snapshot refreshes the baseline without alerts, preventing old single-page baselines from causing upgrade notification floods.
 - Query, scan-task and main-loop error notices have persistent cooldowns; the main loop uses exponential retry backoff.
 - A failed or ambiguous Telegram send is logged and not blindly retried, because Telegram's sendMessage API does not provide an idempotency key. This favors avoiding duplicate pushes over potentially repeating a message whose delivery status is uncertain.
 

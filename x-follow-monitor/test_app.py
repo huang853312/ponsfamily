@@ -59,6 +59,38 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(state["known"], {"fern": ["oldfollow"]})
         self.assertIn("保留已有历史基线", message)
 
+    def test_legacy_state_schedules_complete_baseline_reconciliation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            state_path.write_text(json.dumps({
+                "accounts": ["fern", "openai"], "running": True,
+                "known": {"fern": ["old-page-user"], "openai": ["old-user"]},
+                "ids": {}, "offset": 0,
+            }), encoding="utf-8")
+            with patch.object(app, "STATE", state_path):
+                state = app.load()
+        self.assertEqual(state["schema_version"], 2)
+        self.assertEqual(state["baseline_reconcile"], ["fern", "openai"])
+
+    def test_upgrade_reconciliation_suppresses_first_complete_diff(self):
+        state = {
+            "schema_version": 2, "baseline_reconcile": ["fern"],
+            "accounts": ["fern"], "running": True,
+            "known": {"fern": ["old-page-user"]}, "ids": {"fern": "123"},
+            "offset": 0, "notified_follows": {}, "error_notices": {},
+        }
+        messages = []
+        with patch.object(
+            app, "newest_following",
+            return_value=({"old-page-user": "OldPageUser", "page2-user": "Page2User"}, "123")
+        ), patch.object(
+            app, "safe_send", side_effect=lambda message: messages.append(message) or True
+        ), patch.object(app, "save"):
+            asyncio.run(app.scan_all(state))
+        self.assertEqual(state["known"]["fern"], ["old-page-user", "page2-user"])
+        self.assertEqual(state["baseline_reconcile"], [])
+        self.assertFalse(any("新关注了" in item for item in messages))
+
     def test_missing_users_field_is_rejected(self):
         with patch.object(app, "resolve_id", return_value="123"), \
              patch.object(app, "xapi", return_value={"data": {"cursor_bottom": "cursor-1"}}):
