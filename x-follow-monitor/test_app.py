@@ -51,6 +51,7 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(sum("新关注了 @New" in item for item in messages), 1)
         self.assertIn("source|new", state["notified_follows"])
         self.assertEqual(state["known"]["source"], ["first", "new"])
+        self.assertEqual(sum(item["key"] == "source|new" for item in state["pending_notifications"]), 1)
 
     def test_start_monitor_preserves_baseline(self):
         state = {"running": False, "known": {"fern": ["oldfollow"]}}
@@ -121,14 +122,45 @@ class MonitorTests(unittest.TestCase):
             "accounts": ["fern"], "running": True, "known": {"fern": ["oldfollow"]},
             "ids": {"fern": "123"}, "offset": 0, "notified_follows": {}, "error_notices": {},
         }
-        messages = []
         with patch.object(app, "newest_following", side_effect=RuntimeError("missing users")), \
-             patch.object(app, "safe_send", side_effect=lambda message: messages.append(message) or True), \
              patch.object(app, "save"):
             asyncio.run(app.scan_all(state))
         self.assertEqual(state["known"]["fern"], ["oldfollow"])
-        self.assertEqual(len(messages), 1)
-        self.assertIn("xAPI 查询失败", messages[0])
+        self.assertEqual(len(state["pending_notifications"]), 1)
+        self.assertIn("xAPI 查询失败", state["pending_notifications"][0]["text"])
+
+    def test_outbox_marks_notification_only_after_success(self):
+        state = {
+            "accounts": ["fern"], "known": {"fern": ["oldfollow"]}, "ids": {"fern": "123"},
+            "notified_follows": {}, "pending_notifications": [{
+                "key": "fern|newfollow", "text": "X关注提醒：@fern 新关注了 @NewFollow",
+                "category": "follow", "source": "fern", "target": "newfollow",
+                "created_at": 1, "attempts": 0, "next_attempt_at": 0,
+            }], "last_follow_sent_at": 0,
+        }
+        with patch.object(app, "send") as send_mock, patch.object(app, "save"):
+            delivered = asyncio.run(app.deliver_one_pending_notification(state))
+        self.assertTrue(delivered)
+        send_mock.assert_called_once()
+        self.assertIn("fern|newfollow", state["notified_follows"])
+        self.assertEqual(state["pending_notifications"], [])
+
+    def test_429_keeps_notification_queued_and_honors_retry_after(self):
+        state = {
+            "pending_notifications": [{
+                "key": "fern|newfollow", "text": "alert", "category": "follow",
+                "source": "fern", "target": "newfollow", "attempts": 0, "next_attempt_at": 0,
+            }],
+            "notified_follows": {}, "last_follow_sent_at": 0,
+        }
+        with patch.object(app, "send", side_effect=RuntimeError(
+            'Telegram HTTP 429: {"ok":false,"parameters":{"retry_after":20}}'
+        )), patch.object(app, "save"):
+            delivered = asyncio.run(app.deliver_one_pending_notification(state))
+        self.assertFalse(delivered)
+        self.assertEqual(len(state["pending_notifications"]), 1)
+        self.assertNotIn("fern|newfollow", state["notified_follows"])
+        self.assertGreaterEqual(state["pending_notifications"][0]["next_attempt_at"], time.time() + 20)
 
     def test_prior_marker_prevents_repeat_after_interrupted_scan(self):
         state = {
@@ -148,13 +180,11 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("newfollow", state["known"]["fern"])
 
     def test_error_notifications_are_throttled(self):
-        state = {"error_notices": {}}
-        messages = []
-        with patch.object(app, "safe_send", side_effect=lambda message: messages.append(message) or True), \
-             patch.object(app, "save"):
+        state = {"error_notices": {}, "pending_notifications": []}
+        with patch.object(app, "save"):
             app.report_limited_error(state, "query:fern", "xAPI 查询失败：@fern", now=100000)
             app.report_limited_error(state, "query:fern", "xAPI 查询失败：@fern", now=100100)
-        self.assertEqual(len(messages), 1)
+        self.assertEqual(len(state["pending_notifications"]), 1)
         self.assertEqual(state["error_notices"]["query:fern"]["count"], 2)
 
 

@@ -16,6 +16,7 @@ CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 INTERVAL = max(300, int(os.getenv("X_FOLLOW_INTERVAL", "1800")))
 MAX_CONCURRENCY = max(1, int(os.getenv("X_FOLLOW_CONCURRENCY", "3")))
 ERROR_COOLDOWN = max(600, int(os.getenv("X_FOLLOW_ERROR_COOLDOWN", "21600")))
+FOLLOW_SEND_INTERVAL = max(3.0, float(os.getenv("X_FOLLOW_SEND_INTERVAL", "3")))
 MAX_FOLLOWING_PAGES = max(1, int(os.getenv("X_FOLLOW_MAX_PAGES", "100")))
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
 
@@ -48,6 +49,8 @@ def load():
         "offset": max(0, int(old.get("offset", 0))),
         "notified_follows": notices if isinstance(notices, dict) else {},
         "error_notices": errors if isinstance(errors, dict) else {},
+        "pending_notifications": old.get("pending_notifications") if isinstance(old.get("pending_notifications"), list) else [],
+        "last_follow_sent_at": float(old.get("last_follow_sent_at", 0) or 0),
     }
 
 
@@ -96,6 +99,41 @@ def safe_send(text):
         return False
 
 
+def queue_notification(state, key, message, category="system", source="", target=""):
+    """Durably queue a Telegram message; a paced worker owns its delivery."""
+    queue = state.setdefault("pending_notifications", [])
+    if any(isinstance(item, dict) and item.get("key") == key for item in queue):
+        return False
+    queue.append({
+        "key": key,
+        "text": str(message)[:3500],
+        "category": category,
+        "source": source,
+        "target": target,
+        "created_at": time.time(),
+        "attempts": 0,
+        "next_attempt_at": 0,
+    })
+    save(state)
+    print(f"NOTICE_QUEUED key={key} pending={len(queue)}", flush=True)
+    return True
+
+
+def telegram_retry_after(exc):
+    """Return Telegram's explicit retry_after for a 429 rejection, if present."""
+    message = str(exc)
+    if "Telegram HTTP 429" not in message:
+        return None
+    start = message.find("{")
+    if start < 0:
+        return None
+    try:
+        payload = json.loads(message[start:])
+        return max(1, int(payload.get("parameters", {}).get("retry_after", 1)))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return 1
+
+
 def report_limited_error(state, key, message, now=None):
     """Throttle repeated failures by stable category, not changing error text."""
     now = time.time() if now is None else now
@@ -114,7 +152,7 @@ def report_limited_error(state, key, message, now=None):
         if not persist_before_notice(state):
             return False
         extra = f"\n同类错误累计 {entry['count']} 次；重复通知已限频。" if entry["count"] > 1 else ""
-        safe_send(str(message)[:700] + extra)
+        queue_notification(state, f"error:{key}", str(message)[:700] + extra, category="error")
     return should_send
 
 
@@ -224,9 +262,68 @@ def follow_notice_key(source, followed):
 def _prune_follow_notice_keys(state, source, current):
     notices = state.setdefault("notified_follows", {})
     prefix = source + "|"
+    state["pending_notifications"] = [
+        item for item in state.setdefault("pending_notifications", [])
+        if not (
+            isinstance(item, dict)
+            and item.get("category") == "follow"
+            and item.get("source") == source
+            and item.get("target") not in current
+        )
+    ]
     for key in list(notices):
         if key.startswith(prefix) and key[len(prefix):] not in current:
             notices.pop(key, None)
+
+
+async def deliver_one_pending_notification(state):
+    queue = state.setdefault("pending_notifications", [])
+    if not queue:
+        return False
+    item = queue[0]
+    now = time.time()
+    next_attempt = float(item.get("next_attempt_at", 0) or 0)
+    spacing_wait = FOLLOW_SEND_INTERVAL - (now - float(state.get("last_follow_sent_at", 0) or 0))
+    wait_for = max(next_attempt - now, spacing_wait)
+    if wait_for > 0:
+        await asyncio.sleep(min(wait_for, 2.0))
+        return False
+
+    try:
+        await asyncio.to_thread(send, item["text"])
+    except Exception as exc:
+        attempts = int(item.get("attempts", 0)) + 1
+        item["attempts"] = attempts
+        item["last_error"] = str(exc)[:400]
+        retry_after = telegram_retry_after(exc)
+        delay = retry_after + 1 if retry_after is not None else min(300, 30 * (2 ** min(attempts - 1, 4)))
+        item["next_attempt_at"] = time.time() + delay
+        try:
+            save(state)
+        except Exception as save_exc:
+            print(f"Could not persist notification retry state: {save_exc}", flush=True)
+        print(f"NOTICE_SEND_FAILED key={item.get('key')} attempts={attempts} retry_in={delay}s error={str(exc)[:220]}", flush=True)
+        return False
+
+    sent_at = time.time()
+    if item.get("category") == "follow":
+        state.setdefault("notified_follows", {})[item["key"]] = int(sent_at)
+    state["last_follow_sent_at"] = sent_at
+    sent_key = item.get("key")
+    state["pending_notifications"] = [
+        queued for queued in queue
+        if not (isinstance(queued, dict) and queued.get("key") == sent_key)
+    ]
+    save(state)
+    print(f"NOTICE_SENT key={sent_key} pending={len(state['pending_notifications'])}", flush=True)
+    return True
+
+
+async def notification_worker(state):
+    while True:
+        delivered = await deliver_one_pending_notification(state)
+        if not delivered:
+            await asyncio.sleep(1)
 
 
 async def scan_all(state):
@@ -262,22 +359,20 @@ async def scan_all(state):
             continue
 
         old = set(state["known"][name])
+        pending_keys = {
+            item.get("key") for item in state.setdefault("pending_notifications", [])
+            if isinstance(item, dict)
+        }
         for target in sorted(now - old):
             notice_key = follow_notice_key(name, target)
-            if notice_key in state["notified_follows"]:
+            if notice_key in state["notified_follows"] or notice_key in pending_keys:
                 continue
-            # Persist before sending: a restart cannot resend the same observed
-            # relationship. Telegram has no idempotency key; ambiguous failures
-            # are logged and not blindly retried.
-            state["notified_follows"][notice_key] = int(time.time())
-            if not persist_before_notice(state):
-                continue
-            if not safe_send(f"X关注提醒：@{name} 新关注了 @{current[target]}"):
-                print(
-                    f"FOLLOW_NOTICE_UNCONFIRMED key={notice_key}; "
-                    "dedupe marker retained to prevent duplicate push",
-                    flush=True,
-                )
+            queue_notification(
+                state, notice_key,
+                f"X关注提醒：@{name} 新关注了 @{current[target]}",
+                category="follow", source=name, target=target,
+            )
+            pending_keys.add(notice_key)
 
         state["known"][name] = sorted(now)
         save(state)
@@ -312,6 +407,7 @@ async def main():
     if not BOT or not CHAT or not os.getenv("XAPI_KEY"):
         raise SystemExit("Missing Telegram or XAPI_KEY config")
     state = load()
+    notification_task = asyncio.create_task(notification_worker(state))
     scan_task, next_scan_at, retry_delay = None, 0.0, 5
     while True:
         try:
@@ -351,6 +447,10 @@ async def main():
                                 if not key.startswith(prefix)
                             }
                             state["error_notices"].pop(f"query:{name}", None)
+                            state["pending_notifications"] = [
+                                item for item in state["pending_notifications"]
+                                if not (isinstance(item, dict) and item.get("source") == name)
+                            ]
                             safe_send(f"已移除：@{name}")
                         elif cmd == "/list":
                             body = "\n".join(f"{i + 1}. @{name}" for i, name in enumerate(state["accounts"]))
@@ -377,6 +477,7 @@ async def main():
                                 f"任务：{task_state}\n"
                                 f"间隔：{INTERVAL} 秒\n"
                                 f"错误通知冷却：{ERROR_COOLDOWN} 秒\n"
+                                f"待发送通知：{len(state['pending_notifications'])}\n"
                                 "数据源：xAPI.to"
                             )
                         elif cmd.startswith("/"):

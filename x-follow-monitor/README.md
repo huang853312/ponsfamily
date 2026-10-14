@@ -21,6 +21,7 @@ The service reads only \`/home/ubuntu/ponsfamily/x-follow-monitor/.env\`:
 - New-follow notification markers are persisted before sending, preventing the same observed relationship from being pushed again after a process interruption.
 - A relationship marker is removed only after a later successful complete scan confirms that the relationship is no longer present; a later re-follow can alert again.
 - Legacy state is migrated once: each monitored account's first complete paginated snapshot refreshes the baseline without alerts, preventing old single-page baselines from causing upgrade notification floods.
+- All follow alerts and throttled error notices enter a durable outbound queue. The sender uses a conservative 3-second interval, honors Telegram 429 retry_after, and retries queued messages instead of treating rate-limited messages as delivered.
 - Query, scan-task and main-loop error notices have persistent cooldowns; the main loop uses exponential retry backoff.
 - A failed or ambiguous Telegram send is logged and not blindly retried, because Telegram's sendMessage API does not provide an idempotency key. This favors avoiding duplicate pushes over potentially repeating a message whose delivery status is uncertain.
 
