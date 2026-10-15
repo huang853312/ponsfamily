@@ -271,8 +271,8 @@ def newest_following(name, cached_uid=None):
                         detail = f"{field}={str(value)[:180]}"
                         break
             detail = re.sub(
-                r"(?i)(api[_ -]?key|token|authorization|secret)(\\s*[:=]\\s*)[^,;\\s]+",
-                r"\\1\\2<redacted>",
+                r"(?i)(api[_ -]?key|token|authorization|secret)(\s*[:=]\s*)[^,;\s]+",
+                r"\1\2<redacted>",
                 detail,
             )
             summary = f"top_level_keys={keys}"
