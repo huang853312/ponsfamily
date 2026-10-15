@@ -23,6 +23,7 @@ The service reads only \`/home/ubuntu/ponsfamily/x-follow-monitor/.env\`:
 - Legacy state is migrated once: each monitored account's first complete paginated snapshot refreshes the baseline without alerts, preventing old single-page baselines from causing upgrade notification floods.
 - Missing `data` responses across monitored accounts are grouped into one alert; startup migration merges already queued per-account messages of the same class.
 - Response-shape failures log only top-level response keys and a redacted upstream error summary in `XAPI_RESPONSE_DIAGNOSTIC` records.
+- Diagnostic summaries redact API keys, tokens, authorization values, and secrets before logging.
 - All follow alerts and throttled error notices enter a durable outbound queue. The sender uses a conservative 3-second interval, honors Telegram 429 retry_after, and retries queued messages instead of treating rate-limited messages as delivered.
 - Query, scan-task and main-loop error notices have persistent cooldowns; the main loop uses exponential retry backoff.
 - A failed or ambiguous Telegram send is logged and not blindly retried, because Telegram's sendMessage API does not provide an idempotency key. This favors avoiding duplicate pushes over potentially repeating a message whose delivery status is uncertain.
