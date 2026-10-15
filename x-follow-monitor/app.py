@@ -233,6 +233,11 @@ def resolve_id(name, cached_uid=None):
     if cached_uid:
         return str(cached_uid)
     result = xapi("twitter.user_by_screen_name", {"screen_name": name, "provider": "x"})
+    if isinstance(result, dict):
+        upstream_error = result.get("error")
+        if isinstance(upstream_error, dict) and upstream_error.get("code") == "PLATFORM_HTTP_402":
+            message = str(upstream_error.get("message") or "Insufficient balance or API Key limit exceeded")[:300]
+            raise RuntimeError(f"xAPI PLATFORM_HTTP_402: {message}")
     data = result.get("data") if isinstance(result, dict) else None
     if not isinstance(data, dict):
         raise RuntimeError(f"无法解析 @{name}：用户资料响应结构异常")

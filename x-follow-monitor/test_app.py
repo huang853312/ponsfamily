@@ -134,6 +134,19 @@ class MonitorTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "PLATFORM_HTTP_402"):
                 app.newest_following("fern", "123")
 
+    def test_user_lookup_platform_402_is_not_misreported_as_missing_user(self):
+        response = {
+            "success": False,
+            "error": {
+                "code": "PLATFORM_HTTP_402",
+                "message": "Insufficient balance or API Key limit exceeded",
+                "transient": False,
+            },
+        }
+        with patch.object(app, "xapi", return_value=response):
+            with self.assertRaisesRegex(RuntimeError, "PLATFORM_HTTP_402"):
+                app.resolve_id("newaccount")
+
     def test_platform_402_pauses_all_scans_and_preserves_baselines(self):
         state = {
             "accounts": ["fern", "other"], "running": True,
