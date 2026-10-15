@@ -24,7 +24,7 @@ jobs:
           set -euo pipefail
           test -n "$SERVER_SSH_KEY"
           install -d -m 700 "$HOME/.ssh"
-          printf '%s\\n' "$SERVER_SSH_KEY" > "$HOME/.ssh/deploy_key"
+          printf '%s\n' "$SERVER_SSH_KEY" > "$HOME/.ssh/deploy_key"
           chmod 600 "$HOME/.ssh/deploy_key"
           touch "$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/known_hosts"
@@ -55,8 +55,8 @@ jobs:
           if not target.is_file():
               raise SystemExit("RECOVERY_STOP: monitor .env is missing; no change made")
 
-          direct = re.compile(r'^\\s*(?:export\\s+)?XAPI_KEY\\s*=\\s*(.*?)\\s*$')
-          unit = re.compile(r'^\\s*Environment\\s*=\\s*["\\x27]?(?:XAPI_KEY=)(.*?)["\\x27]?\\s*$')
+          direct = re.compile(r'^\s*(?:export\s+)?XAPI_KEY\s*=\s*(.*?)\s*$')
+          unit = re.compile(r'^\s*Environment\s*=\s*["\x27]?(?:XAPI_KEY=)(.*?)["\x27]?\s*$')
 
           def read_key(path):
               try:
@@ -66,9 +66,9 @@ jobs:
                       m = direct.match(line) or unit.match(line)
                       if m:
                           value = m.group(1).strip()
-                          if len(value) >= 2 and value[0] == value[-1] and value[0] in "\\x22\\x27":
+                          if len(value) >= 2 and value[0] == value[-1] and value[0] in "\x22\x27":
                               value = value[1:-1]
-                          if value and "\\n" not in value and "\\r" not in value:
+                          if value and "\n" not in value and "\r" not in value:
                               return value
               except (OSError, RuntimeError):
                   return None
@@ -146,7 +146,7 @@ jobs:
           os.chmod(backup, 0o600)
 
           original = target.read_text(encoding="utf-8")
-          key_line = re.compile(r'^\\s*XAPI_KEY\\s*=')
+          key_line = re.compile(r'^\s*XAPI_KEY\s*=')
           out = []
           replaced = False
           for line in original.splitlines():
@@ -163,7 +163,7 @@ jobs:
           try:
               os.fchmod(fd, 0o600)
               with os.fdopen(fd, "w", encoding="utf-8") as f:
-                  f.write("\\n".join(out) + "\\n")
+                  f.write("\n".join(out) + "\n")
               os.replace(tmp, target)
               os.chmod(target, 0o600)
           finally:
