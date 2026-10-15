@@ -33,6 +33,48 @@ def load():
     ids = old.get("ids") or {}
     notices = old.get("notified_follows") or {}
     errors = old.get("error_notices") or {}
+    queue = old.get("pending_notifications")
+    queue = queue if isinstance(queue, list) else []
+
+    # Older releases queued one identical missing-data error per monitored account.
+    # Collapse those persisted alerts during migration so the sender does not drain
+    # hundreds of obsolete duplicate error messages after the next restart.
+    compacted, shape_errors, existing_shape_notice = [], [], None
+    for item in queue:
+        if not isinstance(item, dict):
+            continue
+        key = item.get("key")
+        message = str(item.get("text", ""))
+        if key == "error:xapi:missing-data":
+            existing_shape_notice = item
+        elif item.get("category") == "error" and "关注列表响应缺少 data 对象" in message:
+            shape_errors.append(item)
+        else:
+            compacted.append(item)
+    if shape_errors or existing_shape_notice:
+        summary = existing_shape_notice or {
+            "key": "error:xapi:missing-data",
+            "category": "error",
+            "created_at": min((item.get("created_at", time.time()) for item in shape_errors), default=time.time()),
+            "attempts": 0,
+            "next_attempt_at": 0,
+        }
+        summary["key"] = "error:xapi:missing-data"
+        summary["category"] = "error"
+        summary["text"] = (
+            "xAPI 上游响应异常：多个账号的关注列表响应缺少 data 对象。"
+            "本轮保留历史名单，没有把异常响应覆盖为新名单；同类错误已合并。"
+            "请查看服务日志中的 XAPI_RESPONSE_DIAGNOSTIC 摘要。"
+        )
+        summary["attempts"] = max(
+            [int(summary.get("attempts", 0) or 0)]
+            + [int(item.get("attempts", 0) or 0) for item in shape_errors]
+        )
+        summary["next_attempt_at"] = max(
+            [float(summary.get("next_attempt_at", 0) or 0)]
+            + [float(item.get("next_attempt_at", 0) or 0) for item in shape_errors]
+        )
+        compacted.append(summary)
     accounts = list(dict.fromkeys(x for x in accounts if isinstance(x, str)))
     # Pre-v2 state may contain a single page only. Reconcile before alerting.
     version = int(old.get("schema_version", 0) or 0)
@@ -49,7 +91,7 @@ def load():
         "offset": max(0, int(old.get("offset", 0))),
         "notified_follows": notices if isinstance(notices, dict) else {},
         "error_notices": errors if isinstance(errors, dict) else {},
-        "pending_notifications": old.get("pending_notifications") if isinstance(old.get("pending_notifications"), list) else [],
+        "pending_notifications": compacted,
         "last_follow_sent_at": float(old.get("last_follow_sent_at", 0) or 0),
     }
 
@@ -220,7 +262,25 @@ def newest_following(name, cached_uid=None):
         result = xapi("twitter.following", payload)
         data = result.get("data") if isinstance(result, dict) else None
         if not isinstance(data, dict):
-            raise RuntimeError(f"@{name} 的关注列表响应缺少 data 对象")
+            keys = sorted(str(key) for key in result.keys())[:25] if isinstance(result, dict) else []
+            detail = ""
+            if isinstance(result, dict):
+                for field in ("error", "message", "detail", "description", "code", "status"):
+                    value = result.get(field)
+                    if value is not None:
+                        detail = f"{field}={str(value)[:180]}"
+                        break
+            detail = re.sub(
+                r"(?i)(api[_ -]?key|token|authorization|secret)(\\s*[:=]\\s*)[^,;\\s]+",
+                r"\\1\\2<redacted>",
+                detail,
+            )
+            summary = f"top_level_keys={keys}"
+            if detail:
+                summary += f"; upstream={detail}"
+            raise RuntimeError(
+                f"@{name} 的关注列表响应缺少 data 对象；{summary}"
+            )
         if "users" not in data or not isinstance(data["users"], list):
             raise RuntimeError(f"@{name} 的关注列表响应缺少有效 users 列表；为保护历史基线，本轮不更新名单")
         rows = data["users"]
@@ -334,7 +394,22 @@ async def scan_all(state):
     for name, current, uid, exc in results:
         error_key = f"query:{name}"
         if exc is not None:
-            report_limited_error(state, error_key, f"xAPI 查询失败：@{name}：{str(exc)[:250]}")
+            error_text = str(exc)
+            if "关注列表响应缺少 data 对象" in error_text:
+                diagnostic = error_text.split("响应缺少 data 对象", 1)[1][:240].strip(" ：;")
+                message = (
+                    "xAPI 上游响应异常：twitter.following 返回缺少 data 对象。"
+                    "同类账号错误已合并；本轮保留历史名单，没有用异常响应覆盖数据。"
+                )
+                if diagnostic:
+                    message += f" 响应摘要：{diagnostic}"
+                report_limited_error(state, "xapi:missing-data", message)
+                print(
+                    f"XAPI_RESPONSE_DIAGNOSTIC account=@{name} {diagnostic}",
+                    flush=True,
+                )
+            else:
+                report_limited_error(state, error_key, f"xAPI 查询失败：@{name}：{error_text[:250]}")
             continue
 
         clear_error(state, error_key)

@@ -94,6 +94,32 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(state["baseline_reconcile"], [])
         self.assertFalse(any("新关注了" in item for item in messages))
 
+    def test_load_collapses_legacy_missing_data_error_queue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            state_path.write_text(json.dumps({
+                "accounts": ["fern"],
+                "known": {"fern": ["known-user"]},
+                "pending_notifications": [
+                    {"key": "error:query:fern", "category": "error",
+                     "text": "xAPI 查询失败：@fern 的关注列表响应缺少 data 对象",
+                     "attempts": 0, "next_attempt_at": 0},
+                    {"key": "error:query:other", "category": "error",
+                     "text": "xAPI 查询失败：@other 的关注列表响应缺少 data 对象",
+                     "attempts": 1, "next_attempt_at": 200},
+                    {"key": "fern|genuine-follow", "category": "follow",
+                     "text": "X关注提醒：@fern 新关注了 @genuine_follow",
+                     "source": "fern", "target": "genuine_follow"},
+                ],
+            }), encoding="utf-8")
+            with patch.object(app, "STATE", state_path):
+                state = app.load()
+        self.assertEqual(len([x for x in state["pending_notifications"] if x.get("category") == "error"]), 1)
+        self.assertEqual(len([x for x in state["pending_notifications"] if x.get("category") == "follow"]), 1)
+        summary = next(x for x in state["pending_notifications"] if x.get("category") == "error")
+        self.assertEqual(summary["key"], "error:xapi:missing-data")
+        self.assertEqual(summary["next_attempt_at"], 200)
+
     def test_missing_users_field_is_rejected(self):
         with patch.object(app, "resolve_id", return_value="123"), \
              patch.object(app, "xapi", return_value={"data": {"cursor_bottom": "cursor-1"}}):
@@ -163,6 +189,27 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(len(state["pending_notifications"]), 1)
         self.assertNotIn("fern|newfollow", state["notified_follows"])
         self.assertGreaterEqual(state["pending_notifications"][0]["next_attempt_at"], time.time() + 20)
+
+    def test_missing_data_errors_across_accounts_are_grouped(self):
+        state = {
+            "accounts": ["fern", "other"], "running": True,
+            "known": {"fern": ["old1"], "other": ["old2"]}, "ids": {"fern": "1", "other": "2"},
+            "offset": 0, "notified_follows": {}, "error_notices": {}, "pending_notifications": [],
+        }
+        with patch.object(
+            app, "newest_following",
+            side_effect=[
+                RuntimeError("@fern 的关注列表响应缺少 data 对象；top_level_keys=['message']"),
+                RuntimeError("@other 的关注列表响应缺少 data 对象；top_level_keys=['message']"),
+            ],
+        ), patch.object(app, "save"):
+            asyncio.run(app.scan_all(state))
+        queued = [x for x in state["pending_notifications"] if x.get("category") == "error"]
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]["key"], "error:xapi:missing-data")
+        self.assertEqual(state["known"]["fern"], ["old1"])
+        self.assertEqual(state["known"]["other"], ["old2"])
+        self.assertEqual(state["error_notices"]["xapi:missing-data"]["count"], 2)
 
     def test_prior_marker_prevents_repeat_after_interrupted_scan(self):
         state = {
