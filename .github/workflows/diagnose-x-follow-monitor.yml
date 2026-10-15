@@ -1,4 +1,4 @@
-name: Diagnose X Follow Monitor
+name: Recover previous X monitor xAPI key
 
 on:
   push:
@@ -12,100 +12,167 @@ permissions:
   contents: read
 
 jobs:
-  diagnose:
+  recover-key:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Configure SSH
         env:
           SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        shell: bash
         run: |
+          set -euo pipefail
           test -n "$SERVER_SSH_KEY"
           install -d -m 700 "$HOME/.ssh"
-          printf '%s\n' "$SERVER_SSH_KEY" > "$HOME/.ssh/deploy_key"
+          printf '%s\\n' "$SERVER_SSH_KEY" > "$HOME/.ssh/deploy_key"
           chmod 600 "$HOME/.ssh/deploy_key"
           touch "$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/known_hosts"
 
-      - name: Diagnose Telegram command path
+      - name: Find and restore unique previous key
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_PORT: ${{ secrets.SERVER_PORT }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
+        shell: bash
         run: |
+          set -euo pipefail
           test -n "$SERVER_HOST"
           test -n "$SERVER_PORT"
           test -n "$SERVER_USER"
-          SSH="ssh -i $HOME/.ssh/deploy_key -p $SERVER_PORT -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30"
-
-          DIAG_B64=$(base64 -w0 <<'PY'
-          import json
+          SSH=(ssh -i "$HOME/.ssh/deploy_key" -p "$SERVER_PORT" -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30)
+          "${SSH[@]}" "$SERVER_USER@$SERVER_HOST" "sudo python3 -" <<'PY'
+          import hashlib
           import os
-          import subprocess
+          import re
+          import shutil
+          import stat
+          import tempfile
+          from datetime import datetime, timezone
           from pathlib import Path
-          from urllib import parse, request
 
-          target = Path("/home/ubuntu/ponsfamily/x-follow-monitor")
-          env = {}
-          for line in (target / ".env").read_text().splitlines():
-              if line and not line.lstrip().startswith("#") and "=" in line:
-                  key, value = line.split("=", 1)
-                  env[key.strip()] = value.strip().strip(chr(34))
-          state = json.loads((target / "state.json").read_text())
-          token = env["TELEGRAM_BOT_TOKEN"]
-          base = "https://api.telegram.org/bot" + token
+          target = Path("/home/ubuntu/ponsfamily/x-follow-monitor/.env")
+          if not target.is_file():
+              raise SystemExit("RECOVERY_STOP: monitor .env is missing; no change made")
 
-          def call(method, payload=None):
-              data = parse.urlencode(payload or {}).encode()
-              req = request.Request(base + "/" + method, data=data, method="POST")
-              with request.urlopen(req, timeout=30) as response:
-                  return json.loads(response.read().decode())
+          direct = re.compile(r'^\\s*(?:export\\s+)?XAPI_KEY\\s*=\\s*(.*?)\\s*$')
+          unit = re.compile(r'^\\s*Environment\\s*=\\s*["\\x27]?(?:XAPI_KEY=)(.*?)["\\x27]?\\s*$')
 
-          me = call("getMe").get("result") or {}
-          webhook = call("getWebhookInfo").get("result") or {}
-          configured_chat = str(env.get("TELEGRAM_CHAT_ID", ""))
-          chat = call("getChat", {"chat_id": configured_chat}).get("result") or {}
-          masked_chat = ("*" * max(0, len(configured_chat) - 4)) + configured_chat[-4:]
-          print("bot_username=@" + str(me.get("username", "unknown")))
-          print("configured_chat=" + masked_chat)
-          print("configured_chat_type=" + str(chat.get("type", "unknown")))
-          print("configured_chat_title=" + str(chat.get("title") or chat.get("username") or chat.get("first_name") or "unknown"))
-          print("webhook_enabled=" + str(bool(webhook.get("url"))).lower())
-          print("webhook_pending=" + str(webhook.get("pending_update_count", 0)))
-          print("state_offset=" + str(state.get("offset", 0)))
-          print("state_accounts=" + str(len(state.get("accounts") or [])))
-          print("monitored_accounts=" + ",".join(state.get("accounts") or []))
-          print("state_running=" + str(bool(state.get("running"))).lower())
-          print("state_mtime=" + str(int((target / "state.json").stat().st_mtime)))
-          cli = target / "node_modules" / ".bin" / "xapi-to"
-          action = subprocess.run(
-              [str(cli), "get", "twitter.following", "--format", "pretty"],
-              capture_output=True,
-              text=True,
-              timeout=60,
-              env={**os.environ, **env},
-              check=True,
+          def read_key(path):
+              try:
+                  if not path.is_file() or path.stat().st_size > 1_000_000:
+                      return None
+                  for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                      m = direct.match(line) or unit.match(line)
+                      if m:
+                          value = m.group(1).strip()
+                          if len(value) >= 2 and value[0] == value[-1] and value[0] in "\\x22\\x27":
+                              value = value[1:-1]
+                          if value and "\\n" not in value and "\\r" not in value:
+                              return value
+              except (OSError, RuntimeError):
+                  return None
+              return None
+
+          def fp(value):
+              return hashlib.sha256(value.encode()).hexdigest()[:10]
+
+          current = read_key(target)
+          if not current:
+              raise SystemExit("RECOVERY_STOP: current XAPI_KEY not found; no change made")
+
+          candidates = [
+              Path("/home/ubuntu/ponsfamily/.env"),
+              Path("/home/ubuntu/.env"),
+              Path("/home/ubuntu/x-follow-monitor/.env"),
+              Path("/opt/hyperevm-radar/.env"),
+              Path("/opt/robinhood-radar/.env"),
+              Path("/etc/robinhood-radar.env"),
+          ]
+
+          # Include historical monitor-local environment backups, but never print values.
+          try:
+              candidates.extend(p for p in target.parent.glob(".env*") if p != target and p.is_file())
+          except OSError:
+              pass
+
+          allowed_names = {".env", ".profile", ".bashrc"}
+          allowed_suffixes = {".env", ".service", ".conf", ".config", ".sh"}
+          skipped = {"node_modules", ".git", ".venv", "__pycache__", ".deploy"}
+          for root in (Path("/home/ubuntu"), Path("/opt"), Path("/etc/systemd")):
+              if not root.exists():
+                  continue
+              try:
+                  for path in root.rglob("*"):
+                      if not path.is_file() or any(part in skipped for part in path.parts):
+                          continue
+                      if path.name not in allowed_names and path.suffix not in allowed_suffixes:
+                          continue
+                      candidates.append(path)
+              except OSError:
+                  continue
+
+          seen_paths = set()
+          alternates = {}
+          current_resolved = target.resolve()
+          for path in candidates:
+              try:
+                  resolved = path.resolve()
+                  if resolved == current_resolved or resolved in seen_paths:
+                      continue
+                  seen_paths.add(resolved)
+                  key = read_key(resolved)
+                  if key and key != current:
+                      alternates.setdefault(key, []).append(str(path))
+              except (OSError, RuntimeError):
+                  continue
+
+          print("current_key_fingerprint=" + fp(current))
+          print("distinct_previous_key_candidates=" + str(len(alternates)))
+          for value, sources in alternates.items():
+              print("candidate_fingerprint=" + fp(value) + " source_count=" + str(len(sources)))
+
+          if len(alternates) == 0:
+              raise SystemExit("RECOVERY_RESULT=no_previous_key_found; configuration unchanged")
+          if len(alternates) > 1:
+              raise SystemExit("RECOVERY_RESULT=ambiguous_previous_keys; configuration unchanged")
+
+          old_key = next(iter(alternates))
+          backup = target.with_name(
+              ".env.before_key_restore_" +
+              datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
           )
-          print("twitter_following_schema=" + action.stdout.replace(chr(10), " "))
-          catalog = subprocess.run(
-              [str(cli), "search", "twitter following", "--sort", "price", "--format", "pretty"],
-              capture_output=True,
-              text=True,
-              timeout=60,
-              env={**os.environ, **env},
-              check=True,
-          )
-          print("twitter_following_catalog=" + catalog.stdout.replace(chr(10), " "))
+          shutil.copy2(target, backup)
+          os.chmod(backup, 0o600)
+
+          original = target.read_text(encoding="utf-8")
+          key_line = re.compile(r'^\\s*XAPI_KEY\\s*=')
+          out = []
+          replaced = False
+          for line in original.splitlines():
+              if key_line.match(line):
+                  if not replaced:
+                      out.append("XAPI_KEY=" + old_key)
+                      replaced = True
+              else:
+                  out.append(line)
+          if not replaced:
+              out.append("XAPI_KEY=" + old_key)
+
+          fd, tmp = tempfile.mkstemp(prefix=".env.restore.", dir=str(target.parent))
+          try:
+              os.fchmod(fd, 0o600)
+              with os.fdopen(fd, "w", encoding="utf-8") as f:
+                  f.write("\\n".join(out) + "\\n")
+              os.replace(tmp, target)
+              os.chmod(target, 0o600)
+          finally:
+              if os.path.exists(tmp):
+                  os.unlink(tmp)
+
+          print("RECOVERY_RESULT=restored")
+          print("restored_key_fingerprint=" + fp(old_key))
+          print("pre_restore_backup=" + backup.name)
           PY
-          )
 
-          $SSH "$SERVER_USER@$SERVER_HOST" "
-            set -eu
-            echo service_state=\$(sudo systemctl is-active x-follow-monitor.service)
-            sudo systemctl show x-follow-monitor.service -p MainPID -p NRestarts -p Result -p ExecMainStatus -p ActiveEnterTimestamp --no-pager
-            echo processes:
-            pgrep -af /home/ubuntu/ponsfamily/x-follow-monitor/app.py || true
-            echo '$DIAG_B64' | base64 -d | sudo python3
-            echo recent_logs:
-            sudo journalctl -u x-follow-monitor.service --since '20 minutes ago' --no-pager
-          "
+          "${SSH[@]}" "$SERVER_USER@$SERVER_HOST" "sudo systemctl restart x-follow-monitor.service && sleep 5 && sudo systemctl is-active --quiet x-follow-monitor.service && printf 'service=' && sudo systemctl is-active x-follow-monitor.service && sudo systemctl show x-follow-monitor.service -p MainPID -p Result -p NRestarts --no-pager"
