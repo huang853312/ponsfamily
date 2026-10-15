@@ -1,4 +1,4 @@
-name: Check X monitor key recovery availability
+name: Restore X monitor API key
 
 on:
   push:
@@ -12,9 +12,9 @@ permissions:
   contents: read
 
 jobs:
-  key-check:
+  restore:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - name: Configure SSH
         env:
@@ -29,19 +29,140 @@ jobs:
           touch "$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/known_hosts"
 
-      - name: Check saved key availability without revealing or transferring it
+      - name: Restore saved key and resume monitor
         env:
-          XAPI_KEY: ${{ secrets.XAPI_KEY }}
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_PORT: ${{ secrets.SERVER_PORT }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
+          XAPI_KEY: ${{ secrets.XAPI_KEY }}
         shell: bash
         run: |
           set -euo pipefail
-          if [ -n "${XAPI_KEY:-}" ]; then
-            echo "github_actions_xapi_key_secret=present"
-          else
-            echo "github_actions_xapi_key_secret=absent"
-          fi
+          test -n "$SERVER_HOST"
+          test -n "$SERVER_PORT"
+          test -n "$SERVER_USER"
+          test -n "$XAPI_KEY"
+
           SSH=(ssh -i "$HOME/.ssh/deploy_key" -p "$SERVER_PORT" -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30)
-          "${SSH[@]}" "$SERVER_USER@$SERVER_HOST" "sudo systemctl is-active x-follow-monitor.service; sudo systemctl show x-follow-monitor.service -p MainPID -p Result -p NRestarts --no-pager"
+          SERVER="$SERVER_USER@$SERVER_HOST"
+
+          cat > "$RUNNER_TEMP/restore_key.py" <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import shutil
+          import sys
+          import tempfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          root = Path("/home/ubuntu/ponsfamily/x-follow-monitor")
+          env_path, state_path = root / ".env", root / "state.json"
+          key = sys.stdin.read()
+          if not key or "\\n" in key or "\\r" in key:
+              raise SystemExit("key_status=refused_empty_or_multiline")
+          if not env_path.is_file() or not state_path.is_file():
+              raise SystemExit("key_status=refused_missing_config_or_state")
+
+          def fp(s):
+              return hashlib.sha256(s.encode()).hexdigest()[:12]
+
+          env_text = env_path.read_text(encoding="utf-8")
+          matches = [re.match(r'^\\s*XAPI_KEY\\s*=\\s*(.*?)\\s*$', line)
+                     for line in env_text.splitlines()]
+          values = []
+          for m in matches:
+              if m:
+                  value = m.group(1).strip()
+                  if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                      value = value[1:-1]
+                  values.append(value)
+          if len(values) != 1 or not values[0]:
+              raise SystemExit("key_status=refused_invalid_current_key")
+          current = values[0]
+          print("current_key_fingerprint=" + fp(current))
+          print("saved_key_fingerprint=" + fp(key))
+          if current == key:
+              print("key_status=already_current")
+              raise SystemExit(0)
+
+          try:
+              state_text = state_path.read_text(encoding="utf-8")
+              state = json.loads(state_text)
+          except (OSError, json.JSONDecodeError):
+              raise SystemExit("key_status=refused_invalid_state")
+          if not isinstance(state, dict):
+              raise SystemExit("key_status=refused_invalid_state")
+
+          stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+          env_backup = root / (".env.before_restore_" + stamp)
+          state_backup = root / ("state.json.before_restore_" + stamp)
+          shutil.copy2(env_path, env_backup)
+          shutil.copy2(state_path, state_backup)
+          os.chmod(env_backup, 0o600)
+          os.chmod(state_backup, 0o600)
+
+          lines, replaced = [], False
+          for line in env_text.splitlines():
+              if re.match(r'^\\s*XAPI_KEY\\s*=', line):
+                  if not replaced:
+                      lines.append("XAPI_KEY=" + key)
+                      replaced = True
+              else:
+                  lines.append(line)
+          if not replaced:
+              raise SystemExit("key_status=refused_key_line_disappeared")
+
+          state.pop("api_pause_until", None)
+          state.pop("api_pause_reason", None)
+
+          def atomic_write(path, text, st):
+              fd, temp = tempfile.mkstemp(prefix=".restore.", dir=str(path.parent))
+              try:
+                  os.fchmod(fd, st.st_mode & 0o777)
+                  os.fchown(fd, st.st_uid, st.st_gid)
+                  with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                      stream.write(text)
+                      stream.flush()
+                      os.fsync(stream.fileno())
+                  os.replace(temp, path)
+              finally:
+                  if os.path.exists(temp):
+                      os.unlink(temp)
+
+          atomic_write(env_path, "\\n".join(lines) + "\\n", env_path.stat())
+          atomic_write(state_path, json.dumps(state, ensure_ascii=False, indent=2) + "\\n", state_path.stat())
+          print("key_status=restored")
+          print("restored_key_fingerprint=" + fp(key))
+          print("billing_pause_cleared=true")
+          print("backup_files=" + env_backup.name + "," + state_backup.name)
+          PY
+
+          "${SSH[@]}" "$SERVER" 'sudo install -m 600 /dev/stdin /tmp/x-follow-key-restore.py' < "$RUNNER_TEMP/restore_key.py"
+          RESULT=$(printf '%s' "$XAPI_KEY" | "${SSH[@]}" "$SERVER" 'sudo python3 /tmp/x-follow-key-restore.py')
+          printf '%s\n' "$RESULT"
+          "${SSH[@]}" "$SERVER" 'sudo rm -f /tmp/x-follow-key-restore.py'
+
+          if grep -q '^key_status=already_current$' <<< "$RESULT"; then
+            echo "Saved GitHub key matches the current server key; no credentials were changed."
+            exit 0
+          fi
+          if ! grep -q '^key_status=restored$' <<< "$RESULT"; then
+            echo "::error::Key restore stopped safely; inspect the status marker above."
+            exit 1
+          fi
+
+          "${SSH[@]}" "$SERVER" 'sudo systemctl restart x-follow-monitor.service'
+          sleep 35
+          "${SSH[@]}" "$SERVER" '
+            set -eu
+            sudo systemctl is-active --quiet x-follow-monitor.service
+            printf "service="
+            sudo systemctl is-active x-follow-monitor.service
+            sudo systemctl show x-follow-monitor.service -p MainPID -p Result -p NRestarts --no-pager
+            printf "monitor_events=\\n"
+            sudo journalctl -u x-follow-monitor.service --since "3 minutes ago" --no-pager |
+              grep -E "SCAN_SUMMARY|XAPI_BILLING_PAUSE|XAPI_RESPONSE_DIAGNOSTIC|Traceback|ERROR" |
+              tail -n 30 || true
+          '
