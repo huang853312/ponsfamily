@@ -91,6 +91,10 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(state["known"]["source"], ["first", "new"])
         self.assertEqual(sum(item["key"] == "source|new" for item in state["pending_notifications"]), 1)
 
+    def test_scan_now_after_current_task_deadline_is_immediate(self):
+        self.assertEqual(app.scan_completion_deadline(True, now=1000), 0.0)
+        self.assertEqual(app.scan_completion_deadline(False, now=1000), 1000 + app.INTERVAL)
+
     def test_start_monitor_preserves_baseline(self):
         state = {"running": False, "known": {"fern": ["oldfollow"]}}
         message = app.start_monitor(state)

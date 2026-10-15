@@ -538,6 +538,14 @@ async def scan_all(state):
     )
 
 
+def scan_completion_deadline(scan_requested_after_current, now=None):
+    """A /scan_now received during a running/already-finished-but-unhandled task wins."""
+    if scan_requested_after_current:
+        return 0.0
+    current = time.monotonic() if now is None else now
+    return current + INTERVAL
+
+
 def start_monitor(state):
     """Enable monitoring without clearing the persisted follow baseline."""
     state["running"] = True
@@ -620,6 +628,7 @@ async def main():
                             safe_send(start_monitor(state))
                         elif cmd == "/stop_monitor":
                             state["running"] = False
+                            scan_requested_after_current = False
                             if scan_task and not scan_task.done():
                                 scan_task.cancel()
                                 with contextlib.suppress(asyncio.CancelledError):
@@ -630,9 +639,10 @@ async def main():
                             state.pop("api_pause_until", None)
                             state.pop("api_pause_reason", None)
                             print("COMMAND_RECEIVED command=/scan_now", flush=True)
-                            if scan_task and not scan_task.done():
+                            if scan_task is not None:
+                                # The task may already be done but not yet handled below.
                                 scan_requested_after_current = True
-                                safe_send("当前扫描结束后会立即再扫描一次")
+                                safe_send("当前扫描任务结算后会立即再扫描一次")
                             else:
                                 next_scan_at = 0.0
                                 safe_send("已安排立即扫描（如 API 额度仍不足，会再次暂停并保留历史名单）")
@@ -666,12 +676,10 @@ async def main():
                 except Exception as exc:
                     report_limited_error(state, "scan-task", f"扫描任务失败：{str(exc)[:250]}")
                 scan_task = None
+                next_scan_at = scan_completion_deadline(scan_requested_after_current)
                 if scan_requested_after_current:
-                    next_scan_at = 0.0
                     scan_requested_after_current = False
                     print("SCAN_NOW_SCHEDULED reason=command_during_scan", flush=True)
-                else:
-                    next_scan_at = time.monotonic() + INTERVAL
 
             if (
                 state["running"]
