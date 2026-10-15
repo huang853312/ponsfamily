@@ -94,6 +94,9 @@ def load():
         "error_notices": errors if isinstance(errors, dict) else {},
         "pending_notifications": compacted,
         "last_follow_sent_at": float(old.get("last_follow_sent_at", 0) or 0),
+        # Persist the circuit-breaker timer across deploys/restarts.
+        "api_pause_until": float(old.get("api_pause_until", 0) or 0),
+        "api_pause_reason": str(old.get("api_pause_reason", "")),
     }
 
 

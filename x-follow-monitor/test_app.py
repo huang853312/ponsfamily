@@ -25,6 +25,22 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(state["notified_follows"], {})
         self.assertEqual(state["error_notices"], {})
 
+    def test_load_preserves_billing_pause_across_restart(self):
+        pause_until = time.time() + 18000
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            state_path.write_text(json.dumps({
+                "accounts": ["fern"], "running": True,
+                "known": {"fern": ["old-user"]},
+                "api_pause_until": pause_until,
+                "api_pause_reason": "PLATFORM_HTTP_402",
+            }), encoding="utf-8")
+            with patch.object(app, "STATE", state_path):
+                state = app.load()
+        self.assertEqual(state["api_pause_until"], pause_until)
+        self.assertEqual(state["api_pause_reason"], "PLATFORM_HTTP_402")
+        self.assertEqual(state["known"]["fern"], ["old-user"])
+
     def test_channel_post_is_accepted_as_command_message(self):
         post = {"chat": {"id": -100123}, "text": "/list"}
         self.assertEqual(app.update_message({"channel_post": post}), post)
