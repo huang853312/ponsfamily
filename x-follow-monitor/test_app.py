@@ -41,6 +41,26 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(state["api_pause_reason"], "PLATFORM_HTTP_402")
         self.assertEqual(state["known"]["fern"], ["old-user"])
 
+    def test_load_fails_closed_on_corrupt_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            state_path.write_text("{broken", encoding="utf-8")
+            with patch.object(app, "STATE", state_path):
+                with self.assertRaisesRegex(RuntimeError, "拒绝重置"):
+                    app.load()
+
+    def test_clear_error_removes_stale_queued_notice(self):
+        state = {
+            "error_notices": {"xapi:billing-limit": {"active": True, "last_sent": 10}},
+            "pending_notifications": [
+                {"key": "error:xapi:billing-limit", "category": "error", "text": "old error"},
+                {"key": "fern|newfollow", "category": "follow", "text": "new follow"},
+            ],
+        }
+        app.clear_error(state, "xapi:billing-limit")
+        self.assertFalse(state["error_notices"]["xapi:billing-limit"]["active"])
+        self.assertEqual([x["key"] for x in state["pending_notifications"]], ["fern|newfollow"])
+
     def test_channel_post_is_accepted_as_command_message(self):
         post = {"chat": {"id": -100123}, "text": "/list"}
         self.assertEqual(app.update_message({"channel_post": post}), post)

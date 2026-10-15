@@ -25,10 +25,17 @@ USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
 def load():
     try:
         old = json.loads(STATE.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except FileNotFoundError:
         old = {}
+    except (json.JSONDecodeError, OSError) as exc:
+        # Fail closed instead of silently overwriting accounts/history with empty state.
+        raise RuntimeError(
+            f"拒绝重置无法读取的状态文件 {STATE}；请先检查/备份文件：{exc}"
+        ) from exc
     if not isinstance(old, dict):
-        old = {}
+        raise RuntimeError(
+            f"拒绝重置无效的状态文件 {STATE}：顶层 JSON 必须是对象"
+        )
     accounts = old.get("accounts") or ([] if not old.get("a") else [old["a"]])
     known = old.get("known_map") or old.get("known") or {}
     ids = old.get("ids") or {}
@@ -97,6 +104,10 @@ def load():
         # Persist the circuit-breaker timer across deploys/restarts.
         "api_pause_until": float(old.get("api_pause_until", 0) or 0),
         "api_pause_reason": str(old.get("api_pause_reason", "")),
+        "last_scan_at": float(old.get("last_scan_at", 0) or 0),
+        "last_scan_result": str(old.get("last_scan_result", "")),
+        "last_scan_ok_accounts": int(old.get("last_scan_ok_accounts", 0) or 0),
+        "last_scan_failed_accounts": int(old.get("last_scan_failed_accounts", 0) or 0),
     }
 
 
@@ -207,6 +218,12 @@ def clear_error(state, key):
     if isinstance(entry, dict) and entry.get("active"):
         entry["active"] = False
         entry["resolved_at"] = time.time()
+    # A recovered error should not be delivered later as a stale alert.
+    queue_key = f"error:{key}"
+    state["pending_notifications"] = [
+        item for item in state.setdefault("pending_notifications", [])
+        if not (isinstance(item, dict) and item.get("key") == queue_key)
+    ]
 
 
 def xapi(action, payload):
@@ -405,6 +422,9 @@ async def scan_all(state):
     results = await asyncio.gather(
         *(scan_one(name, state["ids"].get(name), sem) for name in list(state["accounts"]))
     )
+    state["last_scan_at"] = time.time()
+    state["last_scan_ok_accounts"] = sum(1 for _name, _current, _uid, exc in results if exc is None)
+    state["last_scan_failed_accounts"] = sum(1 for _name, _current, _uid, exc in results if exc is not None)
 
     # PLATFORM_HTTP_402 is explicitly non-transient. Stop the scan cycle before
     # changing baselines and pause future polls until a manual recheck.
@@ -417,6 +437,7 @@ async def scan_all(state):
         name, exc = billing_failure
         state["api_pause_until"] = time.time() + BILLING_PAUSE_SECONDS
         state["api_pause_reason"] = "PLATFORM_HTTP_402"
+        state["last_scan_result"] = "billing_blocked"
         save(state)
         report_limited_error(
             state,
@@ -436,6 +457,13 @@ async def scan_all(state):
     if any(exc is None for _name, _current, _uid, exc in results):
         state.pop("api_pause_until", None)
         state.pop("api_pause_reason", None)
+        clear_error(state, "xapi:billing-limit")
+
+    if not any(
+        exc is not None and "关注列表响应缺少 data 对象" in str(exc)
+        for _name, _current, _uid, exc in results
+    ):
+        clear_error(state, "xapi:missing-data")
 
     for name, current, uid, exc in results:
         error_key = f"query:{name}"
@@ -499,6 +527,16 @@ async def scan_all(state):
         save(state)
         print(f"SCAN_OK account=@{name} follows={len(now)} new={len(now - old)}", flush=True)
 
+    state["last_scan_result"] = (
+        "success" if state["last_scan_failed_accounts"] == 0 else "partial_error"
+    )
+    save(state)
+    print(
+        f"SCAN_SUMMARY result={state['last_scan_result']} "
+        f"ok={state['last_scan_ok_accounts']} failed={state['last_scan_failed_accounts']}",
+        flush=True,
+    )
+
 
 def start_monitor(state):
     """Enable monitoring without clearing the persisted follow baseline."""
@@ -530,6 +568,7 @@ async def main():
     state = load()
     notification_task = asyncio.create_task(notification_worker(state))
     scan_task, next_scan_at, retry_delay = None, 0.0, 5
+    scan_requested_after_current = False
     while True:
         try:
             result = await asyncio.to_thread(
@@ -588,10 +627,15 @@ async def main():
                                 scan_task = None
                             safe_send("监控已停止")
                         elif cmd == "/scan_now":
-                            next_scan_at = 0.0
                             state.pop("api_pause_until", None)
                             state.pop("api_pause_reason", None)
-                            safe_send("已安排立即扫描（如 API 额度仍不足，会再次暂停并保留历史名单）")
+                            print("COMMAND_RECEIVED command=/scan_now", flush=True)
+                            if scan_task and not scan_task.done():
+                                scan_requested_after_current = True
+                                safe_send("当前扫描结束后会立即再扫描一次")
+                            else:
+                                next_scan_at = 0.0
+                                safe_send("已安排立即扫描（如 API 额度仍不足，会再次暂停并保留历史名单）")
                         elif cmd == "/status":
                             task_state = "扫描中" if scan_task and not scan_task.done() else "等待中"
                             safe_send(
@@ -603,6 +647,10 @@ async def main():
                                 f"待发送通知：{len(state['pending_notifications'])}\n"
                                 + (f"API 暂停至：{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(state['api_pause_until']))}\n"
                                    if float(state.get("api_pause_until", 0) or 0) > time.time() else "")
+                                + (f"最近扫描：{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(state['last_scan_at']))}\n"
+                                   if float(state.get('last_scan_at', 0) or 0) > 0 else "最近扫描：暂无记录\n")
+                                + (f"扫描结果：{state['last_scan_result']}（成功 {state['last_scan_ok_accounts']} / 失败 {state['last_scan_failed_accounts']}）\n"
+                                   if state.get('last_scan_result') else "")
                                 + "数据源：xAPI.to"
                             )
                         elif cmd.startswith("/"):
@@ -618,7 +666,12 @@ async def main():
                 except Exception as exc:
                     report_limited_error(state, "scan-task", f"扫描任务失败：{str(exc)[:250]}")
                 scan_task = None
-                next_scan_at = time.monotonic() + INTERVAL
+                if scan_requested_after_current:
+                    next_scan_at = 0.0
+                    scan_requested_after_current = False
+                    print("SCAN_NOW_SCHEDULED reason=command_during_scan", flush=True)
+                else:
+                    next_scan_at = time.monotonic() + INTERVAL
 
             if (
                 state["running"]
