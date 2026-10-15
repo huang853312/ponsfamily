@@ -16,6 +16,7 @@ CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 INTERVAL = max(300, int(os.getenv("X_FOLLOW_INTERVAL", "1800")))
 MAX_CONCURRENCY = max(1, int(os.getenv("X_FOLLOW_CONCURRENCY", "3")))
 ERROR_COOLDOWN = max(600, int(os.getenv("X_FOLLOW_ERROR_COOLDOWN", "21600")))
+BILLING_PAUSE_SECONDS = max(1800, int(os.getenv("X_FOLLOW_BILLING_PAUSE", "21600")))
 FOLLOW_SEND_INTERVAL = max(3.0, float(os.getenv("X_FOLLOW_SEND_INTERVAL", "3")))
 MAX_FOLLOWING_PAGES = max(1, int(os.getenv("X_FOLLOW_MAX_PAGES", "100")))
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
@@ -260,6 +261,11 @@ def newest_following(name, cached_uid=None):
         if cursor:
             payload["cursor"] = cursor
         result = xapi("twitter.following", payload)
+        if isinstance(result, dict):
+            upstream_error = result.get("error")
+            if isinstance(upstream_error, dict) and upstream_error.get("code") == "PLATFORM_HTTP_402":
+                message = str(upstream_error.get("message") or "Insufficient balance or API Key limit exceeded")[:300]
+                raise RuntimeError(f"xAPI PLATFORM_HTTP_402: {message}")
         data = result.get("data") if isinstance(result, dict) else None
         if not isinstance(data, dict):
             keys = sorted(str(key) for key in result.keys())[:25] if isinstance(result, dict) else []
@@ -391,6 +397,38 @@ async def scan_all(state):
     results = await asyncio.gather(
         *(scan_one(name, state["ids"].get(name), sem) for name in list(state["accounts"]))
     )
+
+    # PLATFORM_HTTP_402 is explicitly non-transient. Stop the scan cycle before
+    # changing baselines and pause future polls until a manual recheck.
+    billing_failure = next(
+        ((name, exc) for name, _current, _uid, exc in results
+         if exc is not None and "PLATFORM_HTTP_402" in str(exc)),
+        None,
+    )
+    if billing_failure:
+        name, exc = billing_failure
+        state["api_pause_until"] = time.time() + BILLING_PAUSE_SECONDS
+        state["api_pause_reason"] = "PLATFORM_HTTP_402"
+        save(state)
+        report_limited_error(
+            state,
+            "xapi:billing-limit",
+            "xAPI.to 额度/余额不足或 API Key 请求限额已达到（PLATFORM_HTTP_402）。"
+            f"自动扫描已暂停 {BILLING_PAUSE_SECONDS // 3600} 小时，避免重复请求；"
+            "所有关注历史名单均已保留。请充值或提高 API Key limit 后发送 /scan_now 恢复检查。"
+            f"上游信息：{str(exc)[:250]}",
+        )
+        print(
+            f"XAPI_BILLING_PAUSE reason=PLATFORM_HTTP_402 "
+            f"account=@{name} pause_seconds={BILLING_PAUSE_SECONDS}",
+            flush=True,
+        )
+        return
+
+    if any(exc is None for _name, _current, _uid, exc in results):
+        state.pop("api_pause_until", None)
+        state.pop("api_pause_reason", None)
+
     for name, current, uid, exc in results:
         error_key = f"query:{name}"
         if exc is not None:
@@ -543,7 +581,9 @@ async def main():
                             safe_send("监控已停止")
                         elif cmd == "/scan_now":
                             next_scan_at = 0.0
-                            safe_send("已安排立即扫描")
+                            state.pop("api_pause_until", None)
+                            state.pop("api_pause_reason", None)
+                            safe_send("已安排立即扫描（如 API 额度仍不足，会再次暂停并保留历史名单）")
                         elif cmd == "/status":
                             task_state = "扫描中" if scan_task and not scan_task.done() else "等待中"
                             safe_send(
@@ -553,7 +593,9 @@ async def main():
                                 f"间隔：{INTERVAL} 秒\n"
                                 f"错误通知冷却：{ERROR_COOLDOWN} 秒\n"
                                 f"待发送通知：{len(state['pending_notifications'])}\n"
-                                "数据源：xAPI.to"
+                                + (f"API 暂停至：{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(state['api_pause_until']))}\n"
+                                   if float(state.get("api_pause_until", 0) or 0) > time.time() else "")
+                                + "数据源：xAPI.to"
                             )
                         elif cmd.startswith("/"):
                             safe_send("无法识别这个命令。\n\n" + help_text())
@@ -570,7 +612,13 @@ async def main():
                 scan_task = None
                 next_scan_at = time.monotonic() + INTERVAL
 
-            if state["running"] and state["accounts"] and scan_task is None and time.monotonic() >= next_scan_at:
+            if (
+                state["running"]
+                and state["accounts"]
+                and scan_task is None
+                and time.monotonic() >= next_scan_at
+                and time.time() >= float(state.get("api_pause_until", 0) or 0)
+            ):
                 scan_task = asyncio.create_task(scan_all(state))
             state["accounts"] = list(dict.fromkeys(state["accounts"]))
             save(state)

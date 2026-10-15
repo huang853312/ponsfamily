@@ -120,6 +120,38 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(summary["key"], "error:xapi:missing-data")
         self.assertEqual(summary["next_attempt_at"], 200)
 
+    def test_platform_402_response_becomes_clear_billing_error(self):
+        response = {
+            "success": False,
+            "error": {
+                "code": "PLATFORM_HTTP_402",
+                "message": "Insufficient balance or API Key limit exceeded",
+                "transient": False,
+            },
+        }
+        with patch.object(app, "resolve_id", return_value="123"), \
+             patch.object(app, "xapi", return_value=response):
+            with self.assertRaisesRegex(RuntimeError, "PLATFORM_HTTP_402"):
+                app.newest_following("fern", "123")
+
+    def test_platform_402_pauses_all_scans_and_preserves_baselines(self):
+        state = {
+            "accounts": ["fern", "other"], "running": True,
+            "known": {"fern": ["old1"], "other": ["old2"]},
+            "ids": {"fern": "1", "other": "2"}, "offset": 0,
+            "notified_follows": {}, "error_notices": {}, "pending_notifications": [],
+        }
+        failure = RuntimeError("xAPI PLATFORM_HTTP_402: Insufficient balance or API Key limit exceeded")
+        with patch.object(app, "newest_following", side_effect=[failure, failure]), \
+             patch.object(app, "save"):
+            asyncio.run(app.scan_all(state))
+        self.assertGreater(state["api_pause_until"], time.time())
+        self.assertEqual(state["api_pause_reason"], "PLATFORM_HTTP_402")
+        self.assertEqual(state["known"]["fern"], ["old1"])
+        self.assertEqual(state["known"]["other"], ["old2"])
+        queued = [x for x in state["pending_notifications"] if x.get("key") == "error:xapi:billing-limit"]
+        self.assertEqual(len(queued), 1)
+
     def test_missing_users_field_is_rejected(self):
         with patch.object(app, "resolve_id", return_value="123"), \
              patch.object(app, "xapi", return_value={"data": {"cursor_bottom": "cursor-1"}}):

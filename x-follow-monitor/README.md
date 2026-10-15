@@ -12,6 +12,7 @@ The service reads only \`/home/ubuntu/ponsfamily/x-follow-monitor/.env\`:
 - \`X_FOLLOW_INTERVAL=1800\` (optional; minimum 300 seconds)
 - \`X_FOLLOW_CONCURRENCY=3\` (optional)
 - \`X_FOLLOW_ERROR_COOLDOWN=21600\` (optional; repeated same-category errors are limited to one message per 6 hours)
+- \`X_FOLLOW_BILLING_PAUSE=21600\` (optional; a non-transient xAPI \`PLATFORM_HTTP_402\` pauses scans for 6 hours; \`/scan_now\` performs a manual recheck after credits/limits are adjusted)
 - \`X_FOLLOW_MAX_PAGES=100\` (optional; maximum cursor-paginated following pages accepted per account scan)
 
 ## Duplicate and false-alert protections
@@ -22,6 +23,7 @@ The service reads only \`/home/ubuntu/ponsfamily/x-follow-monitor/.env\`:
 - A relationship marker is removed only after a later successful complete scan confirms that the relationship is no longer present; a later re-follow can alert again.
 - Legacy state is migrated once: each monitored account's first complete paginated snapshot refreshes the baseline without alerts, preventing old single-page baselines from causing upgrade notification floods.
 - Missing `data` responses across monitored accounts are grouped into one alert; startup migration merges already queued per-account messages of the same class.
+- When xAPI returns \`PLATFORM_HTTP_402\` (balance insufficient or API key request limit reached), the monitor preserves baselines, sends one account-wide alert, pauses repeat requests, and can be manually rechecked with \`/scan_now\` after the xAPI balance/limit is fixed.
 - Response-shape failures log only top-level response keys and a redacted upstream error summary in `XAPI_RESPONSE_DIAGNOSTIC` records.
 - Diagnostic summaries redact API keys, tokens, authorization values, and secrets before logging.
 - All follow alerts and throttled error notices enter a durable outbound queue. The sender uses a conservative 3-second interval, honors Telegram 429 retry_after, and retries queued messages instead of treating rate-limited messages as delivered.
