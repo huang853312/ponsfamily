@@ -1,0 +1,67 @@
+name: Compare Saved and Active XAPI Key Fingerprints
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/check-xapi-key-fingerprint.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Configure SSH
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SERVER_SSH_KEY"
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$SERVER_SSH_KEY" > "$HOME/.ssh/deploy_key"
+          chmod 600 "$HOME/.ssh/deploy_key"
+          touch "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Compare fingerprints only
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          XAPI_KEY: ${{ secrets.XAPI_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SERVER_HOST"
+          test -n "$SERVER_PORT"
+          test -n "$SERVER_USER"
+          if [ -z "${XAPI_KEY:-}" ]; then
+            echo "saved_secret=absent"
+            exit 1
+          fi
+          saved_fp=$(printf '%s' "$XAPI_KEY" | sha256sum | cut -c1-12)
+          echo "saved_secret_fingerprint=$saved_fp"
+          SSH=(ssh -i "$HOME/.ssh/deploy_key" -p "$SERVER_PORT" -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30)
+          "${SSH[@]}" "$SERVER_USER@$SERVER_HOST" 'sudo python3 - <<'PY'
+          import hashlib
+          import re
+          from pathlib import Path
+          p = Path("/home/ubuntu/ponsfamily/x-follow-monitor/.env")
+          values = []
+          for line in p.read_text(encoding="utf-8").splitlines():
+              m = re.match(r"^\\s*XAPI_KEY\\s*=\\s*(.*?)\\s*$", line)
+              if m:
+                  value = m.group(1).strip()
+                  if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                      value = value[1:-1]
+                  values.append(value)
+          if len(values) != 1 or not values[0]:
+              raise SystemExit("active_key=unreadable_or_ambiguous")
+          print("active_server_fingerprint=" + hashlib.sha256(values[0].encode()).hexdigest()[:12])
+          PY
