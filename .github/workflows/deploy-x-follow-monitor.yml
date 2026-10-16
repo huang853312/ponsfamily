@@ -72,9 +72,85 @@ jobs:
           SERVER_PORT: ${{ secrets.SERVER_PORT }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
           RELEASE_SHA: ${{ github.sha }}
+          XAPI_KEY: ${{ secrets.XAPI_KEY }}
         run: |
           SSH="ssh -i $HOME/.ssh/deploy_key -p $SERVER_PORT -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30"
           RELEASE_DIR="/home/ubuntu/ponsfamily/.deploy/x-follow-monitor-$RELEASE_SHA"
+          set -euo pipefail
+          test -n "$XAPI_KEY"
+          # Stream the secret over SSH only; do not log or commit its value.
+          printf '%s' "$XAPI_KEY" | $SSH "$SERVER_USER@$SERVER_HOST" 'umask 077; cat > /tmp/x-follow-xapi-key'
+
+          SYNC_SCRIPT_B64=$(base64 -w0 <<'PY'
+          import hashlib, json, os, re, shutil, tempfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          root = Path("/home/ubuntu/ponsfamily/x-follow-monitor")
+          env_path, state_path = root / ".env", root / "state.json"
+          staged = Path("/tmp/x-follow-xapi-key")
+          try:
+              key = staged.read_text(encoding="utf-8").strip()
+          finally:
+              staged.unlink(missing_ok=True)
+          if not key or chr(10) in key or chr(13) in key:
+              raise SystemExit("xapi_sync=refused_invalid_secret")
+          env_text = env_path.read_text(encoding="utf-8")
+          state = json.loads(state_path.read_text(encoding="utf-8"))
+          if not isinstance(state, dict):
+              raise SystemExit("xapi_sync=refused_invalid_state")
+          matches = []
+          for line in env_text.splitlines():
+              m = re.match(r"^\\s*XAPI_KEY\\s*=\\s*(.*?)\\s*$", line)
+              if m:
+                  matches.append(m.group(1).strip().strip(chr(34)).strip(chr(39)))
+          if len(matches) != 1 or not matches[0]:
+              raise SystemExit("xapi_sync=refused_ambiguous_existing_key")
+          previous = matches[0]
+          stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+          env_backup = root / (".env.before_github_key_sync_" + stamp)
+          state_backup = root / ("state.json.before_github_key_sync_" + stamp)
+          shutil.copy2(env_path, env_backup)
+          shutil.copy2(state_path, state_backup)
+          os.chmod(env_backup, 0o600)
+          os.chmod(state_backup, 0o600)
+          output, replaced = [], False
+          for line in env_text.splitlines():
+              if re.match(r"^\\s*XAPI_KEY\\s*=", line):
+                  if not replaced:
+                      output.append("XAPI_KEY=" + key)
+                      replaced = True
+              else:
+                  output.append(line)
+          if not replaced:
+              raise SystemExit("xapi_sync=refused_missing_key_line")
+          state.pop("api_pause_until", None)
+          state.pop("api_pause_reason", None)
+          def atomic_write(path, data):
+              st = path.stat()
+              fd, temp = tempfile.mkstemp(prefix=".github-key-sync.", dir=str(path.parent))
+              try:
+                  os.fchmod(fd, st.st_mode & 0o777)
+                  os.fchown(fd, st.st_uid, st.st_gid)
+                  with os.fdopen(fd, "w", encoding="utf-8") as f:
+                      f.write(data)
+                      f.flush()
+                      os.fsync(f.fileno())
+                  os.replace(temp, path)
+              finally:
+                  if os.path.exists(temp):
+                      os.unlink(temp)
+          atomic_write(state_path, json.dumps(state, ensure_ascii=False, indent=2) + chr(10))
+          atomic_write(env_path, chr(10).join(output) + chr(10))
+          fp = lambda value: hashlib.sha256(value.encode()).hexdigest()[:12]
+          print("xapi_sync=complete")
+          print("previous_fingerprint=" + fp(previous))
+          print("active_fingerprint=" + fp(key))
+          print("billing_pause_cleared=true")
+          print("preserved_accounts=" + str(len(state.get("accounts") or [])))
+          print("backups=" + env_backup.name + "," + state_backup.name)
+          PY
+          )
 
           $SSH "$SERVER_USER@$SERVER_HOST" "
             set -eu
@@ -100,6 +176,8 @@ jobs:
 
             rsync -a --delete               --exclude='state.json'               --exclude='.env'               --exclude='node_modules/'               --exclude='*.backup.*'               --exclude='__pycache__/'               --exclude='*.pyc'               '$RELEASE_DIR/' \"\$TARGET/\"
 
+            echo '$SYNC_SCRIPT_B64' | base64 -d | sudo python3
+
             cd \"\$TARGET\"
             python3 -m py_compile app.py test_app.py
             python3 -m unittest -v
@@ -110,7 +188,7 @@ jobs:
             sudo systemctl reset-failed x-follow-monitor.service
             sudo systemctl start x-follow-monitor.service
 
-            sleep 15
+            sleep 35
 
             sudo systemctl is-active --quiet x-follow-monitor.service
             main_pid=\$(sudo systemctl show x-follow-monitor.service -p MainPID --value)
@@ -121,6 +199,6 @@ jobs:
             test \"\$result\" = success
             printf 'active=active pid=%s result=%s restarts=%s\n' \"\$main_pid\" \"\$result\" \"\$restarts\"
 
-            sudo journalctl -u x-follow-monitor.service --since '2 minutes ago' --no-pager
+            sudo journalctl -u x-follow-monitor.service --since '3 minutes ago' --no-pager | grep -E 'SCAN_SUMMARY|XAPI_BILLING_PAUSE|XAPI_RESPONSE_DIAGNOSTIC|Traceback|ERROR|Telegram' | tail -n 40 || true
             rm -rf '$RELEASE_DIR'
           "
