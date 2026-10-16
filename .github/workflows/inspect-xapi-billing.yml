@@ -1,0 +1,120 @@
+name: Inspect XAPI Billing for X Follow Monitor
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/inspect-xapi-billing.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Configure SSH
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SERVER_SSH_KEY"
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$SERVER_SSH_KEY" | tr -d '\r' > "$HOME/.ssh/deploy_key"
+          chmod 600 "$HOME/.ssh/deploy_key"
+          touch "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Read billing state and safely probe xAPI account balance
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SERVER_HOST"
+          test -n "$SERVER_PORT"
+          test -n "$SERVER_USER"
+          SSH="ssh -i $HOME/.ssh/deploy_key -p $SERVER_PORT -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20"
+          $SSH "$SERVER_USER@$SERVER_HOST" 'sudo python3 -' <<'PY'
+          import hashlib, json, os, re, subprocess, time
+          from pathlib import Path
+
+          root = Path("/home/ubuntu/ponsfamily/x-follow-monitor")
+          envp = root / ".env"
+          statep = root / "state.json"
+          if not envp.is_file():
+              raise SystemExit("billing_probe=stopped_env_missing")
+          cfg = {}
+          for line in envp.read_text(encoding="utf-8", errors="ignore").splitlines():
+              line = line.strip()
+              if line and not line.startswith("#") and "=" in line:
+                  k, v = line.split("=", 1)
+                  cfg[k.strip()] = v.strip().strip('"').strip("'")
+          key = cfg.get("XAPI_KEY", "")
+          if not key:
+              raise SystemExit("billing_probe=stopped_xapi_key_missing")
+          print("active_key_fingerprint=" + hashlib.sha256(key.encode()).hexdigest()[:12])
+          print("key_present=true")
+          try:
+              state = json.loads(statep.read_text(encoding="utf-8"))
+              print("monitored_accounts=" + str(len(state.get("accounts") or [])))
+              print("last_scan_result=" + str(state.get("last_scan_result") or "none"))
+              print("last_scan_ok=" + str(state.get("last_scan_ok_accounts", 0)))
+              print("last_scan_failed=" + str(state.get("last_scan_failed_accounts", 0)))
+              print("api_pause_reason=" + str(state.get("api_pause_reason") or "none"))
+              print("api_pause_active=" + str(float(state.get("api_pause_until", 0) or 0) > time.time()).lower())
+          except Exception as exc:
+              print("state_read_error=" + type(exc).__name__)
+
+          cli = root / "node_modules" / ".bin" / "xapi-to"
+          if not cli.is_file():
+              raise SystemExit("billing_probe=stopped_xapi_cli_missing")
+          base_env = dict(os.environ)
+          base_env["XAPI_KEY"] = key
+          base_env.pop("XAPI_API_KEY", None)
+          for name, args in (
+              ("account_balance", [str(cli), "balance"]),
+              ("api_key_health", [str(cli), "config", "health"]),
+          ):
+              try:
+                  p = subprocess.run(args, cwd=str(root), env=base_env, capture_output=True,
+                                     text=True, timeout=35, check=False)
+                  raw = (p.stdout or "") + "\n" + (p.stderr or "")
+                  # The xAPI key must never appear in emitted logs.
+                  raw = raw.replace(key, "<redacted>")
+                  raw = re.sub(r"(?i)(sk-xapi-[A-Za-z0-9_-]+)", "<redacted-key>", raw)
+                  print(name + "_exit=" + str(p.returncode))
+                  try:
+                      payload = json.loads(raw.strip())
+                      # Emit only billing/connectivity fields from the response.
+                      selected = {}
+                      def walk(obj, prefix=""):
+                          if isinstance(obj, dict):
+                              for k, v in obj.items():
+                                  path = (prefix + "." + str(k)).strip(".")
+                                  if any(t in str(k).lower() for t in (
+                                      "balance", "limit", "credit", "usage", "remaining",
+                                      "available", "status", "error", "success", "message", "code"
+                                  )):
+                                      selected[path] = v if not isinstance(v, (dict, list)) else type(v).__name__
+                                  if isinstance(v, dict):
+                                      walk(v, path)
+                          elif isinstance(obj, list):
+                              for i, v in enumerate(obj[:10]):
+                                  if isinstance(v, dict):
+                                      walk(v, prefix + "[" + str(i) + "]")
+                      walk(payload)
+                      print(name + "_fields=" + json.dumps(selected, ensure_ascii=False)[:2500])
+                  except Exception:
+                      print(name + "_response=" + raw.strip()[:1500].replace("\n", " "))
+              except subprocess.TimeoutExpired:
+                  print(name + "_result=timeout")
+              except Exception as exc:
+                  print(name + "_exception=" + type(exc).__name__)
+          PY
