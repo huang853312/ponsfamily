@@ -1,0 +1,51 @@
+name: Recover X Follow Monitor Service
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/recover-x-follow-monitor-service.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Configure SSH
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SERVER_SSH_KEY"
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$SERVER_SSH_KEY" > "$HOME/.ssh/deploy_key"
+          chmod 600 "$HOME/.ssh/deploy_key"
+          touch "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Start only X follow monitor
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SERVER_HOST"
+          test -n "$SERVER_PORT"
+          test -n "$SERVER_USER"
+          ssh -i "$HOME/.ssh/deploy_key" -p "$SERVER_PORT" -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 "$SERVER_USER@$SERVER_HOST" '
+            set -eu
+            sudo systemctl start x-follow-monitor.service
+            sleep 5
+            sudo systemctl is-active --quiet x-follow-monitor.service
+            printf "service="
+            sudo systemctl is-active x-follow-monitor.service
+            sudo systemctl show x-follow-monitor.service -p MainPID -p Result -p NRestarts --no-pager
+          '
