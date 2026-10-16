@@ -49,6 +49,7 @@ jobs:
           import hashlib
           import json
           import time
+          import subprocess
           from pathlib import Path
           from urllib import parse, request, error
 
@@ -85,6 +86,46 @@ jobs:
           print("scan_failed_accounts=" + str(state.get("last_scan_failed_accounts", 0)))
           print("api_pause_reason=" + str(state.get("api_pause_reason") or "none"))
           print("api_pause_active=" + str(float(state.get("api_pause_until", 0) or 0) > time.time()).lower())
+          # Check the credentials the live process already has in memory (do not print values).
+          try:
+              pid = subprocess.run(
+                  ["systemctl", "show", "x-follow-monitor.service", "-p", "MainPID", "--value"],
+                  capture_output=True, text=True, timeout=10
+              ).stdout.strip()
+              runtime = {}
+              for item in Path("/proc/" + pid + "/environ").read_bytes().split(bytes([0])):
+                  if b"=" in item:
+                      k, v = item.split(b"=", 1)
+                      runtime[k.decode(errors="ignore")] = v.decode(errors="ignore")
+              runtime_token = runtime.get("TELEGRAM_BOT_TOKEN", "")
+              runtime_chat = runtime.get("TELEGRAM_CHAT_ID", "")
+              print("runtime_telegram_token_present=" + str(bool(runtime_token)).lower())
+              if runtime_token:
+                  me_runtime, _err_runtime = call_for_token(runtime_token, "getMe") if "call_for_token" in globals() else ({}, None)
+                  if not me_runtime:
+                      runtime_url = "https://api.telegram.org/bot" + runtime_token + "/getMe"
+                      runtime_req = request.Request(runtime_url, data=b"", method="POST")
+                      try:
+                          with request.urlopen(runtime_req, timeout=12) as response:
+                              me_runtime = json.loads(response.read().decode())
+                      except Exception:
+                          me_runtime = {}
+                  runtime_user = ((me_runtime.get("result") or {}).get("username", "") if me_runtime.get("ok") else "")
+                  print("runtime_telegram_bot=@" + runtime_user if runtime_user else "runtime_telegram_get_me=failed")
+                  print("runtime_telegram_token_fingerprint=" + hashlib.sha256(runtime_token.encode()).hexdigest()[:12])
+                  if runtime_chat:
+                      chat_url = "https://api.telegram.org/bot" + runtime_token + "/getChat"
+                      chat_req = request.Request(chat_url, data=parse.urlencode({"chat_id": runtime_chat}).encode(), method="POST")
+                      try:
+                          with request.urlopen(chat_req, timeout=12) as response:
+                              chat_result = json.loads(response.read().decode())
+                      except Exception:
+                          chat_result = {}
+                      print("runtime_telegram_chat=" + ("ok" if chat_result.get("ok") else "failed"))
+                      print("runtime_telegram_chat_fingerprint=" + hashlib.sha256(runtime_chat.encode()).hexdigest()[:10])
+          except Exception as exc:
+              print("runtime_telegram_env_check=failed:" + type(exc).__name__)
+
           # Only inspect legacy staging/backups belonging to this X follow monitor.
           legacy_paths = [Path("/tmp/x-follow-xapi.env"), Path("/var/tmp/x-follow-xapi.env")]
           try:
