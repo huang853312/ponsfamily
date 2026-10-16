@@ -78,7 +78,6 @@ jobs:
           rsync -az --delete \
             --exclude='state.json' \
             --exclude='node_modules/' --exclude='.venv/' \
-            --exclude='.venv/' \
             --exclude='*.backup.*' \
             --exclude='__pycache__/' \
             --exclude='*.pyc' \
@@ -108,7 +107,7 @@ jobs:
           found = {}
           sources = {}
           candidates = [
-              # Staged GitHub Actions key must take precedence over the server's old XAPI_KEY.
+              # Staged GitHub Actions key must take precedence over the server old XAPI_KEY.
               Path("/tmp/x-follow-xapi.env"),
               target,
               Path("/home/ubuntu/ponsfamily/.env"),
