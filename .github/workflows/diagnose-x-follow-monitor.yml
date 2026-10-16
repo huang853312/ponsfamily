@@ -1,4 +1,4 @@
-name: Diagnose X Follow Monitor Notifications
+name: Recover X Follow Monitor Config
 
 on:
   push:
@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 jobs:
-  diagnose:
+  recover:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
@@ -24,12 +24,12 @@ jobs:
           set -euo pipefail
           test -n "$SERVER_SSH_KEY"
           install -d -m 700 "$HOME/.ssh"
-          printf '%s\n' "$SERVER_SSH_KEY" > "$HOME/.ssh/deploy_key"
+          printf '%s\\n' "$SERVER_SSH_KEY" > "$HOME/.ssh/deploy_key"
           chmod 600 "$HOME/.ssh/deploy_key"
           touch "$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/known_hosts"
 
-      - name: Read monitor state and test Telegram delivery
+      - name: Rebuild private config and test a real scan
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_PORT: ${{ secrets.SERVER_PORT }}
@@ -42,146 +42,32 @@ jobs:
           test -n "$SERVER_PORT"
           test -n "$SERVER_USER"
           test -n "$XAPI_KEY"
-          saved_fp=$(printf '%s' "$XAPI_KEY" | sha256sum | cut -c1-12)
-          echo "saved_secret_fingerprint=$saved_fp"
-          SSH=(ssh -i "$HOME/.ssh/deploy_key" -p "$SERVER_PORT" -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30)
-          DIAG_B64=$(base64 -w0 <<'PY'
+          SSH="ssh -i $HOME/.ssh/deploy_key -p $SERVER_PORT -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30"
+          { printf 'XAPI_KEY='; printf '%s' "$XAPI_KEY"; printf '\\n'; } | $SSH "$SERVER_USER@$SERVER_HOST" 'umask 077; cat > /tmp/x-follow-xapi.env'
+
+          $SSH "$SERVER_USER@$SERVER_HOST" 'sudo python3 -' <<'PY'
           import hashlib
           import json
-          import time
+          import os
+          import pwd
+          import shutil
           import subprocess
+          import tempfile
+          import time
+          from datetime import datetime, timezone
           from pathlib import Path
           from urllib import parse, request, error
 
           root = Path("/home/ubuntu/ponsfamily/x-follow-monitor")
           env_path = root / ".env"
-          cfg = {}
-          if env_path.is_file():
-              for line in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
-                  line = line.strip()
-                  if line and not line.startswith("#") and "=" in line:
-                      k, v = line.split("=", 1)
-                      cfg[k.strip()] = v.strip().strip('"').strip("'")
-          else:
-              print("monitor_env=missing")
+          state_path = root / "state.json"
+          staged_path = Path("/tmp/x-follow-xapi.env")
 
-          token, chat = cfg.get("TELEGRAM_BOT_TOKEN", ""), cfg.get("TELEGRAM_CHAT_ID", "")
-          key = cfg.get("XAPI_KEY", "")
-          state = {}
-          try:
-              state = json.loads((root / "state.json").read_text(encoding="utf-8"))
-          except Exception as exc:
-              print("state_read=failed:" + type(exc).__name__)
-
-          print("xapi_key_present=" + str(bool(key)).lower())
-          if key:
-              print("xapi_key_fingerprint=" + hashlib.sha256(key.encode()).hexdigest()[:12])
-          print("accounts_count=" + str(len(state.get("accounts") or [])))
-          print("monitor_running=" + str(bool(state.get("running"))).lower())
-          print("pending_notifications=" + str(len(state.get("pending_notifications") or [])))
-          print("last_scan_result=" + str(state.get("last_scan_result") or "none"))
-          last = float(state.get("last_scan_at", 0) or 0)
-          print("last_scan_epoch=" + (str(int(last)) if last else "none"))
-          print("scan_ok_accounts=" + str(state.get("last_scan_ok_accounts", 0)))
-          print("scan_failed_accounts=" + str(state.get("last_scan_failed_accounts", 0)))
-          print("api_pause_reason=" + str(state.get("api_pause_reason") or "none"))
-          print("api_pause_active=" + str(float(state.get("api_pause_until", 0) or 0) > time.time()).lower())
-          # Check the credentials the live process already has in memory (do not print values).
-          try:
-              pid = subprocess.run(
-                  ["systemctl", "show", "x-follow-monitor.service", "-p", "MainPID", "--value"],
-                  capture_output=True, text=True, timeout=10
-              ).stdout.strip()
-              runtime = {}
-              for item in Path("/proc/" + pid + "/environ").read_bytes().split(bytes([0])):
-                  if b"=" in item:
-                      k, v = item.split(b"=", 1)
-                      runtime[k.decode(errors="ignore")] = v.decode(errors="ignore")
-              runtime_token = runtime.get("TELEGRAM_BOT_TOKEN", "")
-              runtime_chat = runtime.get("TELEGRAM_CHAT_ID", "")
-              print("runtime_telegram_token_present=" + str(bool(runtime_token)).lower())
-              if runtime_token:
-                  me_runtime, _err_runtime = call_for_token(runtime_token, "getMe") if "call_for_token" in globals() else ({}, None)
-                  if not me_runtime:
-                      runtime_url = "https://api.telegram.org/bot" + runtime_token + "/getMe"
-                      runtime_req = request.Request(runtime_url, data=b"", method="POST")
-                      try:
-                          with request.urlopen(runtime_req, timeout=12) as response:
-                              me_runtime = json.loads(response.read().decode())
-                      except Exception:
-                          me_runtime = {}
-                  runtime_user = ((me_runtime.get("result") or {}).get("username", "") if me_runtime.get("ok") else "")
-                  print("runtime_telegram_bot=@" + runtime_user if runtime_user else "runtime_telegram_get_me=failed")
-                  print("runtime_telegram_token_fingerprint=" + hashlib.sha256(runtime_token.encode()).hexdigest()[:12])
-                  if runtime_chat:
-                      chat_url = "https://api.telegram.org/bot" + runtime_token + "/getChat"
-                      chat_req = request.Request(chat_url, data=parse.urlencode({"chat_id": runtime_chat}).encode(), method="POST")
-                      try:
-                          with request.urlopen(chat_req, timeout=12) as response:
-                              chat_result = json.loads(response.read().decode())
-                      except Exception:
-                          chat_result = {}
-                      print("runtime_telegram_chat=" + ("ok" if chat_result.get("ok") else "failed"))
-                      print("runtime_telegram_chat_fingerprint=" + hashlib.sha256(runtime_chat.encode()).hexdigest()[:10])
-          except Exception as exc:
-              print("runtime_telegram_env_check=failed:" + type(exc).__name__)
-
-          # Only inspect legacy staging/backups belonging to this X follow monitor.
-          legacy_paths = [Path("/tmp/x-follow-xapi.env"), Path("/var/tmp/x-follow-xapi.env")]
-          try:
-              legacy_paths.extend(p for p in root.glob(".env*") if p != (root / ".env") and p.is_file())
-          except OSError:
-              pass
-          seen_paths, old_keys = set(), {}
-          for path in legacy_paths:
-              try:
-                  resolved = path.resolve()
-                  if resolved in seen_paths or not resolved.is_file() or resolved.stat().st_size > 100000:
-                      continue
-                  seen_paths.add(resolved)
-                  values = []
-                  for line in resolved.read_text(encoding="utf-8", errors="ignore").splitlines():
-                      value_line = line.strip()
-                      if value_line.startswith("XAPI_KEY="):
-                          val = value_line.split("=", 1)[1].strip().strip(chr(34)).strip(chr(39))
-                          if val:
-                              values.append(val)
-                  if len(values) == 1 and values[0] and values[0] != key:
-                      old_keys.setdefault(values[0], []).append(path.name)
-              except (OSError, RuntimeError):
-                  pass
-          print("distinct_legacy_key_candidates=" + str(len(old_keys)))
-          for old_value, sources in old_keys.items():
-              old_fp = hashlib.sha256(old_value.encode()).hexdigest()[:12]
-              print("legacy_key_fingerprint=" + old_fp + " sources=" + ",".join(sorted(set(sources))))
-
-          def call(method, payload=None):
+          def api(token, method, payload=None):
               url = "https://api.telegram.org/bot" + token + "/" + method
-              body = parse.urlencode(payload or {}).encode()
-              req = request.Request(url, data=body, method="POST")
+              req = request.Request(url, data=parse.urlencode(payload or {}).encode(), method="POST")
               try:
-                  with request.urlopen(req, timeout=20) as response:
-                      result = json.loads(response.read().decode())
-                      return result, None
-              except error.HTTPError as exc:
-                  try:
-                      result = json.loads(exc.read().decode())
-                      return result, None
-                  except Exception:
-                      return {}, "http_" + str(exc.code)
-              except Exception as exc:
-                  return {}, type(exc).__name__
-
-          # Search only backups belonging to this X monitor; never print credentials.
-          backup_paths = list(root.glob(".env*")) + list(root.glob("*.env*"))
-          backup_paths += [Path("/tmp/x-follow-monitor.env"), Path("/var/tmp/x-follow-monitor.env")]
-
-          def call_for_token(candidate_token, method, payload=None):
-              url = "https://api.telegram.org/bot" + candidate_token + "/" + method
-              body = parse.urlencode(payload or {}).encode()
-              req = request.Request(url, data=body, method="POST")
-              try:
-                  with request.urlopen(req, timeout=12) as response:
+                  with request.urlopen(req, timeout=15) as response:
                       return json.loads(response.read().decode())
               except error.HTTPError as exc:
                   try:
@@ -191,62 +77,144 @@ jobs:
               except Exception:
                   return {}
 
-          seen_backup_paths, seen_backup_tokens = set(), set()
-          for backup_path in backup_paths:
+          if not state_path.is_file():
+              raise SystemExit("recovery=stopped_state_missing")
+          try:
+              state = json.loads(state_path.read_text(encoding="utf-8"))
+          except (OSError, json.JSONDecodeError):
+              raise SystemExit("recovery=stopped_state_invalid")
+          if not isinstance(state, dict):
+              raise SystemExit("recovery=stopped_state_invalid")
+
+          staged_text = staged_path.read_text(encoding="utf-8")
+          staged_path.unlink(missing_ok=True)
+          keys = []
+          for row in staged_text.splitlines():
+              if "=" in row and row.split("=", 1)[0].strip() == "XAPI_KEY":
+                  keys.append(row.split("=", 1)[1].strip())
+          if len(keys) != 1 or not keys[0] or chr(10) in keys[0] or chr(13) in keys[0]:
+              raise SystemExit("recovery=stopped_invalid_key")
+          new_key = keys[0]
+
+          pid = subprocess.run(
+              ["systemctl", "show", "x-follow-monitor.service", "-p", "MainPID", "--value"],
+              capture_output=True, text=True, timeout=10
+          ).stdout.strip()
+          if not pid or pid == "0":
+              raise SystemExit("recovery=stopped_live_process_missing")
+          try:
+              raw_env = Path("/proc/" + pid + "/environ").read_bytes()
+          except OSError:
+              raise SystemExit("recovery=stopped_live_environment_unreadable")
+          live = {}
+          for item in raw_env.split(bytes([0])):
+              if b"=" in item:
+                  k, v = item.split(b"=", 1)
+                  live[k.decode(errors="ignore")] = v.decode(errors="ignore")
+          token = live.get("TELEGRAM_BOT_TOKEN", "")
+          chat_id = live.get("TELEGRAM_CHAT_ID", "")
+          if not token or not chat_id:
+              raise SystemExit("recovery=stopped_telegram_config_missing")
+          me = api(token, "getMe")
+          username = str((me.get("result") or {}).get("username", "")).lower() if me.get("ok") else ""
+          if username != "xfollow_monitor_alert_bot":
+              raise SystemExit("recovery=stopped_wrong_bot")
+          chat = api(token, "getChat", {"chat_id": chat_id})
+          if not chat.get("ok"):
+              raise SystemExit("recovery=stopped_chat_validation_failed")
+
+          cfg = {}
+          if env_path.is_file():
+              for row in env_path.read_text(encoding="utf-8").splitlines():
+                  row = row.strip()
+                  if row and not row.startswith("#") and "=" in row:
+                      k, v = row.split("=", 1)
+                      cfg[k.strip()] = v.strip().strip(chr(34)).strip(chr(39))
+          previous_key = cfg.get("XAPI_KEY", "")
+          stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+          if env_path.is_file():
+              backup_env = root / (".env.before_recovery_" + stamp)
+              shutil.copy2(env_path, backup_env)
+              os.chmod(backup_env, 0o600)
+          backup_state = root / ("state.json.before_recovery_" + stamp)
+          shutil.copy2(state_path, backup_state)
+          os.chmod(backup_state, 0o600)
+
+          cfg["TELEGRAM_BOT_TOKEN"] = token
+          cfg["TELEGRAM_CHAT_ID"] = chat_id
+          cfg["XAPI_KEY"] = new_key
+          state.pop("api_pause_until", None)
+          state.pop("api_pause_reason", None)
+
+          def atomic_write(path, body, mode, uid, gid):
+              fd, tmp = tempfile.mkstemp(prefix=".recover.", dir=str(path.parent))
               try:
-                  resolved = backup_path.resolve()
-                  if resolved in seen_backup_paths or not resolved.is_file() or resolved.stat().st_size > 100000:
-                      continue
-                  seen_backup_paths.add(resolved)
-                  backup_text = resolved.read_text(encoding="utf-8", errors="ignore")
-              except (OSError, RuntimeError):
-                  continue
-              backup_cfg = {}
-              for backup_line in backup_text.splitlines():
-                  line = backup_line.strip()
-                  if line and not line.startswith("#") and "=" in line:
-                      bk, bv = line.split("=", 1)
-                      backup_cfg[bk.strip()] = bv.strip().strip(chr(34)).strip(chr(39))
-              backup_token = backup_cfg.get("TELEGRAM_BOT_TOKEN", "")
-              backup_chat = backup_cfg.get("TELEGRAM_CHAT_ID", "")
-              if not backup_token or backup_token == token or backup_token in seen_backup_tokens:
-                  continue
-              seen_backup_tokens.add(backup_token)
-              candidate = call_for_token(backup_token, "getMe")
-              candidate_result = candidate.get("result") or {}
-              candidate_user = candidate_result.get("username", "") if candidate.get("ok") else ""
-              if candidate_user:
-                  print("telegram_backup_candidate file=" + backup_path.name
-                        + " bot=@" + candidate_user
-                        + " token_fingerprint=" + hashlib.sha256(backup_token.encode()).hexdigest()[:12])
-                  if backup_chat:
-                      chat_result = call_for_token(backup_token, "getChat", {"chat_id": backup_chat})
-                      print("telegram_backup_chat=" + ("ok" if chat_result.get("ok") else "failed")
-                            + " chat_fingerprint=" + hashlib.sha256(backup_chat.encode()).hexdigest()[:10])
+                  os.fchmod(fd, mode)
+                  os.fchown(fd, uid, gid)
+                  with os.fdopen(fd, "w", encoding="utf-8") as out:
+                      out.write(body)
+                      out.flush()
+                      os.fsync(out.fileno())
+                  os.replace(tmp, path)
+              finally:
+                  if os.path.exists(tmp):
+                      os.unlink(tmp)
 
-          if not token or not chat:
-              print("telegram_config=missing")
-          else:
-              me, me_err = call("getMe")
-              print("telegram_get_me=" + ("ok" if me.get("ok") else "failed:" + str(me_err or me.get("error_code") or "api_error")))
-              if me.get("ok"):
-                  print("telegram_bot_username=@" + str((me.get("result") or {}).get("username", "unknown")))
-              ch, ch_err = call("getChat", {"chat_id": chat})
-              print("telegram_target_chat=" + ("ok" if ch.get("ok") else "failed:" + str(ch_err or ch.get("error_code") or "api_error")))
-              wh, wh_err = call("getWebhookInfo")
-              print("telegram_webhook_enabled=" + str(bool(((wh.get("result") or {}).get("url")))).lower() if wh.get("ok") else "telegram_webhook_check=failed:" + str(wh_err or wh.get("error_code") or "api_error"))
-              print("telegram_send_test_skipped=true")
+          owner = pwd.getpwnam("ubuntu")
+          old_state_stat = state_path.stat()
+          atomic_write(state_path, json.dumps(state, ensure_ascii=False, indent=2) + chr(10),
+                       old_state_stat.st_mode & 0o777, old_state_stat.st_uid, old_state_stat.st_gid)
+          env_body = "".join(k + "=" + v + chr(10) for k, v in cfg.items())
+          atomic_write(env_path, env_body, 0o600, owner.pw_uid, owner.pw_gid)
 
+          fp = lambda value: hashlib.sha256(value.encode()).hexdigest()[:12]
+          print("config_recovery=restored")
+          print("telegram_bot=@" + username)
+          print("telegram_chat=validated")
+          print("previous_xapi_fingerprint=" + (fp(previous_key) if previous_key else "none"))
+          print("active_xapi_fingerprint=" + fp(new_key))
+          print("accounts_preserved=" + str(len(state.get("accounts") or [])))
+          print("billing_pause_cleared=true")
+          sent = api(token, "sendMessage", {
+              "chat_id": chat_id,
+              "text": "X关注监控：专属配置已恢复，正在重新扫描。"
+          })
+          print("telegram_test_message=" + ("sent" if sent.get("ok") else "failed"))
+
+          subprocess.run(["systemctl", "restart", "x-follow-monitor.service"], check=True)
+          active = ""
+          for attempt in range(15):
+              active = subprocess.run(["systemctl", "is-active", "x-follow-monitor.service"],
+                                      capture_output=True, text=True).stdout.strip()
+              if active == "active":
+                  break
+              time.sleep(2)
+          print("service=" + active)
+          if active != "active":
+              raise SystemExit("recovery=service_not_active")
+
+          previous_scan = float(state.get("last_scan_at", 0) or 0)
+          final_state = state
+          deadline = time.time() + 110
+          while time.time() < deadline:
+              time.sleep(2)
+              try:
+                  latest = json.loads(state_path.read_text(encoding="utf-8"))
+                  if isinstance(latest, dict):
+                      final_state = latest
+                      if float(latest.get("last_scan_at", 0) or 0) > previous_scan:
+                          break
+              except (OSError, json.JSONDecodeError):
+                  pass
+          print("last_scan_result=" + str(final_state.get("last_scan_result") or "none"))
+          print("scan_ok_accounts=" + str(final_state.get("last_scan_ok_accounts", 0)))
+          print("scan_failed_accounts=" + str(final_state.get("last_scan_failed_accounts", 0)))
+          print("pending_notifications=" + str(len(final_state.get("pending_notifications") or [])))
+          print("api_pause_reason=" + str(final_state.get("api_pause_reason") or "none"))
+          print("scan_updated_after_restart=" + str(float(final_state.get("last_scan_at", 0) or 0) > previous_scan).lower())
+          logs = subprocess.run(["journalctl", "-u", "x-follow-monitor.service", "--since", "3 minutes ago", "--no-pager"],
+                                capture_output=True, text=True)
+          for row in logs.stdout.splitlines():
+              if any(tag in row for tag in ("SCAN_SUMMARY", "XAPI_BILLING_PAUSE", "NOTICE_SENT", "Traceback", "ERROR")):
+                  print(row[-500:])
           PY
-          )
-          "${SSH[@]}" "$SERVER_USER@$SERVER_HOST" "
-            set -eu
-            printf 'service_active='
-            sudo systemctl is-active x-follow-monitor.service || true
-            sudo systemctl show x-follow-monitor.service -p MainPID -p Result -p NRestarts --no-pager
-            echo '$DIAG_B64' | base64 -d | sudo python3
-            echo '--- recent service events ---'
-            sudo journalctl -u x-follow-monitor.service --since '90 minutes ago' --no-pager |
-              grep -E 'COMMAND_RECEIVED|SCAN_SUMMARY|XAPI_BILLING_PAUSE|XAPI_RESPONSE_DIAGNOSTIC|Telegram|notification|ERROR|Traceback' |
-              tail -n 80 || true
-          "
