@@ -11,7 +11,7 @@ on:
 
 concurrency:
   group: deploy-x-follow-monitor-production
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: read
