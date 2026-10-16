@@ -1,0 +1,88 @@
+name: Read-only X Follow Recovery Check
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/check-x-follow-recovery.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Configure SSH
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SERVER_SSH_KEY"
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$SERVER_SSH_KEY" | tr -d '\r' > "$HOME/.ssh/deploy_key"
+          chmod 600 "$HOME/.ssh/deploy_key"
+          touch "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Read X monitor config and state without changing anything
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SSH="ssh -i $HOME/.ssh/deploy_key -p $SERVER_PORT -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20"
+          $SSH "$SERVER_USER@$SERVER_HOST" 'sudo python3 -' <<'PY'
+          import hashlib, json, subprocess, time
+          from pathlib import Path
+          root=Path("/home/ubuntu/ponsfamily/x-follow-monitor")
+          envp=root/".env"
+          print("env_file_exists="+str(envp.is_file()).lower())
+          if envp.is_file():
+              cfg={}
+              for line in envp.read_text(encoding="utf-8",errors="ignore").splitlines():
+                  if "=" in line and not line.lstrip().startswith("#"):
+                      k,v=line.split("=",1)
+                      cfg[k.strip()]=v.strip().strip(chr(34)).strip(chr(39))
+              for name in ("TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID","XAPI_KEY"):
+                  value=cfg.get(name,"")
+                  print(name.lower()+"_present="+str(bool(value)).lower())
+                  if value:
+                      print(name.lower()+"_fingerprint="+hashlib.sha256(value.encode()).hexdigest()[:12])
+          try:
+              s=json.loads((root/"state.json").read_text(encoding="utf-8"))
+              print("accounts="+str(len(s.get("accounts") or [])))
+              print("running_flag="+str(bool(s.get("running"))).lower())
+              print("last_scan_result="+str(s.get("last_scan_result") or "none"))
+              print("scan_ok="+str(s.get("last_scan_ok_accounts",0)))
+              print("scan_failed="+str(s.get("last_scan_failed_accounts",0)))
+              print("api_pause_reason="+str(s.get("api_pause_reason") or "none"))
+              print("api_pause_active="+str(float(s.get("api_pause_until",0) or 0)>time.time()).lower())
+              print("pending_notifications="+str(len(s.get("pending_notifications") or [])))
+          except Exception as exc:
+              print("state_read_failed="+type(exc).__name__)
+          for prop in ("ActiveState","MainPID","Result","NRestarts"):
+              out=subprocess.run(["systemctl","show","x-follow-monitor.service","-p",prop,"--value"],capture_output=True,text=True)
+              print("service_"+prop.lower()+"="+out.stdout.strip())
+          pid=subprocess.run(["systemctl","show","x-follow-monitor.service","-p","MainPID","--value"],capture_output=True,text=True).stdout.strip()
+          if pid and pid!="0":
+              try:
+                  runtime={}
+                  for item in Path("/proc/"+pid+"/environ").read_bytes().split(bytes([0])):
+                      if b"=" in item:
+                          k,v=item.split(b"=",1)
+                          runtime[k.decode(errors="ignore")]=v.decode(errors="ignore")
+                  token=runtime.get("TELEGRAM_BOT_TOKEN","")
+                  chat=runtime.get("TELEGRAM_CHAT_ID","")
+                  print("runtime_telegram_token_present="+str(bool(token)).lower())
+                  if token: print("runtime_telegram_token_fingerprint="+hashlib.sha256(token.encode()).hexdigest()[:12])
+                  print("runtime_telegram_chat_present="+str(bool(chat)).lower())
+              except Exception as exc:
+                  print("runtime_env_read_failed="+type(exc).__name__)
+          PY
