@@ -444,7 +444,8 @@ async def scan_all(state):
             "xapi:billing-limit",
             "xAPI.to 额度/余额不足或 API Key 请求限额已达到（PLATFORM_HTTP_402）。"
             f"自动扫描已暂停 {BILLING_PAUSE_SECONDS // 3600} 小时，避免重复请求；"
-            "所有关注历史名单均已保留。请充值或提高 API Key limit 后发送 /scan_now 恢复检查。"
+            "本轮已成功取得的数据仍会处理，失败账号的历史名单会保留。"
+            "请充值或提高 API Key limit 后发送 /scan_now 恢复检查。"
             f"上游信息：{str(exc)[:250]}",
         )
         print(
@@ -452,9 +453,7 @@ async def scan_all(state):
             f"account=@{name} pause_seconds={BILLING_PAUSE_SECONDS}",
             flush=True,
         )
-        return
-
-    if any(exc is None for _name, _current, _uid, exc in results):
+    elif any(exc is None for _name, _current, _uid, exc in results):
         state.pop("api_pause_until", None)
         state.pop("api_pause_reason", None)
         clear_error(state, "xapi:billing-limit")
@@ -528,7 +527,8 @@ async def scan_all(state):
         print(f"SCAN_OK account=@{name} follows={len(now)} new={len(now - old)}", flush=True)
 
     state["last_scan_result"] = (
-        "success" if state["last_scan_failed_accounts"] == 0 else "partial_error"
+        "billing_blocked" if billing_failure else
+        ("success" if state["last_scan_failed_accounts"] == 0 else "partial_error")
     )
     save(state)
     print(

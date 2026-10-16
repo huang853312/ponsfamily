@@ -187,6 +187,32 @@ class MonitorTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "PLATFORM_HTTP_402"):
                 app.resolve_id("newaccount")
 
+    def test_platform_402_processes_successful_accounts_before_pausing(self):
+        state = {
+            "accounts": ["fern", "other"], "running": True,
+            "known": {"fern": ["old1"], "other": ["old2"]},
+            "ids": {"fern": "1", "other": "2"}, "offset": 0,
+            "notified_follows": {}, "error_notices": {}, "pending_notifications": [],
+        }
+
+        def lookup(name, cached_uid=None):
+            if name == "fern":
+                return {"old1": "Old1", "new-follow": "NewFollow"}, "1"
+            raise RuntimeError("xAPI PLATFORM_HTTP_402: Insufficient balance or API Key limit exceeded")
+
+        with patch.object(app, "newest_following", side_effect=lookup), patch.object(app, "save"):
+            asyncio.run(app.scan_all(state))
+
+        self.assertEqual(state["known"]["fern"], ["new-follow", "old1"])
+        self.assertEqual(state["known"]["other"], ["old2"])
+        self.assertEqual(state["last_scan_result"], "billing_blocked")
+        self.assertEqual(state["last_scan_ok_accounts"], 1)
+        self.assertEqual(state["last_scan_failed_accounts"], 1)
+        follows = [x for x in state["pending_notifications"] if x.get("category") == "follow"]
+        self.assertEqual(len(follows), 1)
+        self.assertEqual(follows[0]["key"], "fern|new-follow")
+        self.assertGreater(state["api_pause_until"], time.time())
+
     def test_platform_402_pauses_all_scans_and_preserves_baselines(self):
         state = {
             "accounts": ["fern", "other"], "running": True,
