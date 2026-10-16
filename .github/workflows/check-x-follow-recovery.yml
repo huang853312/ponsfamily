@@ -60,6 +60,8 @@ jobs:
               print("accounts="+str(len(s.get("accounts") or [])))
               print("running_flag="+str(bool(s.get("running"))).lower())
               print("last_scan_result="+str(s.get("last_scan_result") or "none"))
+              print("last_scan_epoch="+str(int(float(s.get("last_scan_at",0) or 0))))
+              print("now_epoch="+str(int(time.time())))
               print("scan_ok="+str(s.get("last_scan_ok_accounts",0)))
               print("scan_failed="+str(s.get("last_scan_failed_accounts",0)))
               print("api_pause_reason="+str(s.get("api_pause_reason") or "none"))
@@ -85,4 +87,9 @@ jobs:
                   print("runtime_telegram_chat_present="+str(bool(chat)).lower())
               except Exception as exc:
                   print("runtime_env_read_failed="+type(exc).__name__)
+          print("--- recent x-follow service logs ---")
+          logs=subprocess.run(["journalctl","-u","x-follow-monitor.service","--since","10 minutes ago","--no-pager"],capture_output=True,text=True)
+          for row in logs.stdout.splitlines():
+              if any(tag in row for tag in ("SCAN_SUMMARY","SCAN_OK","XAPI_BILLING_PAUSE","NOTICE_SENT","NOTICE_QUEUED","COMMAND_RECEIVED","Traceback","ERROR","Unable to record")):
+                  print(row[-350:])
           PY
