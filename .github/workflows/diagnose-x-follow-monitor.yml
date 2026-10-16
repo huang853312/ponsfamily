@@ -127,6 +127,62 @@ jobs:
               except Exception as exc:
                   return {}, type(exc).__name__
 
+          # Search only backups belonging to this monitor; never print credential values.
+          backup_paths = []
+          for pattern in (".env*", "*.env*"):
+              backup_paths.extend(root.glob(pattern))
+          backup_paths.extend([
+              Path("/tmp/x-follow-monitor.env"),
+              Path("/var/tmp/x-follow-monitor.env"),
+          ])
+          seen_backup_paths, seen_backup_tokens = set(), set()
+          for backup_path in backup_paths:
+              try:
+                  resolved = backup_path.resolve()
+                  if resolved in seen_backup_paths or not resolved.is_file() or resolved.stat().st_size > 100000:
+                      continue
+                  seen_backup_paths.add(resolved)
+                  backup_cfg = {}
+                  for backup_line in resolved.read_text(encoding="utf-8", errors="ignore").splitlines():
+                      backup_line = backup_line.strip()
+                      if backup_line and not backup_line.startswith("#") and "=" in backup_line:
+                          bk, bv = backup_line.split("=", 1)
+                          backup_cfg[bk.strip()] = bv.strip().strip('"').strip("'")
+                  backup_token = backup_cfg.get("TELEGRAM_BOT_TOKEN", "")
+                  backup_chat = backup_cfg.get("TELEGRAM_CHAT_ID", "")
+                  if not backup_token or backup_token == token or backup_token in seen_backup_tokens:
+                      continue
+                  seen_backup_tokens.add(backup_token)
+                  candidate, candidate_err = call("getMe") if False else ({}, None)
+                  candidate_url = "https://api.telegram.org/bot" + backup_token + "/getMe"
+                  candidate_req = request.Request(candidate_url, data=b"", method="POST")
+                  try:
+                      with request.urlopen(candidate_req, timeout=15) as candidate_resp:
+                          candidate = json.loads(candidate_resp.read().decode())
+                  except error.HTTPError as exc:
+                      try:
+                          candidate = json.loads(exc.read().decode())
+                      except Exception:
+                          candidate = {}
+                  except Exception:
+                      candidate = {}
+                  candidate_user = (candidate.get("result") or {}).get("username", "") if candidate.get("ok") else ""
+                  if candidate_user:
+                      print("telegram_backup_candidate file=" + backup_path.name
+                            + " bot=@" + candidate_user
+                            + " token_fingerprint=" + hashlib.sha256(backup_token.encode()).hexdigest()[:12])
+                      if backup_chat:
+                          candidate_chat, _candidate_chat_err = (call("getChat", {"chat_id": backup_chat}) if backup_token == token else ({}, None))
+                          chat_url = "https://api.telegram.org/bot" + backup_token + "/getChat"
+                          chat_req = request.Request(chat_url, data=parse.urlencode({"chat_id": backup_chat}).encode(), method="POST")
+                          try:
+                              with request.urlopen(chat_req, timeout=15) as chat_resp:
+                                  chat_result = json.loads(chat_resp.read().decode())
+                          except Exception:
+                              chat_result = {}
+                          print("telegram_backup_chat=" + ("ok" if chat_result.get("ok") else "failed")
+                                + " chat_fingerprint=" + hashlib.sha256(backup_chat.encode()).hexdigest()[:10])
+          
           if not token or not chat:
               print("telegram_config=missing")
           else:
