@@ -69,6 +69,10 @@ jobs:
               print("last_scan_failed=" + str(state.get("last_scan_failed_accounts", 0)))
               print("api_pause_reason=" + str(state.get("api_pause_reason") or "none"))
               print("api_pause_active=" + str(float(state.get("api_pause_until", 0) or 0) > time.time()).lower())
+              billing = (state.get("error_notices") or {}).get("xapi:billing-limit") or {}
+              last_error = str(billing.get("last_error") or "").replace(key, "<redacted>")
+              last_error = re.sub(r"(?i)(sk-xapi-[A-Za-z0-9_-]+)", "<redacted-key>", last_error)
+              print("last_billing_error=" + last_error[:1100].replace(chr(10), " "))
           except Exception as exc:
               print("state_read_error=" + type(exc).__name__)
 
