@@ -61,6 +61,24 @@ jobs:
               raise SystemExit("billing_probe=stopped_xapi_key_missing")
           print("active_key_fingerprint=" + hashlib.sha256(key.encode()).hexdigest()[:12])
           print("key_present=true")
+          # Check only this monitor's own historical env backups by fingerprint, never print credentials.
+          expected_old_fingerprint = "bcd67bd4e288"
+          old_key_backup_found = False
+          for candidate in root.glob(".env*"):
+              if not candidate.is_file() or candidate.name == ".env":
+                  continue
+              try:
+                  for row in candidate.read_text(encoding="utf-8", errors="ignore").splitlines():
+                      if row.strip().startswith("XAPI_KEY="):
+                          candidate_key = row.split("=", 1)[1].strip().strip('"').strip("'")
+                          if candidate_key and hashlib.sha256(candidate_key.encode()).hexdigest()[:12] == expected_old_fingerprint:
+                              old_key_backup_found = True
+                              print("previous_key_backup_found=true")
+                              print("previous_key_backup_file=" + candidate.name)
+              except OSError:
+                  pass
+          if not old_key_backup_found:
+              print("previous_key_backup_found=false")
           try:
               state = json.loads(statep.read_text(encoding="utf-8"))
               print("monitored_accounts=" + str(len(state.get("accounts") or [])))
@@ -69,6 +87,7 @@ jobs:
               print("last_scan_failed=" + str(state.get("last_scan_failed_accounts", 0)))
               print("api_pause_reason=" + str(state.get("api_pause_reason") or "none"))
               print("api_pause_active=" + str(float(state.get("api_pause_until", 0) or 0) > time.time()).lower())
+              print("last_scan_age_seconds=" + str(max(0, int(time.time() - float(state.get("last_scan_at", 0) or 0)))))
               billing = (state.get("error_notices") or {}).get("xapi:billing-limit") or {}
               last_error = str(billing.get("last_error") or "").replace(key, "<redacted>")
               last_error = re.sub(r"(?i)(sk-xapi-[A-Za-z0-9_-]+)", "<redacted-key>", last_error)
@@ -121,4 +140,14 @@ jobs:
                   print(name + "_result=timeout")
               except Exception as exc:
                   print(name + "_exception=" + type(exc).__name__)
+          for prop in ("ActiveState", "MainPID", "NRestarts"):
+              result = subprocess.run(["systemctl", "show", "x-follow-monitor.service", "-p", prop, "--value"],
+                                      capture_output=True, text=True, timeout=10)
+              print("service_" + prop.lower() + "=" + result.stdout.strip())
+          recent = subprocess.run(["journalctl", "-u", "x-follow-monitor.service", "--since", "3 minutes ago", "--no-pager"],
+                                  capture_output=True, text=True, timeout=15)
+          print("--- recent monitor runtime evidence ---")
+          for row in recent.stdout.splitlines():
+              if any(tag in row for tag in ("SCAN_SUMMARY", "XAPI_BILLING_PAUSE", "SCAN_OK", "Traceback", "ERROR")):
+                  print(row[-420:])
           PY
