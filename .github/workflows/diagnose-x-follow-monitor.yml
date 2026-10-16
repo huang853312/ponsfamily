@@ -1,0 +1,128 @@
+name: Diagnose X Follow Monitor Notifications
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/diagnose-x-follow-monitor.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Configure SSH
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SERVER_SSH_KEY"
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$SERVER_SSH_KEY" > "$HOME/.ssh/deploy_key"
+          chmod 600 "$HOME/.ssh/deploy_key"
+          touch "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Read monitor state and test Telegram delivery
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SERVER_HOST"
+          test -n "$SERVER_PORT"
+          test -n "$SERVER_USER"
+          SSH=(ssh -i "$HOME/.ssh/deploy_key" -p "$SERVER_PORT" -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30)
+          DIAG_B64=$(base64 -w0 <<'PY'
+          import hashlib
+          import json
+          import time
+          from pathlib import Path
+          from urllib import parse, request, error
+
+          root = Path("/home/ubuntu/ponsfamily/x-follow-monitor")
+          cfg = {}
+          for line in (root / ".env").read_text(encoding="utf-8").splitlines():
+              line = line.strip()
+              if line and not line.startswith("#") and "=" in line:
+                  k, v = line.split("=", 1)
+                  cfg[k.strip()] = v.strip().strip('"').strip("'")
+
+          token, chat = cfg.get("TELEGRAM_BOT_TOKEN", ""), cfg.get("TELEGRAM_CHAT_ID", "")
+          key = cfg.get("XAPI_KEY", "")
+          state = {}
+          try:
+              state = json.loads((root / "state.json").read_text(encoding="utf-8"))
+          except Exception as exc:
+              print("state_read=failed:" + type(exc).__name__)
+
+          print("xapi_key_present=" + str(bool(key)).lower())
+          if key:
+              print("xapi_key_fingerprint=" + hashlib.sha256(key.encode()).hexdigest()[:12])
+          print("accounts_count=" + str(len(state.get("accounts") or [])))
+          print("monitor_running=" + str(bool(state.get("running"))).lower())
+          print("pending_notifications=" + str(len(state.get("pending_notifications") or [])))
+          print("last_scan_result=" + str(state.get("last_scan_result") or "none"))
+          last = float(state.get("last_scan_at", 0) or 0)
+          print("last_scan_epoch=" + (str(int(last)) if last else "none"))
+          print("scan_ok_accounts=" + str(state.get("last_scan_ok_accounts", 0)))
+          print("scan_failed_accounts=" + str(state.get("last_scan_failed_accounts", 0)))
+          print("api_pause_reason=" + str(state.get("api_pause_reason") or "none"))
+          print("api_pause_active=" + str(float(state.get("api_pause_until", 0) or 0) > time.time()).lower())
+
+          def call(method, payload=None):
+              url = "https://api.telegram.org/bot" + token + "/" + method
+              body = parse.urlencode(payload or {}).encode()
+              req = request.Request(url, data=body, method="POST")
+              try:
+                  with request.urlopen(req, timeout=20) as response:
+                      result = json.loads(response.read().decode())
+                      return result, None
+              except error.HTTPError as exc:
+                  try:
+                      result = json.loads(exc.read().decode())
+                      return result, None
+                  except Exception:
+                      return {}, "http_" + str(exc.code)
+              except Exception as exc:
+                  return {}, type(exc).__name__
+
+          if not token or not chat:
+              print("telegram_config=missing")
+          else:
+              me, me_err = call("getMe")
+              print("telegram_get_me=" + ("ok" if me.get("ok") else "failed:" + str(me_err or me.get("error_code") or "api_error")))
+              if me.get("ok"):
+                  print("telegram_bot_username=@" + str((me.get("result") or {}).get("username", "unknown")))
+              ch, ch_err = call("getChat", {"chat_id": chat})
+              print("telegram_target_chat=" + ("ok" if ch.get("ok") else "failed:" + str(ch_err or ch.get("error_code") or "api_error")))
+              wh, wh_err = call("getWebhookInfo")
+              print("telegram_webhook_enabled=" + str(bool(((wh.get("result") or {}).get("url")))).lower() if wh.get("ok") else "telegram_webhook_check=failed:" + str(wh_err or wh.get("error_code") or "api_error"))
+              # One explicit test notification verifies the configured delivery path end-to-end.
+              test_text = "X关注监控诊断：Telegram 通知通道测试成功。此消息为一次人工连通性检查。"
+              sent, sent_err = call("sendMessage", {"chat_id": chat, "text": test_text, "disable_notification": "false"})
+              print("telegram_test_message=" + ("sent" if sent.get("ok") else "failed:" + str(sent_err or sent.get("error_code") or "api_error")))
+              if sent.get("ok"):
+                  print("telegram_test_message_id=" + str((sent.get("result") or {}).get("message_id", "unknown")))
+
+          PY
+          )
+          "${SSH[@]}" "$SERVER_USER@$SERVER_HOST" "
+            set -eu
+            printf 'service_active='
+            sudo systemctl is-active x-follow-monitor.service || true
+            sudo systemctl show x-follow-monitor.service -p MainPID -p Result -p NRestarts --no-pager
+            echo '$DIAG_B64' | base64 -d | sudo python3
+            echo '--- recent service events ---'
+            sudo journalctl -u x-follow-monitor.service --since '90 minutes ago' --no-pager |
+              grep -E 'COMMAND_RECEIVED|SCAN_SUMMARY|XAPI_BILLING_PAUSE|XAPI_RESPONSE_DIAGNOSTIC|Telegram|notification|ERROR|Traceback' |
+              tail -n 80 || true
+          "
