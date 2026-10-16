@@ -77,6 +77,34 @@ jobs:
           print("scan_failed_accounts=" + str(state.get("last_scan_failed_accounts", 0)))
           print("api_pause_reason=" + str(state.get("api_pause_reason") or "none"))
           print("api_pause_active=" + str(float(state.get("api_pause_until", 0) or 0) > time.time()).lower())
+          # Only inspect legacy staging/backups belonging to this X follow monitor.
+          legacy_paths = [Path("/tmp/x-follow-xapi.env"), Path("/var/tmp/x-follow-xapi.env")]
+          try:
+              legacy_paths.extend(p for p in root.glob(".env*") if p != (root / ".env") and p.is_file())
+          except OSError:
+              pass
+          seen_paths, old_keys = set(), {}
+          for path in legacy_paths:
+              try:
+                  resolved = path.resolve()
+                  if resolved in seen_paths or not resolved.is_file() or resolved.stat().st_size > 100000:
+                      continue
+                  seen_paths.add(resolved)
+                  values = []
+                  for line in resolved.read_text(encoding="utf-8", errors="ignore").splitlines():
+                      value_line = line.strip()
+                      if value_line.startswith("XAPI_KEY="):
+                          val = value_line.split("=", 1)[1].strip().strip(chr(34)).strip(chr(39))
+                          if val:
+                              values.append(val)
+                  if len(values) == 1 and values[0] and values[0] != key:
+                      old_keys.setdefault(values[0], []).append(path.name)
+              except (OSError, RuntimeError):
+                  pass
+          print("distinct_legacy_key_candidates=" + str(len(old_keys)))
+          for old_value, sources in old_keys.items():
+              old_fp = hashlib.sha256(old_value.encode()).hexdigest()[:12]
+              print("legacy_key_fingerprint=" + old_fp + " sources=" + ",".join(sorted(set(sources))))
 
           def call(method, payload=None):
               url = "https://api.telegram.org/bot" + token + "/" + method
@@ -106,12 +134,7 @@ jobs:
               print("telegram_target_chat=" + ("ok" if ch.get("ok") else "failed:" + str(ch_err or ch.get("error_code") or "api_error")))
               wh, wh_err = call("getWebhookInfo")
               print("telegram_webhook_enabled=" + str(bool(((wh.get("result") or {}).get("url")))).lower() if wh.get("ok") else "telegram_webhook_check=failed:" + str(wh_err or wh.get("error_code") or "api_error"))
-              # One explicit test notification verifies the configured delivery path end-to-end.
-              test_text = "X关注监控诊断：Telegram 通知通道测试成功。此消息为一次人工连通性检查。"
-              sent, sent_err = call("sendMessage", {"chat_id": chat, "text": test_text, "disable_notification": "false"})
-              print("telegram_test_message=" + ("sent" if sent.get("ok") else "failed:" + str(sent_err or sent.get("error_code") or "api_error")))
-              if sent.get("ok"):
-                  print("telegram_test_message_id=" + str((sent.get("result") or {}).get("message_id", "unknown")))
+              print("telegram_send_test_skipped=true")
 
           PY
           )
