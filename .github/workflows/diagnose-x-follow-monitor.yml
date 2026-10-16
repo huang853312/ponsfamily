@@ -53,12 +53,16 @@ jobs:
           from urllib import parse, request, error
 
           root = Path("/home/ubuntu/ponsfamily/x-follow-monitor")
+          env_path = root / ".env"
           cfg = {}
-          for line in (root / ".env").read_text(encoding="utf-8").splitlines():
-              line = line.strip()
-              if line and not line.startswith("#") and "=" in line:
-                  k, v = line.split("=", 1)
-                  cfg[k.strip()] = v.strip().strip('"').strip("'")
+          if env_path.is_file():
+              for line in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                  line = line.strip()
+                  if line and not line.startswith("#") and "=" in line:
+                      k, v = line.split("=", 1)
+                      cfg[k.strip()] = v.strip().strip('"').strip("'")
+          else:
+              print("monitor_env=missing")
 
           token, chat = cfg.get("TELEGRAM_BOT_TOKEN", ""), cfg.get("TELEGRAM_CHAT_ID", "")
           key = cfg.get("XAPI_KEY", "")
