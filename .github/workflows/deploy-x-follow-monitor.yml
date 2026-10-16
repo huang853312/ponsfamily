@@ -6,12 +6,11 @@ on:
       - main
     paths:
       - "x-follow-monitor/**"
-      - ".github/workflows/deploy-x-follow-monitor.yml"
   workflow_dispatch:
 
 concurrency:
   group: deploy-x-follow-monitor-production
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -77,6 +76,7 @@ jobs:
 
           rsync -az --delete \
             --exclude='state.json' \
+            --exclude='.env' \
             --exclude='node_modules/' --exclude='.venv/' \
             --exclude='*.backup.*' \
             --exclude='__pycache__/' \
