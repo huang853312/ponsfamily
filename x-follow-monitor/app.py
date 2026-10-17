@@ -3,6 +3,7 @@ import contextlib
 import json
 import os
 import re
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -210,6 +211,19 @@ def queue_notification(state, key, message, category="system", source="", target
     save(state)
     print(f"NOTICE_QUEUED key={key} pending={len(queue)}", flush=True)
     return True
+
+
+def is_telegram_poll_timeout(exc):
+    """Recognize transient socket/read timeouts from Telegram long polling only."""
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    if isinstance(exc, error.URLError):
+        reason = exc.reason
+        if isinstance(reason, (TimeoutError, socket.timeout)):
+            return True
+        return "timed out" in str(reason).lower()
+    message = str(exc).lower()
+    return "the read operation timed out" in message or "read timed out" in message
 
 
 def telegram_retry_after(exc):
@@ -625,15 +639,45 @@ async def main():
     notification_task = asyncio.create_task(notification_worker(state))
     scan_task, next_scan_at, retry_delay = None, 0.0, 5
     scan_requested_after_current = False
+    telegram_poll_timeout_streak = 0
     while True:
         try:
-            result = await asyncio.to_thread(
-                tg, "getUpdates", {
-                    "offset": state["offset"] + 1,
-                    "timeout": 10,
-                    "allowed_updates": json.dumps(["message", "channel_post"]),
-                },
-            )
+            try:
+                result = await asyncio.to_thread(
+                    tg, "getUpdates", {
+                        "offset": state["offset"] + 1,
+                        "timeout": 10,
+                        "allowed_updates": json.dumps(["message", "channel_post"]),
+                    },
+                )
+            except Exception as exc:
+                if not is_telegram_poll_timeout(exc):
+                    raise
+                telegram_poll_timeout_streak += 1
+                print(
+                    "TELEGRAM_POLL_TIMEOUT "
+                    f"consecutive={telegram_poll_timeout_streak}; recovering_without_main_loop_failure=true",
+                    flush=True,
+                )
+                if telegram_poll_timeout_streak >= 3:
+                    report_limited_error(
+                        state,
+                        "telegram-poll-timeout",
+                        "Telegram getUpdates 连续发生读取超时，机器人仍在自动重试；"
+                        "该网络超时不会中断监控主循环，也不会重复发送每次超时告警。",
+                    )
+                result = {"result": []}
+            else:
+                if telegram_poll_timeout_streak:
+                    print(
+                        "TELEGRAM_POLL_RECOVERED "
+                        f"after_consecutive_timeouts={telegram_poll_timeout_streak}",
+                        flush=True,
+                    )
+                telegram_poll_timeout_streak = 0
+                clear_error(state, "telegram-poll-timeout")
+                clear_error(state, "main-loop")
+
             for update in result.get("result", []):
                 state["offset"] = update["update_id"]
                 msg = update_message(update)

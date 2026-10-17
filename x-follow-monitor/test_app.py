@@ -10,6 +10,13 @@ import app
 
 
 class MonitorTests(unittest.TestCase):
+    def test_telegram_poll_timeout_detector(self):
+        self.assertTrue(app.is_telegram_poll_timeout(TimeoutError("The read operation timed out")))
+        self.assertTrue(app.is_telegram_poll_timeout(TimeoutError("read timed out")))
+        self.assertTrue(app.is_telegram_poll_timeout(app.error.URLError(TimeoutError("timed out"))))
+        self.assertFalse(app.is_telegram_poll_timeout(RuntimeError("Telegram HTTP 401: unauthorized")))
+        self.assertFalse(app.is_telegram_poll_timeout(RuntimeError("xAPI PLATFORM_HTTP_402")))
+
     def test_clean_username(self):
         self.assertEqual(app.clean(" @OpenAI "), "openai")
         with self.assertRaises(ValueError):
