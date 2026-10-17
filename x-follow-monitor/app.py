@@ -17,7 +17,7 @@ CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 INTERVAL = max(300, int(os.getenv("X_FOLLOW_INTERVAL", "1800")))
 MAX_CONCURRENCY = max(1, int(os.getenv("X_FOLLOW_CONCURRENCY", "3")))
 ERROR_COOLDOWN = max(600, int(os.getenv("X_FOLLOW_ERROR_COOLDOWN", "21600")))
-BILLING_PAUSE_SECONDS = max(1800, int(os.getenv("X_FOLLOW_BILLING_PAUSE", "21600")))
+BILLING_PAUSE_SECONDS = max(1800, int(os.getenv("X_FOLLOW_BILLING_PAUSE", "1800")))
 FOLLOW_SEND_INTERVAL = max(3.0, float(os.getenv("X_FOLLOW_SEND_INTERVAL", "3")))
 MAX_FOLLOWING_PAGES = max(1, int(os.getenv("X_FOLLOW_MAX_PAGES", "100")))
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
@@ -189,6 +189,22 @@ def load():
             f"queued={purged_legacy_proxy_notices} error_records={len(stale_legacy_proxy_error_keys)}",
             flush=True,
         )
+    api_pause_until = float(old.get("api_pause_until", 0) or 0)
+    api_pause_reason = str(old.get("api_pause_reason", ""))
+    last_scan_at = float(old.get("last_scan_at", 0) or 0)
+    # Older versions parked billing failures for six hours. Keep the circuit
+    # breaker, but automatically recheck after 30 minutes so a dashboard fix
+    # takes effect without requiring a manual Telegram /scan_now command.
+    if api_pause_reason == "PLATFORM_HTTP_402" and api_pause_until > time.time():
+        scheduled_recheck = last_scan_at + BILLING_PAUSE_SECONDS
+        if api_pause_until > scheduled_recheck:
+            api_pause_until = max(time.time(), scheduled_recheck)
+            print(
+                "BILLING_PAUSE_MIGRATED_TO_AUTO_RECHECK "
+                f"seconds={BILLING_PAUSE_SECONDS}",
+                flush=True,
+            )
+
     accounts = list(dict.fromkeys(x for x in accounts if isinstance(x, str)))
     # Pre-v2 state may contain a single page only. Reconcile before alerting.
     version = int(old.get("schema_version", 0) or 0)
@@ -208,9 +224,9 @@ def load():
         "pending_notifications": compacted,
         "last_follow_sent_at": float(old.get("last_follow_sent_at", 0) or 0),
         # Persist the circuit-breaker timer across deploys/restarts.
-        "api_pause_until": float(old.get("api_pause_until", 0) or 0),
-        "api_pause_reason": str(old.get("api_pause_reason", "")),
-        "last_scan_at": float(old.get("last_scan_at", 0) or 0),
+        "api_pause_until": api_pause_until,
+        "api_pause_reason": api_pause_reason,
+        "last_scan_at": last_scan_at,
         "last_scan_result": str(old.get("last_scan_result", "")),
         "last_scan_ok_accounts": int(old.get("last_scan_ok_accounts", 0) or 0),
         "last_scan_failed_accounts": int(old.get("last_scan_failed_accounts", 0) or 0),
@@ -670,9 +686,9 @@ async def scan_all(state):
             state,
             "xapi:billing-limit",
             "xAPI.to 额度/余额不足或 API Key 请求限额已达到（PLATFORM_HTTP_402）。"
-            f"自动扫描已暂停 {BILLING_PAUSE_SECONDS // 3600} 小时，避免重复请求；"
+            f"自动扫描已暂停 {BILLING_PAUSE_SECONDS // 60} 分钟，之后自动重试，不需要手动发送命令；"
             "本轮已成功取得的数据仍会处理，失败账号的历史名单会保留。"
-            "请充值或提高 API Key limit 后发送 /scan_now 恢复检查。"
+            "若已调整账户余额或 API Key limit，系统会在下次自动重试时恢复；"
             f"上游信息：{str(exc)[:250]}",
         )
         print(

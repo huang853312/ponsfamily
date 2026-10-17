@@ -237,19 +237,27 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("query:real-data-error", state["error_notices"])
         self.assertEqual(state["accounts"], ["brian_armstrong"])
 
-    def test_load_preserves_billing_pause_across_restart(self):
-        pause_until = time.time() + 18000
+    def test_load_shortens_legacy_billing_pause_to_automatic_recheck(self):
+        now = time.time()
+        last_scan_at = now - 600
+        pause_until = now + 18000
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "state.json"
             state_path.write_text(json.dumps({
                 "accounts": ["fern"], "running": True,
                 "known": {"fern": ["old-user"]},
+                "last_scan_at": last_scan_at,
                 "api_pause_until": pause_until,
                 "api_pause_reason": "PLATFORM_HTTP_402",
             }), encoding="utf-8")
             with patch.object(app, "STATE", state_path):
                 state = app.load()
-        self.assertEqual(state["api_pause_until"], pause_until)
+        self.assertLess(state["api_pause_until"], pause_until)
+        self.assertAlmostEqual(
+            state["api_pause_until"],
+            last_scan_at + app.BILLING_PAUSE_SECONDS,
+            delta=1.0,
+        )
         self.assertEqual(state["api_pause_reason"], "PLATFORM_HTTP_402")
         self.assertEqual(state["known"]["fern"], ["old-user"])
 
