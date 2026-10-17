@@ -1,0 +1,145 @@
+name: X Follow Monitor Live Scan Verification
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/run-x-follow-monitor-live-scan.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-live-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Configure SSH
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SERVER_SSH_KEY"
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$SERVER_SSH_KEY" | tr -d '\r' > "$HOME/.ssh/deploy_key"
+          chmod 600 "$HOME/.ssh/deploy_key"
+          touch "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Back up monitor state, trigger one live scan, and verify result
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SERVER_HOST"
+          test -n "$SERVER_PORT"
+          test -n "$SERVER_USER"
+          SSH="ssh -i $HOME/.ssh/deploy_key -p $SERVER_PORT -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20"
+          $SSH "$SERVER_USER@$SERVER_HOST" 'sudo python3 -' <<'PY'
+          import json, os, pwd, shutil, subprocess, tempfile, time
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          root = Path("/home/ubuntu/ponsfamily/x-follow-monitor")
+          state_path = root / "state.json"
+          if not state_path.is_file():
+              raise SystemExit("live_scan=stopped_state_missing")
+          try:
+              state = json.loads(state_path.read_text(encoding="utf-8"))
+          except Exception:
+              raise SystemExit("live_scan=stopped_state_invalid")
+          if not isinstance(state, dict) or not isinstance(state.get("accounts"), list):
+              raise SystemExit("live_scan=stopped_state_shape_invalid")
+          account_count = len(state["accounts"])
+          if not state.get("running"):
+              raise SystemExit("live_scan=stopped_monitor_flag_false")
+          previous_scan = float(state.get("last_scan_at", 0) or 0)
+          stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+          backup = root / ("state.json.before_live_scan_" + stamp)
+          shutil.copy2(state_path, backup)
+          os.chmod(backup, 0o600)
+          state.pop("api_pause_until", None)
+          state.pop("api_pause_reason", None)
+          old_stat = state_path.stat()
+          fd, temp = tempfile.mkstemp(prefix=".live-scan.", dir=str(root))
+          try:
+              os.fchmod(fd, old_stat.st_mode & 0o777)
+              os.fchown(fd, old_stat.st_uid, old_stat.st_gid)
+              with os.fdopen(fd, "w", encoding="utf-8") as output:
+                  json.dump(state, output, ensure_ascii=False, indent=2)
+                  output.write("\n")
+                  output.flush()
+                  os.fsync(output.fileno())
+              os.replace(temp, state_path)
+          finally:
+              if os.path.exists(temp):
+                  os.unlink(temp)
+          print("accounts_preserved=" + str(account_count))
+          print("state_backup=" + backup.name)
+          print("previous_pause_cleared_for_one_probe=true")
+          subprocess.run(["systemctl", "restart", "x-follow-monitor.service"], check=True, timeout=60)
+          time.sleep(3)
+          active = subprocess.run(["systemctl", "is-active", "x-follow-monitor.service"],
+                                  capture_output=True, text=True, timeout=15).stdout.strip()
+          print("service_active_after_restart=" + active)
+          if active != "active":
+              raise SystemExit("live_scan=service_not_active")
+
+          deadline = time.time() + 480
+          observed_new_scan_at = 0.0
+          stable_since = None
+          latest = state
+          while time.time() < deadline:
+              time.sleep(3)
+              try:
+                  current = json.loads(state_path.read_text(encoding="utf-8"))
+                  if not isinstance(current, dict):
+                      continue
+                  latest = current
+                  scan_at = float(current.get("last_scan_at", 0) or 0)
+                  if scan_at <= previous_scan:
+                      continue
+                  if observed_new_scan_at != scan_at:
+                      observed_new_scan_at = scan_at
+                      stable_since = time.time()
+                      continue
+                  if stable_since and time.time() - stable_since >= 10:
+                      break
+              except (OSError, json.JSONDecodeError):
+                  pass
+
+          updated = observed_new_scan_at > previous_scan
+          latest = json.loads(state_path.read_text(encoding="utf-8"))
+          print("new_scan_completed=" + str(updated).lower())
+          print("last_scan_result=" + str(latest.get("last_scan_result") or "none"))
+          print("accounts=" + str(len(latest.get("accounts") or [])))
+          print("scan_ok=" + str(latest.get("last_scan_ok_accounts", 0)))
+          print("scan_failed=" + str(latest.get("last_scan_failed_accounts", 0)))
+          print("api_pause_reason=" + str(latest.get("api_pause_reason") or "none"))
+          print("api_pause_active=" + str(float(latest.get("api_pause_until", 0) or 0) > time.time()).lower())
+          print("pending_notifications=" + str(len(latest.get("pending_notifications") or [])))
+          logs = subprocess.run(
+              ["journalctl", "-u", "x-follow-monitor.service", "--since", "12 minutes ago", "--no-pager"],
+              capture_output=True, text=True, timeout=30
+          )
+          print("--- live scan evidence ---")
+          for row in logs.stdout.splitlines():
+              if any(tag in row for tag in (
+                  "SCAN_SUMMARY", "SCAN_OK", "XAPI_BILLING_PAUSE",
+                  "XAPI_TRANSIENT_RETRY", "XAPI_TRANSIENT_NETWORK",
+                  "STARTUP_PURGED_LEGACY_PROXY_ALERTS", "TELEGRAM_POLL_TIMEOUT",
+                  "TELEGRAM_POLL_RECOVERED", "Traceback", "ERROR"
+              )):
+                  print(row[-450:])
+          if not updated:
+              raise SystemExit("live_scan=timed_out_without_new_result")
+          if latest.get("last_scan_result") != "success" or int(latest.get("last_scan_ok_accounts", 0)) != account_count:
+              raise SystemExit("live_scan=not_fully_recovered")
+          print("live_scan=all_accounts_success")
+          PY
