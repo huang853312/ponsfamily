@@ -17,6 +17,63 @@ class MonitorTests(unittest.TestCase):
         self.assertFalse(app.is_telegram_poll_timeout(RuntimeError("Telegram HTTP 401: unauthorized")))
         self.assertFalse(app.is_telegram_poll_timeout(RuntimeError("xAPI PLATFORM_HTTP_402")))
 
+    def test_transient_proxy_reset_retries_then_succeeds(self):
+        from subprocess import CompletedProcess
+        failed = json.dumps({
+            "success": False,
+            "error": {
+                "code": "PROXY_ERROR",
+                "message": "read ECONNRESET",
+                "transient": False,
+            },
+        })
+        good = json.dumps({"success": True, "data": {"users": []}})
+        with patch.object(app.CLI, "is_file", return_value=True), \
+             patch.object(app.subprocess, "run", side_effect=[
+                 CompletedProcess([], 0, failed, ""),
+                 CompletedProcess([], 0, good, ""),
+             ]) as run_mock, \
+             patch.object(app.time, "sleep") as sleep_mock:
+            result = app.xapi("twitter.following", {"user_id": "123"})
+        self.assertTrue(result["success"])
+        self.assertEqual(run_mock.call_count, 2)
+        sleep_mock.assert_called_once_with(1)
+
+    def test_transient_proxy_reset_is_grouped_after_bounded_retries(self):
+        from subprocess import CompletedProcess
+        failed = json.dumps({
+            "success": False,
+            "error": {
+                "code": "PROXY_ERROR",
+                "message": "read ECONNRESET",
+                "transient": False,
+            },
+        })
+        with patch.object(app.CLI, "is_file", return_value=True), \
+             patch.object(app.subprocess, "run", return_value=CompletedProcess([], 0, failed, "")) as run_mock, \
+             patch.object(app.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "XAPI_TRANSIENT_NETWORK"):
+                app.xapi("twitter.following", {"user_id": "123"})
+        self.assertEqual(run_mock.call_count, 3)
+
+    def test_billing_402_is_not_retried(self):
+        from subprocess import CompletedProcess
+        billing = json.dumps({
+            "success": False,
+            "error": {
+                "code": "PLATFORM_HTTP_402",
+                "message": "Insufficient balance or API Key limit exceeded",
+                "transient": False,
+            },
+        })
+        with patch.object(app.CLI, "is_file", return_value=True), \
+             patch.object(app.subprocess, "run", return_value=CompletedProcess([], 0, billing, "")) as run_mock, \
+             patch.object(app.time, "sleep") as sleep_mock:
+            result = app.xapi("twitter.following", {"user_id": "123"})
+        self.assertEqual(result["error"]["code"], "PLATFORM_HTTP_402")
+        run_mock.assert_called_once()
+        sleep_mock.assert_not_called()
+
     def test_clean_username(self):
         self.assertEqual(app.clean(" @OpenAI "), "openai")
         with self.assertRaises(ValueError):

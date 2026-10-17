@@ -308,20 +308,119 @@ def clear_error(state, key):
     ]
 
 
+def is_transient_network_error(code, message):
+    """Identify reset/timeout failures that may recover on a bounded retry."""
+    code = str(code or "").upper()
+    message = str(message or "").lower()
+    network_markers = (
+        "econnreset", "connection reset", "read timed out", "the read operation timed out",
+        "etimedout", "upstream timeout", "socket hang up", "econnrefused", "eai_again",
+        "connection aborted", "remote end closed connection", "broken pipe",
+    )
+    if not any(marker in message for marker in network_markers):
+        return False
+    return code in ("", "PROXY_ERROR", "NETWORK_ERROR", "UPSTREAM_TIMEOUT",
+                    "ECONNRESET", "ETIMEDOUT", "ECONNREFUSED", "EAI_AGAIN") or bool(
+                        any(marker in message for marker in network_markers)
+                    )
+
+
+def _xapi_error_fields(payload):
+    if not isinstance(payload, dict):
+        return "", ""
+    err = payload.get("error")
+    if isinstance(err, dict):
+        return str(err.get("code") or ""), str(err.get("message") or "")
+    return str(payload.get("code") or ""), str(payload.get("message") or "")
+
+
 def xapi(action, payload):
+    """Call xAPI, retrying only connection-reset/timeout failures; never retry billing 402."""
     if not CLI.is_file():
         raise RuntimeError(f"xapi-to CLI 不存在：{CLI}")
-    process = subprocess.run(
-        [str(CLI), "call", action, "--input", json.dumps(payload, ensure_ascii=False)],
-        capture_output=True, text=True, timeout=90, check=False,
-    )
-    if process.returncode:
-        raise RuntimeError((process.stderr or process.stdout or "xAPI failed")[-500:])
-    try:
-        return json.loads(process.stdout)
-    except json.JSONDecodeError as exc:
-        preview = process.stdout[-300:].replace("\n", " ")
-        raise RuntimeError(f"xAPI 返回的不是 JSON：{preview}") from exc
+    args = [str(CLI), "call", action, "--input", json.dumps(payload, ensure_ascii=False)]
+    last_network_detail = ""
+    # Three bounded attempts protect against transient proxy resets without retrying
+    # normal API, auth, or billing errors that can cost money.
+    for attempt in range(1, 4):
+        try:
+            process = subprocess.run(
+                args,
+                capture_output=True, text=True, timeout=90, check=False,
+            )
+        except subprocess.TimeoutExpired:
+            last_network_detail = "xAPI CLI request timed out"
+            if attempt < 3:
+                delay = attempt
+                print(
+                    f"XAPI_TRANSIENT_RETRY action={action} attempt={attempt}/3 "
+                    f"reason=client_timeout wait={delay}s",
+                    flush=True,
+                )
+                time.sleep(delay)
+                continue
+            raise RuntimeError(
+                f"XAPI_TRANSIENT_NETWORK: request timed out after {attempt} attempts"
+            )
+
+        output = process.stdout or ""
+        detail = (process.stderr or output or "xAPI failed")[-500:]
+        if process.returncode:
+            if is_transient_network_error("", detail):
+                last_network_detail = detail
+                if attempt < 3:
+                    delay = attempt
+                    print(
+                        f"XAPI_TRANSIENT_RETRY action={action} attempt={attempt}/3 "
+                        f"reason=process_network_error wait={delay}s",
+                        flush=True,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise RuntimeError(
+                    f"XAPI_TRANSIENT_NETWORK: connection failed after {attempt} attempts: {detail}"
+                )
+            raise RuntimeError(detail)
+
+        try:
+            result = json.loads(output)
+        except json.JSONDecodeError as exc:
+            preview = output[-300:].replace("\n", " ")
+            if is_transient_network_error("", detail + " " + preview):
+                last_network_detail = (detail + " " + preview)[-300:]
+                if attempt < 3:
+                    delay = attempt
+                    print(
+                        f"XAPI_TRANSIENT_RETRY action={action} attempt={attempt}/3 "
+                        f"reason=invalid_network_response wait={delay}s",
+                        flush=True,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise RuntimeError(
+                    f"XAPI_TRANSIENT_NETWORK: invalid network response after {attempt} attempts: "
+                    f"{last_network_detail}"
+                ) from exc
+            raise RuntimeError(f"xAPI 返回的不是 JSON：{preview}") from exc
+
+        code, message = _xapi_error_fields(result)
+        if is_transient_network_error(code, message):
+            last_network_detail = f"{code}: {message}".strip(": ")
+            if attempt < 3:
+                delay = attempt
+                print(
+                    f"XAPI_TRANSIENT_RETRY action={action} attempt={attempt}/3 "
+                    f"reason={code or 'network_error'} wait={delay}s",
+                    flush=True,
+                )
+                time.sleep(delay)
+                continue
+            raise RuntimeError(
+                f"XAPI_TRANSIENT_NETWORK: {last_network_detail} after {attempt} attempts"
+            )
+        return result
+
+    raise RuntimeError(f"XAPI_TRANSIENT_NETWORK: {last_network_detail or 'unknown error'}")
 
 
 def clean(value):
@@ -549,6 +648,13 @@ async def scan_all(state):
         state.pop("api_pause_reason", None)
         clear_error(state, "xapi:billing-limit")
 
+    has_transient_network_failures = any(
+        exc is not None and "XAPI_TRANSIENT_NETWORK" in str(exc)
+        for _name, _current, _uid, exc in results
+    )
+    if not has_transient_network_failures:
+        clear_error(state, "xapi:proxy-network")
+
     if not any(
         exc is not None and "关注列表响应缺少 data 对象" in str(exc)
         for _name, _current, _uid, exc in results
@@ -561,6 +667,21 @@ async def scan_all(state):
             error_text = str(exc)
             if "PLATFORM_HTTP_402" in error_text:
                 # Billing failures are reported once per scan cycle above, not once per account.
+                continue
+            if "XAPI_TRANSIENT_NETWORK" in error_text:
+                report_limited_error(
+                    state,
+                    "xapi:proxy-network",
+                    "xAPI 代理连接暂时失败（ECONNRESET/timeout）。每次调用已自动重试 3 次；"
+                    "本轮失败账号的历史名单已保留，其余成功账号仍正常处理。"
+                    "程序会在下个扫描周期继续尝试，不会按账号重复告警。"
+                    f"上游摘要：{error_text[-220:]}",
+                )
+                print(
+                    f"XAPI_TRANSIENT_NETWORK account=@{name} "
+                    "action_retries=3 baseline_preserved=true",
+                    flush=True,
+                )
                 continue
             if "关注列表响应缺少 data 对象" in error_text:
                 diagnostic = error_text.split("响应缺少 data 对象", 1)[1][:240].strip(" ：;")
