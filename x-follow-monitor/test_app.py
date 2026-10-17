@@ -216,7 +216,7 @@ class MonitorTests(unittest.TestCase):
                     {
                         "key": "error:query:real-data-error",
                         "category": "error",
-                        "text": "关注列表响应缺少 data 对象；schema validation failed",
+                        "text": "xAPI HTTP 429 rate limited",
                     },
                     {
                         "key": "brian_armstrong|new-follow",
