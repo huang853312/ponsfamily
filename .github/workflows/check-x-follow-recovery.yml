@@ -90,6 +90,6 @@ jobs:
           print("--- recent x-follow service logs ---")
           logs=subprocess.run(["journalctl","-u","x-follow-monitor.service","--since","10 minutes ago","--no-pager"],capture_output=True,text=True)
           for row in logs.stdout.splitlines():
-              if any(tag in row for tag in ("SCAN_SUMMARY","SCAN_OK","XAPI_BILLING_PAUSE","NOTICE_SENT","NOTICE_QUEUED","COMMAND_RECEIVED","Traceback","ERROR","Unable to record")):
+              if any(tag in row for tag in ("SCAN_SUMMARY","SCAN_OK","XAPI_BILLING_PAUSE","XAPI_TRANSIENT_RETRY","XAPI_TRANSIENT_NETWORK","STARTUP_PURGED_LEGACY_PROXY_ALERTS","STARTUP_PURGED_DUPLICATE_BILLING_ALERTS","STARTUP_PURGED_STALE_TELEGRAM_TIMEOUT_ALERTS","TELEGRAM_POLL_TIMEOUT","TELEGRAM_POLL_RECOVERED","NOTICE_SENT","NOTICE_QUEUED","COMMAND_RECEIVED","Traceback","ERROR","Unable to record")):
                   print(row[-350:])
           PY
