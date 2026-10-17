@@ -25,6 +25,51 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(state["notified_follows"], {})
         self.assertEqual(state["error_notices"], {})
 
+    def test_load_purges_old_per_account_402_alerts_but_keeps_real_alerts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            state_path.write_text(json.dumps({
+                "schema_version": 2,
+                "accounts": ["brian_armstrong", "yorios9312"],
+                "running": True,
+                "known": {"brian_armstrong": ["old-follow"]},
+                "error_notices": {
+                    "query:brian_armstrong": {
+                        "active": True,
+                        "last_error": "xAPI PLATFORM_HTTP_402: Insufficient balance or API Key limit exceeded",
+                    },
+                    "query:other_error": {"active": True, "last_error": "temporary timeout"},
+                    "xapi:billing-limit": {"active": True, "last_error": "global billing notice"},
+                },
+                "pending_notifications": [
+                    {
+                        "key": "error:query:brian_armstrong",
+                        "category": "error",
+                        "text": "xAPI 查询失败：@brian_armstrong：xAPI PLATFORM_HTTP_402: Insufficient balance or API Key limit exceeded",
+                    },
+                    {
+                        "key": "error:query:yorios9312",
+                        "category": "error",
+                        "text": "xAPI 查询失败：@yorios9312：xAPI PLATFORM_HTTP_402: Insufficient balance or API Key limit exceeded",
+                    },
+                    {"key": "error:query:other_error", "category": "error", "text": "temporary timeout"},
+                    {"key": "brian_armstrong|newfollow", "category": "follow", "text": "X关注提醒：新关注"},
+                ],
+                "api_pause_until": time.time() + 18000,
+                "api_pause_reason": "PLATFORM_HTTP_402",
+            }), encoding="utf-8")
+            with patch.object(app, "STATE", state_path):
+                state = app.load()
+        keys = [item.get("key") for item in state["pending_notifications"]]
+        self.assertNotIn("error:query:brian_armstrong", keys)
+        self.assertNotIn("error:query:yorios9312", keys)
+        self.assertIn("error:query:other_error", keys)
+        self.assertIn("brian_armstrong|newfollow", keys)
+        self.assertNotIn("query:brian_armstrong", state["error_notices"])
+        self.assertIn("query:other_error", state["error_notices"])
+        self.assertEqual(state["accounts"], ["brian_armstrong", "yorios9312"])
+        self.assertGreater(state["api_pause_until"], time.time())
+
     def test_load_preserves_billing_pause_across_restart(self):
         pause_until = time.time() + 18000
         with tempfile.TemporaryDirectory() as directory:

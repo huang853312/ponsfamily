@@ -41,9 +41,28 @@ def load():
     ids = old.get("ids") or {}
     notices = old.get("notified_follows") or {}
     errors = old.get("error_notices") or {}
+    errors = errors if isinstance(errors, dict) else {}
+    # Remove per-account billing records from old releases. They must never
+    # re-enter the notification cooldown and recreate a flood after restart.
+    stale_billing_error_keys = [
+        key for key, entry in errors.items()
+        if str(key).startswith("query:")
+        and isinstance(entry, dict)
+        and (
+            "PLATFORM_HTTP_402" in str(entry.get("last_error", ""))
+            or "Insufficient balance or API Key limit exceeded" in str(entry.get("last_error", ""))
+        )
+    ]
+    for key in stale_billing_error_keys:
+        errors.pop(key, None)
+
     queue = old.get("pending_notifications")
     queue = queue if isinstance(queue, list) else []
+    purged_billing_notices = 0
 
+    # Older releases queued billing failures separately for each account.
+    # Purge that backlog on load even while the global billing pause is active.
+    # Never remove genuine follow alerts or unrelated errors.
     # Older releases queued one identical missing-data error per monitored account.
     # Collapse those persisted alerts during migration so the sender does not drain
     # hundreds of obsolete duplicate error messages after the next restart.
@@ -53,6 +72,17 @@ def load():
             continue
         key = item.get("key")
         message = str(item.get("text", ""))
+        stale_account_billing_notice = (
+            item.get("category") == "error"
+            and str(key).startswith("error:query:")
+            and (
+                "PLATFORM_HTTP_402" in message
+                or "Insufficient balance or API Key limit exceeded" in message
+            )
+        )
+        if stale_account_billing_notice:
+            purged_billing_notices += 1
+            continue
         if key == "error:xapi:missing-data":
             existing_shape_notice = item
         elif item.get("category") == "error" and "关注列表响应缺少 data 对象" in message:
@@ -83,6 +113,12 @@ def load():
             + [float(item.get("next_attempt_at", 0) or 0) for item in shape_errors]
         )
         compacted.append(summary)
+    if purged_billing_notices or stale_billing_error_keys:
+        print(
+            "STARTUP_PURGED_DUPLICATE_BILLING_ALERTS "
+            f"queued={purged_billing_notices} error_records={len(stale_billing_error_keys)}",
+            flush=True,
+        )
     accounts = list(dict.fromkeys(x for x in accounts if isinstance(x, str)))
     # Pre-v2 state may contain a single page only. Reconcile before alerting.
     version = int(old.get("schema_version", 0) or 0)
