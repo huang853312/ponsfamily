@@ -211,6 +211,12 @@ class MonitorTests(unittest.TestCase):
         follows = [x for x in state["pending_notifications"] if x.get("category") == "follow"]
         self.assertEqual(len(follows), 1)
         self.assertEqual(follows[0]["key"], "fern|new-follow")
+        billing_notices = [
+            x for x in state["pending_notifications"]
+            if x.get("category") == "error"
+        ]
+        self.assertEqual([x["key"] for x in billing_notices], ["error:xapi:billing-limit"])
+        self.assertFalse(any("error:query:" in x.get("key", "") for x in billing_notices))
         self.assertGreater(state["api_pause_until"], time.time())
 
     def test_platform_402_pauses_all_scans_and_preserves_baselines(self):
