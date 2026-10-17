@@ -132,7 +132,8 @@ class MonitorTests(unittest.TestCase):
         self.assertNotIn("query:brian_armstrong", state["error_notices"])
         self.assertIn("query:other_error", state["error_notices"])
         self.assertEqual(state["accounts"], ["brian_armstrong", "yorios9312"])
-        self.assertGreater(state["api_pause_until"], time.time())
+        # Legacy states with no scan timestamp are eligible for immediate recheck.
+        self.assertLessEqual(state["api_pause_until"], time.time() + 1.0)
 
     def test_load_purges_old_telegram_read_timeout_alert_but_keeps_other_notices(self):
         with tempfile.TemporaryDirectory() as directory:
