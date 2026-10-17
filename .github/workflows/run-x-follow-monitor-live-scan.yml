@@ -1,4 +1,4 @@
-name: X Follow Monitor Live Scan Verification
+name: X Follow Monitor Live Scan Verification - retry after key settings check
 
 on:
   push:
