@@ -1,4 +1,4 @@
-name: Read-only X Follow Recovery Check after latest limit trial
+name: Read-only X Follow Recovery Check - inspect latest 402 after dashboard
 
 on:
   push:
