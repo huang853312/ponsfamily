@@ -141,6 +141,63 @@ jobs:
                   print(name + "_result=timeout")
               except Exception as exc:
                   print(name + "_exception=" + type(exc).__name__)
+          # One minimal live probe of the exact action used by the monitor.
+          # Emit only response metadata; never print account IDs, API keys, or user lists.
+          try:
+              current_state = json.loads(statep.read_text(encoding="utf-8"))
+              probe_name = "0xrachelita"
+              probe_uid = (current_state.get("ids") or {}).get(probe_name)
+              if probe_uid:
+                  probe_action = "twitter.following"
+                  probe_input = {"user_id": str(probe_uid), "provider": "x"}
+              else:
+                  probe_action = "twitter.user_by_screen_name"
+                  probe_input = {"screen_name": probe_name, "provider": "x"}
+              probe = subprocess.run(
+                  [str(cli), "call", probe_action, "--input", json.dumps(probe_input)],
+                  cwd=str(root), env=base_env, capture_output=True, text=True,
+                  timeout=60, check=False,
+              )
+              print("live_probe_action=" + probe_action)
+              print("live_probe_exit=" + str(probe.returncode))
+              try:
+                  payload = json.loads((probe.stdout or "").strip())
+                  print("live_probe_top_keys=" + ",".join(sorted(str(k) for k in payload.keys())[:25]) if isinstance(payload, dict) else "live_probe_payload_type=" + type(payload).__name__)
+                  found = {}
+                  def inspect_fields(obj, prefix=""):
+                      if isinstance(obj, dict):
+                          for k, v in obj.items():
+                              kstr = str(k)
+                              path = (prefix + "." + kstr).strip(".")
+                              if kstr.lower() in ("code", "message", "status", "request_id", "requestid", "source", "error"):
+                                  if isinstance(v, (str, int, float, bool)) or v is None:
+                                      found[path] = v
+                                  elif isinstance(v, dict):
+                                      found[path] = {str(kk): vv for kk, vv in v.items() if str(kk).lower() in ("code", "message", "type", "status", "request_id", "requestid", "source") and isinstance(vv, (str, int, float, bool))}
+                              if isinstance(v, dict):
+                                  inspect_fields(v, path)
+                      elif isinstance(obj, list):
+                          for idx, v in enumerate(obj[:2]):
+                              if isinstance(v, dict): inspect_fields(v, prefix + "[" + str(idx) + "]")
+                  inspect_fields(payload)
+                  print("live_probe_error_fields=" + json.dumps(found, ensure_ascii=False)[:1800])
+                  if isinstance(payload, dict):
+                      data = payload.get("data")
+                      if isinstance(data, dict):
+                          users = data.get("users")
+                          print("live_probe_data_keys=" + ",".join(sorted(str(k) for k in data.keys())[:25]))
+                          if isinstance(users, list): print("live_probe_users_count=" + str(len(users)))
+              except Exception:
+                  # Avoid logging raw body because a successful response contains profile data.
+                  output = (probe.stdout or "") + " " + (probe.stderr or "")
+                  print("live_probe_json_parse=failed")
+                  print("live_probe_output_has_402=" + str("402" in output).lower())
+                  print("live_probe_output_has_limit_text=" + str("limit exceeded" in output.lower()).lower())
+          except subprocess.TimeoutExpired:
+              print("live_probe_result=timeout")
+          except Exception as exc:
+              print("live_probe_exception=" + type(exc).__name__)
+
           for prop in ("ActiveState", "MainPID", "NRestarts"):
               result = subprocess.run(["systemctl", "show", "x-follow-monitor.service", "-p", prop, "--value"],
                                       capture_output=True, text=True, timeout=10)
