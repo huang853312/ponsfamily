@@ -1,4 +1,4 @@
-name: Read-only X Follow Recovery Check with Live Scan Diagnostics
+name: Read-only X Follow Recovery Check after latest limit trial
 
 on:
   push:
