@@ -1,4 +1,4 @@
-name: Read-only X Follow Recovery Check
+name: Read-only X Follow Recovery Check with Live Scan Diagnostics
 
 on:
   push:
