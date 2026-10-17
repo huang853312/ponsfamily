@@ -77,6 +77,52 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(state["accounts"], ["brian_armstrong", "yorios9312"])
         self.assertGreater(state["api_pause_until"], time.time())
 
+    def test_load_purges_old_telegram_read_timeout_alert_but_keeps_other_notices(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            state_path.write_text(json.dumps({
+                "schema_version": 2,
+                "accounts": ["brian_armstrong"],
+                "running": True,
+                "known": {"brian_armstrong": ["old-follow"]},
+                "error_notices": {
+                    "main-loop": {
+                        "active": True,
+                        "last_error": "监控主循环失败：The read operation timed out",
+                    },
+                    "query:brian_armstrong": {
+                        "active": True,
+                        "last_error": "temporary timeout contacting xAPI",
+                    },
+                },
+                "pending_notifications": [
+                    {
+                        "key": "error:main-loop",
+                        "category": "error",
+                        "text": "监控主循环失败：The read operation timed out；同类错误累计 6 次；重复通知已限频。",
+                    },
+                    {
+                        "key": "error:query:brian_armstrong",
+                        "category": "error",
+                        "text": "xAPI 查询失败：@brian_armstrong：temporary timeout contacting xAPI",
+                    },
+                    {
+                        "key": "brian_armstrong|new-follow",
+                        "category": "follow",
+                        "text": "X关注提醒：@brian_armstrong 新关注了 @new_follow",
+                    },
+                ],
+            }), encoding="utf-8")
+            with patch.object(app, "STATE", state_path):
+                state = app.load()
+        keys = [item.get("key") for item in state["pending_notifications"]]
+        self.assertNotIn("error:main-loop", keys)
+        self.assertIn("error:query:brian_armstrong", keys)
+        self.assertIn("brian_armstrong|new-follow", keys)
+        self.assertNotIn("main-loop", state["error_notices"])
+        self.assertIn("query:brian_armstrong", state["error_notices"])
+        self.assertEqual(state["accounts"], ["brian_armstrong"])
+
     def test_load_preserves_billing_pause_across_restart(self):
         pause_until = time.time() + 18000
         with tempfile.TemporaryDirectory() as directory:

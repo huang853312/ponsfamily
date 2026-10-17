@@ -57,9 +57,27 @@ def load():
     for key in stale_billing_error_keys:
         errors.pop(key, None)
 
+    def is_stale_telegram_timeout(value):
+        value = str(value or "").lower()
+        return (
+            "the read operation timed out" in value
+            or "read timed out" in value
+            or "telegram getupdates" in value and "timed out" in value
+        )
+
+    stale_telegram_error_keys = [
+        key for key, entry in errors.items()
+        if key in ("main-loop", "telegram-poll-timeout")
+        and isinstance(entry, dict)
+        and is_stale_telegram_timeout(entry.get("last_error", ""))
+    ]
+    for key in stale_telegram_error_keys:
+        errors.pop(key, None)
+
     queue = old.get("pending_notifications")
     queue = queue if isinstance(queue, list) else []
     purged_billing_notices = 0
+    purged_telegram_timeout_notices = 0
 
     # Older releases queued billing failures separately for each account.
     # Purge that backlog on load even while the global billing pause is active.
@@ -83,6 +101,14 @@ def load():
         )
         if stale_account_billing_notice:
             purged_billing_notices += 1
+            continue
+        stale_telegram_timeout_notice = (
+            item.get("category") == "error"
+            and key in ("error:main-loop", "error:telegram-poll-timeout")
+            and is_stale_telegram_timeout(message)
+        )
+        if stale_telegram_timeout_notice:
+            purged_telegram_timeout_notices += 1
             continue
         if key == "error:xapi:missing-data":
             existing_shape_notice = item
@@ -118,6 +144,12 @@ def load():
         print(
             "STARTUP_PURGED_DUPLICATE_BILLING_ALERTS "
             f"queued={purged_billing_notices} error_records={len(stale_billing_error_keys)}",
+            flush=True,
+        )
+    if purged_telegram_timeout_notices or stale_telegram_error_keys:
+        print(
+            "STARTUP_PURGED_STALE_TELEGRAM_TIMEOUT_ALERTS "
+            f"queued={purged_telegram_timeout_notices} error_records={len(stale_telegram_error_keys)}",
             flush=True,
         )
     accounts = list(dict.fromkeys(x for x in accounts if isinstance(x, str)))
