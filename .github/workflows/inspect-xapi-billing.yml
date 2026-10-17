@@ -141,62 +141,84 @@ jobs:
                   print(name + "_result=timeout")
               except Exception as exc:
                   print(name + "_exception=" + type(exc).__name__)
-          # One minimal live probe of the exact action used by the monitor.
-          # Emit only response metadata; never print account IDs, API keys, or user lists.
+          # Read-only batch probe: mirrors the monitor's concurrency and captures per-account error metadata only.
+          # Does not modify state.json, histories, notification queues, or the service.
           try:
               current_state = json.loads(statep.read_text(encoding="utf-8"))
-              probe_name = "0xrachelita"
-              probe_uid = (current_state.get("ids") or {}).get(probe_name)
-              if probe_uid:
-                  probe_action = "twitter.following"
-                  probe_input = {"user_id": str(probe_uid), "provider": "x"}
-              else:
-                  probe_action = "twitter.user_by_screen_name"
-                  probe_input = {"screen_name": probe_name, "provider": "x"}
-              probe = subprocess.run(
-                  [str(cli), "call", probe_action, "--input", json.dumps(probe_input)],
-                  cwd=str(root), env=base_env, capture_output=True, text=True,
-                  timeout=60, check=False,
-              )
-              print("live_probe_action=" + probe_action)
-              print("live_probe_exit=" + str(probe.returncode))
-              try:
-                  payload = json.loads((probe.stdout or "").strip())
-                  print("live_probe_top_keys=" + ",".join(sorted(str(k) for k in payload.keys())[:25]) if isinstance(payload, dict) else "live_probe_payload_type=" + type(payload).__name__)
-                  found = {}
-                  def inspect_fields(obj, prefix=""):
-                      if isinstance(obj, dict):
-                          for k, v in obj.items():
-                              kstr = str(k)
-                              path = (prefix + "." + kstr).strip(".")
-                              if kstr.lower() in ("code", "message", "status", "request_id", "requestid", "source", "error"):
-                                  if isinstance(v, (str, int, float, bool)) or v is None:
-                                      found[path] = v
-                                  elif isinstance(v, dict):
-                                      found[path] = {str(kk): vv for kk, vv in v.items() if str(kk).lower() in ("code", "message", "type", "status", "request_id", "requestid", "source") and isinstance(vv, (str, int, float, bool))}
-                              if isinstance(v, dict):
-                                  inspect_fields(v, path)
-                      elif isinstance(obj, list):
-                          for idx, v in enumerate(obj[:2]):
-                              if isinstance(v, dict): inspect_fields(v, prefix + "[" + str(idx) + "]")
-                  inspect_fields(payload)
-                  print("live_probe_error_fields=" + json.dumps(found, ensure_ascii=False)[:1800])
-                  if isinstance(payload, dict):
-                      data = payload.get("data")
-                      if isinstance(data, dict):
-                          users = data.get("users")
-                          print("live_probe_data_keys=" + ",".join(sorted(str(k) for k in data.keys())[:25]))
-                          if isinstance(users, list): print("live_probe_users_count=" + str(len(users)))
-              except Exception:
-                  # Avoid logging raw body because a successful response contains profile data.
-                  output = (probe.stdout or "") + " " + (probe.stderr or "")
-                  print("live_probe_json_parse=failed")
-                  print("live_probe_output_has_402=" + str("402" in output).lower())
-                  print("live_probe_output_has_limit_text=" + str("limit exceeded" in output.lower()).lower())
+              probe_accounts = list(dict.fromkeys(current_state.get("accounts") or []))
+              probe_ids = current_state.get("ids") or {}
+              print("batch_probe_accounts=" + str(len(probe_accounts)))
+              print("batch_probe_concurrency=3")
+              def parse_probe_payload(stdout):
+                  try:
+                      obj = json.loads((stdout or "").strip())
+                  except Exception:
+                      return None, "non_json", ""
+                  if not isinstance(obj, dict):
+                      return obj, "unexpected_payload", ""
+                  err = obj.get("error")
+                  if isinstance(err, dict):
+                      return obj, str(err.get("code") or "error"), str(err.get("message") or "")[:240]
+                  code = str(obj.get("code") or "")
+                  message = str(obj.get("message") or "")[:240]
+                  if code or obj.get("success") is False:
+                      return obj, code or "error", message
+                  if obj.get("success") is True and isinstance(obj.get("data"), dict):
+                      return obj, "ok", ""
+                  if isinstance(obj.get("data"), dict) and "users" in obj.get("data", {}):
+                      return obj, "ok", ""
+                  return obj, "unexpected_payload", message
+              def call_action(action, data):
+                  p = subprocess.run(
+                      [str(cli), "call", action, "--input", json.dumps(data)],
+                      cwd=str(root), env=base_env, capture_output=True, text=True,
+                      timeout=60, check=False,
+                  )
+                  obj, code, message = parse_probe_payload(p.stdout)
+                  if p.returncode != 0 and code == "ok":
+                      code = "cli_exit_" + str(p.returncode)
+                  return p.returncode, obj, code, message
+              def probe_one(name):
+                  uid = probe_ids.get(name)
+                  if not uid:
+                      rc, obj, code, message = call_action("twitter.user_by_screen_name", {"screen_name": name, "provider": "x"})
+                      if code != "ok": return name, code, message, "user_by_screen_name"
+                      data = obj.get("data") if isinstance(obj, dict) else None
+                      uid = (data or {}).get("rest_id") or (data or {}).get("id") if isinstance(data, dict) else None
+                      if not uid: return name, "missing_user_id", "", "user_by_screen_name"
+                  try:
+                      rc, obj, code, message = call_action("twitter.following", {"user_id": str(uid), "provider": "x"})
+                      if code == "ok":
+                          data = obj.get("data") if isinstance(obj, dict) else None
+                          users = data.get("users") if isinstance(data, dict) else None
+                          return name, "ok", str(len(users)) if isinstance(users, list) else "data_ok", "twitter.following"
+                      return name, code, message, "twitter.following"
+                  except subprocess.TimeoutExpired:
+                      return name, "timeout", "", "twitter.following"
+                  except Exception as exc:
+                      return name, type(exc).__name__, str(exc)[:160], "twitter.following"
+              from concurrent.futures import ThreadPoolExecutor, as_completed
+              probe_results = []
+              with ThreadPoolExecutor(max_workers=3) as executor:
+                  futures = [executor.submit(probe_one, name) for name in probe_accounts]
+                  for future in as_completed(futures):
+                      try: probe_results.append(future.result())
+                      except Exception as exc: probe_results.append(("unknown", type(exc).__name__, str(exc)[:160], "probe"))
+              probe_results.sort(key=lambda row: row[0])
+              probe_ok = sum(1 for row in probe_results if row[1] == "ok")
+              print("batch_probe_ok=" + str(probe_ok))
+              print("batch_probe_failed=" + str(len(probe_results) - probe_ok))
+              for name, code, detail, action in probe_results:
+                  if code == "ok":
+                      print("batch_probe_result account=@" + name + " action=" + action + " status=ok detail=" + detail)
+                  else:
+                      safe_detail = str(detail or "").replace(key, "<redacted>")
+                      safe_detail = re.sub(r"(?i)(sk-xapi-[A-Za-z0-9_-]+)", "<redacted-key>", safe_detail)
+                      print("batch_probe_result account=@" + name + " action=" + action + " status=" + str(code) + " detail=" + safe_detail[:240])
           except subprocess.TimeoutExpired:
-              print("live_probe_result=timeout")
+              print("batch_probe_result=timeout")
           except Exception as exc:
-              print("live_probe_exception=" + type(exc).__name__)
+              print("batch_probe_exception=" + type(exc).__name__)
 
           for prop in ("ActiveState", "MainPID", "NRestarts"):
               result = subprocess.run(["systemctl", "show", "x-follow-monitor.service", "-p", prop, "--value"],
