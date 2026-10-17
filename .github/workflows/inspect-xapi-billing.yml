@@ -1,4 +1,5 @@
 name: Inspect XAPI Billing for X Follow Monitor
+# Read-only check of current production runtime; no credentials are printed.
 
 on:
   push:
