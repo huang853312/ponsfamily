@@ -438,6 +438,15 @@ async def scan_all(state):
         state["api_pause_until"] = time.time() + BILLING_PAUSE_SECONDS
         state["api_pause_reason"] = "PLATFORM_HTTP_402"
         state["last_scan_result"] = "billing_blocked"
+        # Remove queued per-account 402 notices left by older releases. Keep follow alerts.
+        state["pending_notifications"] = [
+            item for item in state.setdefault("pending_notifications", [])
+            if not (
+                isinstance(item, dict)
+                and str(item.get("key", "")).startswith("error:query:")
+                and "PLATFORM_HTTP_402" in str(item.get("text", ""))
+            )
+        ]
         save(state)
         report_limited_error(
             state,
@@ -468,6 +477,9 @@ async def scan_all(state):
         error_key = f"query:{name}"
         if exc is not None:
             error_text = str(exc)
+            if "PLATFORM_HTTP_402" in error_text:
+                # Billing failures are reported once per scan cycle above, not once per account.
+                continue
             if "关注列表响应缺少 data 对象" in error_text:
                 diagnostic = error_text.split("响应缺少 data 对象", 1)[1][:240].strip(" ：;")
                 message = (
