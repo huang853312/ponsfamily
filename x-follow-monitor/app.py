@@ -74,10 +74,25 @@ def load():
     for key in stale_telegram_error_keys:
         errors.pop(key, None)
 
+    # Prior releases mislabeled proxy ECONNRESET as a malformed/missing-data
+    # response. Purge those legacy error records and queued messages at startup.
+    stale_legacy_proxy_error_keys = [
+        key for key, entry in errors.items()
+        if isinstance(entry, dict)
+        and (str(key).startswith("query:") or key == "xapi:missing-data")
+        and is_transient_network_error("", entry.get("last_error", ""))
+    ]
+    for key in stale_legacy_proxy_error_keys:
+        errors.pop(key, None)
+
     queue = old.get("pending_notifications")
     queue = queue if isinstance(queue, list) else []
     purged_billing_notices = 0
     purged_telegram_timeout_notices = 0
+    purged_legacy_proxy_notices = 0
+    stale_legacy_proxy_notice_keys = {
+        "error:" + key for key in stale_legacy_proxy_error_keys
+    }
 
     # Older releases queued billing failures separately for each account.
     # Purge that backlog on load even while the global billing pause is active.
@@ -109,6 +124,22 @@ def load():
         )
         if stale_telegram_timeout_notice:
             purged_telegram_timeout_notices += 1
+            continue
+        if (
+            item.get("category") == "error"
+            and (
+                key in stale_legacy_proxy_notice_keys
+                or (
+                    key == "error:xapi:missing-data"
+                    and is_transient_network_error("", message)
+                )
+                or (
+                    str(key).startswith("error:query:")
+                    and is_transient_network_error("", message)
+                )
+            )
+        ):
+            purged_legacy_proxy_notices += 1
             continue
         if key == "error:xapi:missing-data":
             existing_shape_notice = item
@@ -150,6 +181,12 @@ def load():
         print(
             "STARTUP_PURGED_STALE_TELEGRAM_TIMEOUT_ALERTS "
             f"queued={purged_telegram_timeout_notices} error_records={len(stale_telegram_error_keys)}",
+            flush=True,
+        )
+    if purged_legacy_proxy_notices or stale_legacy_proxy_error_keys:
+        print(
+            "STARTUP_PURGED_LEGACY_PROXY_ALERTS "
+            f"queued={purged_legacy_proxy_notices} error_records={len(stale_legacy_proxy_error_keys)}",
             flush=True,
         )
     accounts = list(dict.fromkeys(x for x in accounts if isinstance(x, str)))

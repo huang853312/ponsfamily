@@ -180,6 +180,63 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("query:brian_armstrong", state["error_notices"])
         self.assertEqual(state["accounts"], ["brian_armstrong"])
 
+    def test_load_purges_legacy_proxy_missing_data_alerts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            state_path.write_text(json.dumps({
+                "schema_version": 2,
+                "accounts": ["brian_armstrong"],
+                "running": True,
+                "known": {"brian_armstrong": ["old-follow"]},
+                "error_notices": {
+                    "xapi:missing-data": {
+                        "active": True,
+                        "last_error": "twitter.following missing data; upstream=error={'code':'PROXY_ERROR','message':'read ECONNRESET'}",
+                    },
+                    "query:temporary-timeout": {
+                        "active": True,
+                        "last_error": "xAPI_TRANSIENT_NETWORK: read ECONNRESET",
+                    },
+                    "query:real-data-error": {
+                        "active": True,
+                        "last_error": "关注列表响应缺少 data 对象；upstream says schema is invalid",
+                    },
+                },
+                "pending_notifications": [
+                    {
+                        "key": "error:xapi:missing-data",
+                        "category": "error",
+                        "text": "上游响应缺少 data 对象。上游摘要：PROXY_ERROR read ECONNRESET；累计 61 次。",
+                    },
+                    {
+                        "key": "error:query:temporary-timeout",
+                        "category": "error",
+                        "text": "xAPI 查询失败：PROXY_ERROR read ECONNRESET",
+                    },
+                    {
+                        "key": "error:query:real-data-error",
+                        "category": "error",
+                        "text": "关注列表响应缺少 data 对象；schema validation failed",
+                    },
+                    {
+                        "key": "brian_armstrong|new-follow",
+                        "category": "follow",
+                        "text": "X关注提醒：@brian_armstrong 新关注了 @new_follow",
+                    },
+                ],
+            }), encoding="utf-8")
+            with patch.object(app, "STATE", state_path):
+                state = app.load()
+        keys = [item.get("key") for item in state["pending_notifications"]]
+        self.assertNotIn("error:xapi:missing-data", keys)
+        self.assertNotIn("error:query:temporary-timeout", keys)
+        self.assertIn("error:query:real-data-error", keys)
+        self.assertIn("brian_armstrong|new-follow", keys)
+        self.assertNotIn("xapi:missing-data", state["error_notices"])
+        self.assertNotIn("query:temporary-timeout", state["error_notices"])
+        self.assertIn("query:real-data-error", state["error_notices"])
+        self.assertEqual(state["accounts"], ["brian_armstrong"])
+
     def test_load_preserves_billing_pause_across_restart(self):
         pause_until = time.time() + 18000
         with tempfile.TemporaryDirectory() as directory:
