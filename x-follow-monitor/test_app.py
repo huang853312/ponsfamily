@@ -28,7 +28,7 @@ class MonitorTests(unittest.TestCase):
             },
         })
         good = json.dumps({"success": True, "data": {"users": []}})
-        with patch.object(app.CLI, "is_file", return_value=True), \
+        with patch.object(app, "CLI", Path(__file__)), \
              patch.object(app.subprocess, "run", side_effect=[
                  CompletedProcess([], 0, failed, ""),
                  CompletedProcess([], 0, good, ""),
@@ -49,7 +49,7 @@ class MonitorTests(unittest.TestCase):
                 "transient": False,
             },
         })
-        with patch.object(app.CLI, "is_file", return_value=True), \
+        with patch.object(app, "CLI", Path(__file__)), \
              patch.object(app.subprocess, "run", return_value=CompletedProcess([], 0, failed, "")) as run_mock, \
              patch.object(app.time, "sleep"):
             with self.assertRaisesRegex(RuntimeError, "XAPI_TRANSIENT_NETWORK"):
@@ -66,7 +66,7 @@ class MonitorTests(unittest.TestCase):
                 "transient": False,
             },
         })
-        with patch.object(app.CLI, "is_file", return_value=True), \
+        with patch.object(app, "CLI", Path(__file__)), \
              patch.object(app.subprocess, "run", return_value=CompletedProcess([], 0, billing, "")) as run_mock, \
              patch.object(app.time, "sleep") as sleep_mock:
             result = app.xapi("twitter.following", {"user_id": "123"})
