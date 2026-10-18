@@ -1,4 +1,4 @@
-name: Read-only X Follow Recovery Check - verify serial production scan
+name: Read-only X Follow Recovery Check - final serial scan verification
 
 on:
   push:
