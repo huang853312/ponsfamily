@@ -120,7 +120,7 @@ jobs:
                   probe_names=list(ids)[:1]
               for probe_name in probe_names:
                   req_body=json.dumps({"action_id":"twitter.following","input":{"user_id":str(ids[probe_name]),"provider":"x"}}).encode("utf-8")
-                  req=urllib.request.Request("https://action.xapi.to/v1/actions/execute",data=req_body,headers={"Content-Type":"application/json","XAPI-Key":cfg.get("XAPI_KEY","")},method="POST")
+                  req=urllib.request.Request("https://action.xapi.to/v1/actions/execute",data=req_body,headers={"Content-Type":"application/json","Accept":"application/json","User-Agent":"undici","XAPI-Key":cfg.get("XAPI_KEY","")},method="POST")
                   status=None; headers={}; raw=b""
                   try:
                       with urllib.request.urlopen(req,timeout=60) as response:
@@ -135,9 +135,12 @@ jobs:
                         +" source="+str(headers.get("X-XAPI-Source") or "missing")
                         +" request_id="+str(headers.get("X-XAPI-Request-Id") or "missing")
                         +" routing_attempts="+str(headers.get("X-Routing-Attempts") or "missing")
+                        +" server="+str(headers.get("Server") or "missing")
+                        +" content_type="+str(headers.get("Content-Type") or "missing")
                         +" success="+str(payload.get("success") if isinstance(payload,dict) else "non_json")
                         +" error_code="+str(err_obj.get("code") or payload.get("code") or "none")
-                        +" error_message="+str(err_obj.get("message") or payload.get("message") or "")[:220])
+                        +" error_message="+str(err_obj.get("message") or payload.get("message") or "")[:220]
+                        +" raw_preview="+raw.decode("utf-8",errors="replace").replace(chr(10)," ")[:180])
           except Exception as exc:
               print("direct_probe_exception="+type(exc).__name__+":"+str(exc)[:160])
 
