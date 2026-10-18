@@ -192,10 +192,22 @@ def load():
     api_pause_until = float(old.get("api_pause_until", 0) or 0)
     api_pause_reason = str(old.get("api_pause_reason", ""))
     last_scan_at = float(old.get("last_scan_at", 0) or 0)
-    # Older versions parked billing failures for six hours. Keep the circuit
-    # breaker, but automatically recheck after 30 minutes so a dashboard fix
-    # takes effect without requiring a manual Telegram /scan_now command.
-    if api_pause_reason == "PLATFORM_HTTP_402" and api_pause_until > time.time():
+    billing_policy_version = int(old.get("billing_policy_version", 0) or 0)
+    # The previous policy paused the entire monitor after any single-account 402.
+    # Clear that legacy pause once during migration so the fixed per-account policy
+    # can resume immediately. New global pauses are retained across restarts.
+    if billing_policy_version < 2:
+        if api_pause_reason == "PLATFORM_HTTP_402":
+            api_pause_until = 0
+            api_pause_reason = ""
+            print(
+                "BILLING_PAUSE_CLEARED_AFTER_POLICY_MIGRATION "
+                "previous_policy=single_account_stopped_all",
+                flush=True,
+            )
+        billing_policy_version = 2
+    # Retain automatic recheck as a safety net if an old longer pause remains.
+    elif api_pause_reason == "PLATFORM_HTTP_402" and api_pause_until > time.time():
         scheduled_recheck = last_scan_at + BILLING_PAUSE_SECONDS
         if api_pause_until > scheduled_recheck:
             api_pause_until = max(time.time(), scheduled_recheck)
@@ -226,6 +238,7 @@ def load():
         # Persist the circuit-breaker timer across deploys/restarts.
         "api_pause_until": api_pause_until,
         "api_pause_reason": api_pause_reason,
+        "billing_policy_version": billing_policy_version,
         "last_scan_at": last_scan_at,
         "last_scan_result": str(old.get("last_scan_result", "")),
         "last_scan_ok_accounts": int(old.get("last_scan_ok_accounts", 0) or 0),
@@ -660,19 +673,26 @@ async def scan_all(state):
     state["last_scan_ok_accounts"] = sum(1 for _name, _current, _uid, exc in results if exc is None)
     state["last_scan_failed_accounts"] = sum(1 for _name, _current, _uid, exc in results if exc is not None)
 
-    # PLATFORM_HTTP_402 is explicitly non-transient. Stop the scan cycle before
-    # changing baselines and pause future polls until a manual recheck.
-    billing_failure = next(
-        ((name, exc) for name, _current, _uid, exc in results
-         if exc is not None and "PLATFORM_HTTP_402" in str(exc)),
-        None,
+    # Isolate occasional per-account 402s. A single failed query must not stop
+    # all other monitored accounts; declare a global billing outage only when at
+    # least half of accounts (and at least two when possible) return the same code.
+    billing_failures = [
+        (name, exc) for name, _current, _uid, exc in results
+        if exc is not None and "PLATFORM_HTTP_402" in str(exc)
+    ]
+    billing_threshold = (
+        min(len(results), max(2, (len(results) + 1) // 2))
+        if results else 1
     )
-    if billing_failure:
-        name, exc = billing_failure
+    global_billing_failure = len(billing_failures) >= billing_threshold
+    state["billing_policy_version"] = 2
+
+    if global_billing_failure:
+        name, exc = billing_failures[0]
         state["api_pause_until"] = time.time() + BILLING_PAUSE_SECONDS
         state["api_pause_reason"] = "PLATFORM_HTTP_402"
         state["last_scan_result"] = "billing_blocked"
-        # Remove queued per-account 402 notices left by older releases. Keep follow alerts.
+        # Remove stale account-level 402 alerts when a broad outage is confirmed.
         state["pending_notifications"] = [
             item for item in state.setdefault("pending_notifications", [])
             if not (
@@ -685,21 +705,30 @@ async def scan_all(state):
         report_limited_error(
             state,
             "xapi:billing-limit",
-            "xAPI.to 额度/余额不足或 API Key 请求限额已达到（PLATFORM_HTTP_402）。"
-            f"自动扫描已暂停 {BILLING_PAUSE_SECONDS // 60} 分钟，之后自动重试，不需要手动发送命令；"
-            "本轮已成功取得的数据仍会处理，失败账号的历史名单会保留。"
-            "若已调整账户余额或 API Key limit，系统会在下次自动重试时恢复；"
-            f"上游信息：{str(exc)[:250]}",
+            "xAPI.to 疑似全局计费故障："
+            f"{len(billing_failures)}/{len(results)} 个账号返回 PLATFORM_HTTP_402，"
+            f"已达到全局暂停阈值 {billing_threshold}。"
+            f"监控将暂停 {BILLING_PAUSE_SECONDS // 60} 分钟后自动重试；"
+            "已成功取得的数据会继续处理，失败账号历史基线会保留。"
+            f"首个错误账号：@{name}；上游信息：{str(exc)[:220]}",
         )
         print(
             f"XAPI_BILLING_PAUSE reason=PLATFORM_HTTP_402 "
+            f"failed={len(billing_failures)}/{len(results)} threshold={billing_threshold} "
             f"account=@{name} pause_seconds={BILLING_PAUSE_SECONDS}",
             flush=True,
         )
-    elif any(exc is None for _name, _current, _uid, exc in results):
+    else:
+        # Clear legacy/global state whenever this scan does not meet the global threshold.
         state.pop("api_pause_until", None)
         state.pop("api_pause_reason", None)
         clear_error(state, "xapi:billing-limit")
+        if billing_failures:
+            print(
+                f"XAPI_ACCOUNT_402_ISOLATED count={len(billing_failures)}/{len(results)} "
+                f"global_threshold={billing_threshold}; other_accounts_continue=true",
+                flush=True,
+            )
 
     has_transient_network_failures = any(
         exc is not None and "XAPI_TRANSIENT_NETWORK" in str(exc)
@@ -719,7 +748,20 @@ async def scan_all(state):
         if exc is not None:
             error_text = str(exc)
             if "PLATFORM_HTTP_402" in error_text:
-                # Billing failures are reported once per scan cycle above, not once per account.
+                if not global_billing_failure:
+                    detail = error_text.replace("\\n", " ")[:220]
+                    report_limited_error(
+                        state,
+                        error_key,
+                        f"xAPI 单账号请求返回 PLATFORM_HTTP_402：@{name} 本轮已隔离，"
+                        "其他账号继续扫描；当前未达到全局暂停阈值。"
+                        f"上游摘要：{detail}",
+                    )
+                    print(
+                        f"XAPI_ACCOUNT_402 account=@{name} "
+                        "baseline_preserved=true global_pause=false",
+                        flush=True,
+                    )
                 continue
             if "XAPI_TRANSIENT_NETWORK" in error_text:
                 report_limited_error(
@@ -795,7 +837,7 @@ async def scan_all(state):
         print(f"SCAN_OK account=@{name} follows={len(now)} new={len(now - old)}", flush=True)
 
     state["last_scan_result"] = (
-        "billing_blocked" if billing_failure else
+        "billing_blocked" if global_billing_failure else
         ("success" if state["last_scan_failed_accounts"] == 0 else "partial_error")
     )
     save(state)

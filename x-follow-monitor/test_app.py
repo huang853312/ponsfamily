@@ -238,28 +238,24 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("query:real-data-error", state["error_notices"])
         self.assertEqual(state["accounts"], ["brian_armstrong"])
 
-    def test_load_shortens_legacy_billing_pause_to_automatic_recheck(self):
-        now = time.time()
-        last_scan_at = now - 600
-        pause_until = now + 18000
+    def test_load_clears_legacy_global_402_pause_after_policy_migration(self):
+        pause_until = time.time() + 18000
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "state.json"
             state_path.write_text(json.dumps({
+                "schema_version": 2,
                 "accounts": ["fern"], "running": True,
                 "known": {"fern": ["old-user"]},
-                "last_scan_at": last_scan_at,
+                "last_scan_at": time.time() - 600,
                 "api_pause_until": pause_until,
                 "api_pause_reason": "PLATFORM_HTTP_402",
             }), encoding="utf-8")
             with patch.object(app, "STATE", state_path):
                 state = app.load()
-        self.assertLess(state["api_pause_until"], pause_until)
-        self.assertAlmostEqual(
-            state["api_pause_until"],
-            last_scan_at + app.BILLING_PAUSE_SECONDS,
-            delta=1.0,
-        )
-        self.assertEqual(state["api_pause_reason"], "PLATFORM_HTTP_402")
+        self.assertEqual(state["api_pause_until"], 0)
+        self.assertEqual(state["api_pause_reason"], "")
+        self.assertEqual(state["billing_policy_version"], 2)
+        self.assertEqual(state["accounts"], ["fern"])
         self.assertEqual(state["known"]["fern"], ["old-user"])
 
     def test_load_fails_closed_on_corrupt_state(self):
@@ -408,7 +404,7 @@ class MonitorTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "PLATFORM_HTTP_402"):
                 app.resolve_id("newaccount")
 
-    def test_platform_402_processes_successful_accounts_before_pausing(self):
+    def test_one_account_402_does_not_pause_other_accounts(self):
         state = {
             "accounts": ["fern", "other"], "running": True,
             "known": {"fern": ["old1"], "other": ["old2"]},
@@ -426,9 +422,11 @@ class MonitorTests(unittest.TestCase):
 
         self.assertEqual(state["known"]["fern"], ["new-follow", "old1"])
         self.assertEqual(state["known"]["other"], ["old2"])
-        self.assertEqual(state["last_scan_result"], "billing_blocked")
+        self.assertEqual(state["last_scan_result"], "partial_error")
         self.assertEqual(state["last_scan_ok_accounts"], 1)
         self.assertEqual(state["last_scan_failed_accounts"], 1)
+        self.assertNotIn("api_pause_until", state)
+        self.assertNotIn("api_pause_reason", state)
         follows = [x for x in state["pending_notifications"] if x.get("category") == "follow"]
         self.assertEqual(len(follows), 1)
         self.assertEqual(follows[0]["key"], "fern|new-follow")
@@ -436,11 +434,11 @@ class MonitorTests(unittest.TestCase):
             x for x in state["pending_notifications"]
             if x.get("category") == "error"
         ]
-        self.assertEqual([x["key"] for x in billing_notices], ["error:xapi:billing-limit"])
-        self.assertFalse(any("error:query:" in x.get("key", "") for x in billing_notices))
-        self.assertGreater(state["api_pause_until"], time.time())
+        self.assertEqual([x["key"] for x in billing_notices], ["error:query:other"])
+        self.assertIn("单账号请求返回 PLATFORM_HTTP_402", billing_notices[0]["text"])
+        self.assertNotIn("error:xapi:billing-limit", [x["key"] for x in state["pending_notifications"]])
 
-    def test_platform_402_pauses_all_scans_and_preserves_baselines(self):
+    def test_global_402_pauses_scans_only_when_threshold_reached_and_preserves_baselines(self):
         state = {
             "accounts": ["fern", "other"], "running": True,
             "known": {"fern": ["old1"], "other": ["old2"]},
