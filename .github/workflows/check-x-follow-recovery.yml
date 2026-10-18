@@ -108,7 +108,7 @@ jobs:
                               print(label+"_result=timeout")
               except Exception as exc:
                   print("post_scan_billing_probe_error="+type(exc).__name__)
-                    for prop in ("ActiveState","MainPID","Result","NRestarts"):
+          for prop in ("ActiveState","MainPID","Result","NRestarts"):
               out=subprocess.run(["systemctl","show","x-follow-monitor.service","-p",prop,"--value"],capture_output=True,text=True)
               print("service_"+prop.lower()+"="+out.stdout.strip())
           pid=subprocess.run(["systemctl","show","x-follow-monitor.service","-p","MainPID","--value"],capture_output=True,text=True).stdout.strip()
