@@ -1,4 +1,4 @@
-name: Read-only X Follow Recovery Check - inspect latest 402 after dashboard
+name: Read-only X Follow Recovery Check - verify post-fix production scan
 
 on:
   push:
