@@ -56,7 +56,29 @@ class MonitorTests(unittest.TestCase):
                 app.xapi("twitter.following", {"user_id": "123"})
         self.assertEqual(run_mock.call_count, 3)
 
-    def test_billing_402_is_not_retried(self):
+    def test_billing_402_retries_once_for_readonly_following(self):
+        from subprocess import CompletedProcess
+        billing = json.dumps({
+            "success": False,
+            "error": {
+                "code": "PLATFORM_HTTP_402",
+                "message": "Insufficient balance or API Key limit exceeded",
+                "transient": False,
+            },
+        })
+        good = json.dumps({"success": True, "data": {"users": []}})
+        with patch.object(app, "CLI", Path(__file__)), \
+             patch.object(app.subprocess, "run", side_effect=[
+                 CompletedProcess([], 0, billing, ""),
+                 CompletedProcess([], 0, good, ""),
+             ]) as run_mock, \
+             patch.object(app.time, "sleep") as sleep_mock:
+            result = app.xapi("twitter.following", {"user_id": "123"})
+        self.assertTrue(result["success"])
+        self.assertEqual(run_mock.call_count, 2)
+        sleep_mock.assert_called_once_with(1)
+
+    def test_billing_402_is_not_retried_for_non_readonly_action(self):
         from subprocess import CompletedProcess
         billing = json.dumps({
             "success": False,
@@ -69,7 +91,7 @@ class MonitorTests(unittest.TestCase):
         with patch.object(app, "CLI", Path(__file__)), \
              patch.object(app.subprocess, "run", return_value=CompletedProcess([], 0, billing, "")) as run_mock, \
              patch.object(app.time, "sleep") as sleep_mock:
-            result = app.xapi("twitter.following", {"user_id": "123"})
+            result = app.xapi("twitter.tweet_create", {"text": "test"})
         self.assertEqual(result["error"]["code"], "PLATFORM_HTTP_402")
         run_mock.assert_called_once()
         sleep_mock.assert_not_called()

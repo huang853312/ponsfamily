@@ -15,7 +15,7 @@ CLI = APP / "node_modules" / ".bin" / "xapi-to"
 BOT = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 INTERVAL = max(300, int(os.getenv("X_FOLLOW_INTERVAL", "1800")))
-MAX_CONCURRENCY = max(1, int(os.getenv("X_FOLLOW_CONCURRENCY", "3")))
+MAX_CONCURRENCY = max(1, int(os.getenv("X_FOLLOW_CONCURRENCY", "1")))
 ERROR_COOLDOWN = max(600, int(os.getenv("X_FOLLOW_ERROR_COOLDOWN", "21600")))
 BILLING_PAUSE_SECONDS = max(1800, int(os.getenv("X_FOLLOW_BILLING_PAUSE", "1800")))
 FOLLOW_SEND_INTERVAL = max(3.0, float(os.getenv("X_FOLLOW_SEND_INTERVAL", "3")))
@@ -406,6 +406,7 @@ def xapi(action, payload):
         raise RuntimeError(f"xapi-to CLI 不存在：{CLI}")
     args = [str(CLI), "call", action, "--input", json.dumps(payload, ensure_ascii=False)]
     last_network_detail = ""
+    billing_retry_used = False
     # Three bounded attempts protect against transient proxy resets without retrying
     # normal API, auth, or billing errors that can cost money.
     for attempt in range(1, 4):
@@ -470,6 +471,19 @@ def xapi(action, payload):
             raise RuntimeError(f"xAPI 返回的不是 JSON：{preview}") from exc
 
         code, message = _xapi_error_fields(result)
+        if (
+            code == "PLATFORM_HTTP_402"
+            and action in ("twitter.following", "twitter.user_by_screen_name")
+            and not billing_retry_used
+            and attempt < 3
+        ):
+            billing_retry_used = True
+            print(
+                f"XAPI_BILLING_RETRY action={action} attempt={attempt}/3 wait=1s",
+                flush=True,
+            )
+            time.sleep(1)
+            continue
         if is_transient_network_error(code, message):
             last_network_detail = f"{code}: {message}".strip(": ")
             if attempt < 3:
@@ -537,7 +551,9 @@ def newest_following(name, cached_uid=None):
             upstream_error = result.get("error")
             if isinstance(upstream_error, dict) and upstream_error.get("code") == "PLATFORM_HTTP_402":
                 message = str(upstream_error.get("message") or "Insufficient balance or API Key limit exceeded")[:300]
-                raise RuntimeError(f"xAPI PLATFORM_HTTP_402: {message}")
+                raise RuntimeError(
+                    f"xAPI PLATFORM_HTTP_402 at twitter.following page={page_number}: {message}"
+                )
         data = result.get("data") if isinstance(result, dict) else None
         if not isinstance(data, dict):
             keys = sorted(str(key) for key in result.keys())[:25] if isinstance(result, dict) else []
