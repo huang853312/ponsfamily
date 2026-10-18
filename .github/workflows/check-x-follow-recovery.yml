@@ -1,4 +1,4 @@
-name: Read-only X Follow Recovery Check - final serial scan verification
+name: Read-only X Follow Recovery Check - inspect serial scan process
 
 on:
   push:
@@ -126,8 +126,23 @@ jobs:
                   print("runtime_telegram_chat_present="+str(bool(chat)).lower())
               except Exception as exc:
                   print("runtime_env_read_failed="+type(exc).__name__)
+          # Read-only process snapshot: show timing/CPU and child-process count, not command arguments.
+          try:
+              pids=[x for x in (pid or "").split() if x.isdigit() and x!="0"]
+              for proc_pid in pids:
+                  snap=subprocess.run(["ps","-p",proc_pid,"-o","pid=,etime=,%cpu=,%mem=,stat=,comm="],capture_output=True,text=True)
+                  print("service_process_snapshot="+snap.stdout.strip())
+                  children=Path("/proc/"+proc_pid+"/task/"+proc_pid+"/children")
+                  if children.is_file():
+                      child_ids=[x for x in children.read_text().split() if x.isdigit()]
+                      print("service_child_process_count="+str(len(child_ids)))
+                      for child_pid in child_ids[:4]:
+                          child=subprocess.run(["ps","-p",child_pid,"-o","pid=,etime=,%cpu=,%mem=,stat=,comm="],capture_output=True,text=True)
+                          print("service_child_snapshot="+child.stdout.strip())
+          except Exception as exc:
+              print("process_snapshot_error="+type(exc).__name__)
           print("--- recent x-follow service logs ---")
-          logs=subprocess.run(["journalctl","-u","x-follow-monitor.service","--since","10 minutes ago","--no-pager"],capture_output=True,text=True)
+          logs=subprocess.run(["journalctl","-u","x-follow-monitor.service","--since","30 minutes ago","--no-pager"],capture_output=True,text=True)
           for row in logs.stdout.splitlines():
               if any(tag in row for tag in ("SCAN_SUMMARY","SCAN_OK","XAPI_BILLING_PAUSE","XAPI_ACCOUNT_402","XAPI_ACCOUNT_402_ISOLATED","BILLING_PAUSE_CLEARED_AFTER_POLICY_MIGRATION","XAPI_TRANSIENT_RETRY","XAPI_TRANSIENT_NETWORK","STARTUP_PURGED_LEGACY_PROXY_ALERTS","STARTUP_PURGED_DUPLICATE_BILLING_ALERTS","STARTUP_PURGED_STALE_TELEGRAM_TIMEOUT_ALERTS","TELEGRAM_POLL_TIMEOUT","TELEGRAM_POLL_RECOVERED","NOTICE_SENT","NOTICE_QUEUED","COMMAND_RECEIVED","Traceback","ERROR","Unable to record")):
                   print(row[-350:])
