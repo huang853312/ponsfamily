@@ -109,6 +109,38 @@ jobs:
                               print(label+"_result=timeout")
               except Exception as exc:
                   print("post_scan_billing_probe_error="+type(exc).__name__)
+          # One raw HTTP-level probe captures xAPI's outer HTTP status and diagnostic headers.
+          # Only metadata/error fields are emitted; the API key and user lists are never printed.
+          try:
+              import urllib.request, urllib.error
+              state_obj=json.loads((root/"state.json").read_text(encoding="utf-8"))
+              ids=state_obj.get("ids") or {}
+              probe_names=[name for name in ("jerallaire","bobbilee") if name in ids]
+              if not probe_names:
+                  probe_names=list(ids)[:1]
+              for probe_name in probe_names:
+                  req_body=json.dumps({"action_id":"twitter.following","input":{"user_id":str(ids[probe_name]),"provider":"x"}}).encode("utf-8")
+                  req=urllib.request.Request("https://action.xapi.to/v1/actions/execute",data=req_body,headers={"Content-Type":"application/json","XAPI-Key":cfg.get("XAPI_KEY","")},method="POST")
+                  status=None; headers={}; raw=b""
+                  try:
+                      with urllib.request.urlopen(req,timeout=60) as response:
+                          status=response.status; headers=response.headers; raw=response.read()
+                  except urllib.error.HTTPError as exc:
+                      status=exc.code; headers=exc.headers; raw=exc.read()
+                  try: payload=json.loads(raw.decode("utf-8",errors="replace"))
+                  except Exception: payload={}
+                  err_obj=payload.get("error") if isinstance(payload,dict) else None
+                  if not isinstance(err_obj,dict): err_obj={}
+                  print("direct_probe account=@"+probe_name+" http_status="+str(status)
+                        +" source="+str(headers.get("X-XAPI-Source") or "missing")
+                        +" request_id="+str(headers.get("X-XAPI-Request-Id") or "missing")
+                        +" routing_attempts="+str(headers.get("X-Routing-Attempts") or "missing")
+                        +" success="+str(payload.get("success") if isinstance(payload,dict) else "non_json")
+                        +" error_code="+str(err_obj.get("code") or payload.get("code") or "none")
+                        +" error_message="+str(err_obj.get("message") or payload.get("message") or "")[:220])
+          except Exception as exc:
+              print("direct_probe_exception="+type(exc).__name__+":"+str(exc)[:160])
+
           for prop in ("ActiveState","MainPID","Result","NRestarts"):
               out=subprocess.run(["systemctl","show","x-follow-monitor.service","-p",prop,"--value"],capture_output=True,text=True)
               print("service_"+prop.lower()+"="+out.stdout.strip())
