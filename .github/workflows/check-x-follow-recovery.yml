@@ -1,4 +1,4 @@
-name: Read-only X Follow Recovery Check - inspect serial scan process
+name: Read-only X Follow Recovery Check - inspect scan subprocesses
 
 on:
   push:
@@ -132,13 +132,16 @@ jobs:
               for proc_pid in pids:
                   snap=subprocess.run(["ps","-p",proc_pid,"-o","pid=,etime=,%cpu=,%mem=,stat=,comm="],capture_output=True,text=True)
                   print("service_process_snapshot="+snap.stdout.strip())
-                  children=Path("/proc/"+proc_pid+"/task/"+proc_pid+"/children")
-                  if children.is_file():
-                      child_ids=[x for x in children.read_text().split() if x.isdigit()]
-                      print("service_child_process_count="+str(len(child_ids)))
-                      for child_pid in child_ids[:4]:
-                          child=subprocess.run(["ps","-p",child_pid,"-o","pid=,etime=,%cpu=,%mem=,stat=,comm="],capture_output=True,text=True)
-                          print("service_child_snapshot="+child.stdout.strip())
+                  # Enumerate by PPID; Python worker threads can own subprocesses, so /proc/<main-tid>/children alone is incomplete.
+                  table=subprocess.run(["ps","-eo","pid=,ppid=,etimes=,%cpu=,stat=,comm="],capture_output=True,text=True)
+                  children=[]
+                  for line in table.stdout.splitlines():
+                      cols=line.split()
+                      if len(cols)>=6 and cols[1]==proc_pid:
+                          children.append(" ".join((cols[0],cols[2],cols[3],cols[4],cols[5])))
+                  print("service_child_process_count="+str(len(children)))
+                  for child in children[:6]:
+                      print("service_child_snapshot="+child)
           except Exception as exc:
               print("process_snapshot_error="+type(exc).__name__)
           print("--- recent x-follow service logs ---")
