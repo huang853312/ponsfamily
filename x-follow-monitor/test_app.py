@@ -114,7 +114,7 @@ class MonitorTests(unittest.TestCase):
     def test_load_purges_old_per_account_402_alerts_but_keeps_real_alerts(self):
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "state.json"
-            state_path.write_text(json.dumps({
+            state_path.write_text(json.dumps({"follow_policy_version": 3, 
                 "schema_version": 2,
                 "accounts": ["brian_armstrong", "yorios9312"],
                 "running": True,
@@ -160,7 +160,7 @@ class MonitorTests(unittest.TestCase):
     def test_load_purges_old_telegram_read_timeout_alert_but_keeps_other_notices(self):
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "state.json"
-            state_path.write_text(json.dumps({
+            state_path.write_text(json.dumps({"follow_policy_version": 3, 
                 "schema_version": 2,
                 "accounts": ["brian_armstrong"],
                 "running": True,
@@ -206,7 +206,7 @@ class MonitorTests(unittest.TestCase):
     def test_load_purges_legacy_proxy_missing_data_alerts(self):
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "state.json"
-            state_path.write_text(json.dumps({
+            state_path.write_text(json.dumps({"follow_policy_version": 3, 
                 "schema_version": 2,
                 "accounts": ["brian_armstrong"],
                 "running": True,
@@ -376,7 +376,7 @@ class MonitorTests(unittest.TestCase):
     def test_load_collapses_legacy_missing_data_error_queue(self):
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "state.json"
-            state_path.write_text(json.dumps({
+            state_path.write_text(json.dumps({"follow_policy_version": 3, 
                 "accounts": ["fern"],
                 "known": {"fern": ["known-user"]},
                 "pending_notifications": [
@@ -434,7 +434,7 @@ class MonitorTests(unittest.TestCase):
             "notified_follows": {}, "error_notices": {}, "pending_notifications": [],
         }
 
-        def lookup(name, cached_uid=None):
+        def lookup(name, cached_uid=None, stop_at=None):
             if name == "fern":
                 return {"old1": "Old1", "new-follow": "NewFollow"}, "1"
             raise RuntimeError("xAPI PLATFORM_HTTP_402: Insufficient balance or API Key limit exceeded")
@@ -594,6 +594,114 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(len(state["pending_notifications"]), 1)
         self.assertEqual(state["error_notices"]["query:fern"]["count"], 2)
 
+    def _paused_state(self):
+        state = {
+            "accounts": ["alice", "bob", "carol"], "ids": {}, "known": {"alice": ["1"], "bob": ["2"], "carol": ["3"]},
+            "running": True, "baseline_reconcile": [], "notified_follows": [], "pending_notifications": [],
+            "api_pause_reason": "PLATFORM_HTTP_402", "api_pause_until": 0,
+            "error_notices": {"xapi:billing-limit": {"count": 1, "active": True, "last_sent": time.time()}},
+        }
+        return state
+
+    def test_billing_outage_recheck_probes_one_account_and_backs_off_silently(self):
+        state = self._paused_state()
+        calls = []
+        def fake(name, uid=None, stop_at=None):
+            calls.append(name)
+            raise RuntimeError("xAPI PLATFORM_HTTP_402: Insufficient balance")
+        with patch.object(app, "newest_following", side_effect=fake), patch.object(app, "save"):
+            asyncio.run(app.scan_all(state))
+            first_until = state["api_pause_until"] - time.time()
+            asyncio.run(app.scan_all(state))
+            second_until = state["api_pause_until"] - time.time()
+        self.assertEqual(calls, ["alice", "alice"])
+        self.assertEqual(state["billing_pause_streak"], 2)
+        self.assertGreater(second_until, first_until)
+        self.assertLessEqual(second_until, app.BILLING_PAUSE_MAX_SECONDS + 1)
+        self.assertEqual(state["pending_notifications"], [])
+
+    def test_billing_outage_recovery_resumes_full_scan_and_notifies_once(self):
+        state = self._paused_state()
+        calls = []
+        def fake(name, uid=None, stop_at=None):
+            calls.append(name)
+            return {state["known"][name][0]: name + "_f"}, "uid_" + name
+        with patch.object(app, "newest_following", side_effect=fake), patch.object(app, "save"):
+            asyncio.run(app.scan_all(state))
+        self.assertNotIn("api_pause_reason", state)
+        self.assertEqual(sorted(set(calls)), ["alice", "bob", "carol"])
+        recovered = [n for n in state["pending_notifications"] if n["key"].startswith("recovered:xapi-billing")]
+        self.assertEqual(len(recovered), 1)
+
+    def test_billing_pause_backoff_is_capped(self):
+        self.assertEqual(app.billing_pause_seconds(0), app.BILLING_PAUSE_SECONDS)
+        self.assertEqual(app.billing_pause_seconds(50), app.BILLING_PAUSE_MAX_SECONDS)
+
+
+    def test_incremental_read_stops_at_first_page_overlapping_baseline(self):
+        responses = [
+            {"data": {"users": [{"screen_name": "Newbie"}, {"screen_name": "Old1"}], "cursor_bottom": "p2"}},
+            {"data": {"users": [{"screen_name": "Old2"}], "cursor_bottom": "p3"}},
+        ]
+        with patch.object(app, "resolve_id", return_value="1"), \
+             patch.object(app, "xapi", side_effect=responses) as xapi_mock:
+            current, _uid = app.newest_following("fern", "1", {"old1", "old2"})
+        self.assertIsInstance(current, app.PartialFollowing)
+        self.assertEqual(set(current), {"newbie", "old1"})
+        self.assertEqual(xapi_mock.call_count, 1)
+
+    def test_incremental_scan_alerts_new_follow_and_keeps_baseline(self):
+        state = {
+            "accounts": ["fern"], "running": True, "known": {"fern": ["old1", "old2"]},
+            "ids": {"fern": "1"}, "notified_follows": {}, "error_notices": {},
+            "pending_notifications": [], "last_full_scan": {"fern": time.time()},
+        }
+        seen = {}
+        def fake(name, uid=None, stop_at=None):
+            seen["stop_at"] = stop_at
+            return app.PartialFollowing({"newbie": "Newbie", "old1": "Old1"}), "1"
+        with patch.object(app, "newest_following", side_effect=fake), patch.object(app, "save"):
+            asyncio.run(app.scan_all(state))
+        self.assertEqual(seen["stop_at"], {"old1", "old2"})
+        self.assertEqual(state["known"]["fern"], ["newbie", "old1", "old2"])
+        self.assertEqual(len([n for n in state["pending_notifications"] if n.get("category") == "follow"]), 1)
+
+    def test_new_account_baseline_reads_first_page_only(self):
+        responses = [
+            {"data": {"users": [{"screen_name": "A"}], "cursor_bottom": "p2"}},
+            {"data": {"users": [{"screen_name": "B"}], "cursor_bottom": ""}},
+        ]
+        with patch.object(app, "resolve_id", return_value="1"), \
+             patch.object(app, "xapi", side_effect=responses) as xapi_mock:
+            current, _uid = app.newest_following("fern", "1", set())
+        self.assertEqual(set(current), {"a"})
+        self.assertEqual(xapi_mock.call_count, 1)
+
+    def test_no_overlap_is_capped_at_new_page_limit(self):
+        responses = [
+            {"data": {"users": [{"screen_name": f"N{i}"}], "cursor_bottom": f"p{i+1}"}}
+            for i in range(10)
+        ]
+        with patch.object(app, "resolve_id", return_value="1"), \
+             patch.object(app, "xapi", side_effect=responses) as xapi_mock:
+            app.newest_following("fern", "1", {"old"})
+        self.assertEqual(xapi_mock.call_count, app.NEW_FOLLOW_MAX_PAGES)
+
+
+    def test_switch_to_new_follows_only_drops_follow_backlog_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            state_path.write_text(json.dumps({
+                "accounts": ["cz_binance"], "known": {"cz_binance": ["a"]},
+                "pending_notifications": [
+                    {"key": "cz_binance|x", "text": "X关注提醒", "category": "follow"},
+                    {"key": "error:y", "text": "err", "category": "error"},
+                ],
+            }), encoding="utf-8")
+            with patch.object(app, "STATE", state_path):
+                state = app.load()
+        self.assertEqual([q["key"] for q in state["pending_notifications"]], ["error:y"])
+        self.assertEqual(state["follow_policy_version"], 3)
 
 if __name__ == "__main__":
     unittest.main()
