@@ -20,6 +20,7 @@ PRIVATE_KEY = os.getenv("COPY_PRIVATE_KEY", "")
 STATE_FILE = os.getenv("COPY_STATE_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json"))
 ROUTERS = {a.strip().lower() for a in os.getenv("COPY_ROUTERS", "0x65050a9b7e5075a2ba5ced7b1b64ee66262c40dc").split(",") if a.strip()}
 SWAP_SELECTOR = "0x4d819a2a"
+PERMIT2 = "0x000000000022d473030f116ddee9f6b43ac78ba3"
 POLL_SEC = float(os.getenv("COPY_POLL_SEC", "1.5"))
 MAX_AGE_SEC = int(os.getenv("COPY_MAX_AGE_SEC", "30"))
 EXPLORER = "https://robinhoodchain.blockscout.com"
@@ -345,6 +346,15 @@ class Trader:
         # The target's own sell already moved the price, so quote what we can get now.
         guess = scaled_min_out(word_int(inp, 3), sold, amt, 0)
         quote = self.best_out(router, target, inp, amt, 0, guess)
+        if quote <= 0 and self.allowance(token, self.me, PERMIT2) < amt:
+            # Some routes pull tokens through Uniswap Permit2 instead of a plain allowance.
+            h, ok = self.send_tx(token, "0x095ea7b3" + "0" * 24 + PERMIT2[2:] + f"{amt:064x}", 0)
+            if ok:
+                expiry = int(time.time()) + 3600
+                p2 = ("0x87517c45" + "0" * 24 + token[2:] + "0" * 24 + router[2:]
+                      + f"{min(amt, (1 << 160) - 1):064x}" + f"{expiry:064x}")
+                self.send_tx(PERMIT2, p2, 0)
+            quote = self.best_out(router, target, inp, amt, 0, guess)
         if quote <= 0:
             return f"❌ 现在卖不出去（可能是貔貅币或没流动性），请手动处理 {sym}"
         keep = (Decimal(100) - Decimal(self.s["slippage_pct"])) / 100
