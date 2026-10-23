@@ -1,0 +1,118 @@
+name: Deploy Copy Trader
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "copy-trader/**"
+      - ".github/workflows/deploy-copy-trader.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-copy-trader-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test
+        working-directory: copy-trader
+        run: |
+          pip install -q -r requirements.txt
+          python3 -m unittest -v
+
+      - name: Check Telegram bot secret
+        id: gate
+        env:
+          COPY_TG_BOT_TOKEN: ${{ secrets.COPY_TG_BOT_TOKEN }}
+        run: |
+          if test -z "$COPY_TG_BOT_TOKEN"; then
+            echo "::warning::COPY_TG_BOT_TOKEN secret not set yet; files are tested but not deployed."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure SSH
+        if: steps.gate.outputs.ready == 'true'
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          touch ~/.ssh/known_hosts
+
+      - name: Deploy and restart
+        if: steps.gate.outputs.ready == 'true'
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          COPY_TG_BOT_TOKEN: ${{ secrets.COPY_TG_BOT_TOKEN }}
+          COPY_PRIVATE_KEY: ${{ secrets.COPY_PRIVATE_KEY }}
+          COPY_RPC_URL: ${{ secrets.COPY_RPC_URL }}
+        run: |
+          SSH="ssh -i $HOME/.ssh/deploy_key -p $SERVER_PORT -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30"
+          $SSH "$SERVER_USER@$SERVER_HOST" 'install -d /home/ubuntu/ponsfamily/copy-trader'
+          rsync -az --exclude='state.json' --exclude='.env' --exclude='.venv/' --exclude='__pycache__/' \
+            -e "$SSH" copy-trader/ "$SERVER_USER@$SERVER_HOST:/home/ubuntu/ponsfamily/copy-trader/"
+
+          # Stage secrets (never echoed) for the server-side env writer.
+          {
+            printf 'COPY_TG_BOT_TOKEN=%s\n' "$COPY_TG_BOT_TOKEN"
+            test -n "$COPY_PRIVATE_KEY" && printf 'COPY_PRIVATE_KEY=%s\n' "$COPY_PRIVATE_KEY"
+            test -n "$COPY_RPC_URL" && printf 'RPC_URL=%s\n' "$COPY_RPC_URL"
+            true
+          } | $SSH "$SERVER_USER@$SERVER_HOST" 'umask 077; cat > /tmp/copy-trader-staged.env'
+
+          $SSH "$SERVER_USER@$SERVER_HOST" '
+            set -e
+            cd /home/ubuntu/ponsfamily/copy-trader
+            test -x .venv/bin/python || python3 -m venv .venv
+            .venv/bin/pip install -q -r requirements.txt
+            python3 - <<"PY"
+          import os
+          from pathlib import Path
+          def read(p):
+              out = {}
+              try:
+                  for line in Path(p).read_text().splitlines():
+                      if "=" in line and not line.lstrip().startswith("#"):
+                          k, v = line.split("=", 1)
+                          out[k.strip().removeprefix("export ").strip()] = v.strip().strip(chr(34)).strip(chr(39))
+              except OSError:
+                  pass
+              return out
+          target = Path("/home/ubuntu/ponsfamily/copy-trader/.env")
+          env = read(target)
+          env.update({k: v for k, v in read("/tmp/copy-trader-staged.env").items() if v})
+          if not env.get("TELEGRAM_CHAT_ID"):
+              chat = read("/home/ubuntu/ponsfamily/x-follow-monitor/.env").get("TELEGRAM_CHAT_ID")
+              if chat:
+                  env["TELEGRAM_CHAT_ID"] = chat
+          missing = [k for k in ("COPY_TG_BOT_TOKEN", "TELEGRAM_CHAT_ID") if not env.get(k)]
+          if missing:
+              raise SystemExit("missing=" + ",".join(missing))
+          print("private_key_configured=" + str(bool(env.get("COPY_PRIVATE_KEY"))))
+          tmp = target.with_suffix(".tmp")
+          tmp.write_text("".join(f"{k}={v}\n" for k, v in env.items()))
+          os.chmod(tmp, 0o600)
+          os.replace(tmp, target)
+          Path("/tmp/copy-trader-staged.env").unlink(missing_ok=True)
+          PY
+            sudo install -m 0644 copy-trader.service /etc/systemd/system/copy-trader.service
+            sudo systemctl daemon-reload
+            sudo systemctl enable copy-trader.service
+            sudo systemctl restart copy-trader.service
+            sleep 15
+            sudo systemctl is-active copy-trader.service
+            sudo journalctl -u copy-trader.service --since "1 minute ago" --no-pager | tail -n 20
+          '
