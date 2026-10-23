@@ -118,3 +118,41 @@ class Safety(unittest.TestCase):
 
     def test_cannot_add_router(self):
         self.assertIn("不能添加", self.t.command("/add 0x65050a9b7e5075a2ba5ced7b1b64ee66262c40dc x"))
+
+
+class FakeRPC:
+    """eth_call succeeds while min-out <= limit; balances from a dict."""
+    def __init__(self, limit, bal=0):
+        self.limit, self.bal = limit, bal
+    def call(self, method, params):
+        if method == "eth_call":
+            data = params[0]["data"]
+            if data.startswith("0x70a08231"):
+                return hex(self.bal)
+            if T.word_int(data, 3) > self.limit:
+                raise RuntimeError("execution reverted")
+            return "0x"
+        raise AssertionError(method)
+
+
+class Quotes(unittest.TestCase):
+    def mk(self, rpc):
+        t = T.Trader(rpc, T.json.loads(T.json.dumps(T.DEFAULT_STATE)))
+        t.me = ME
+        return t
+
+    def test_best_out_finds_limit(self):
+        for limit in (5, 1234567, 10 ** 24):
+            q = self.mk(FakeRPC(limit)).best_out("0x" + "1" * 40, TARGET, BUY, 10 ** 15, 0, 1000)
+            self.assertLessEqual(q, limit)
+            self.assertGreater(q, limit * 0.999)
+
+    def test_best_out_unsellable(self):
+        self.assertEqual(self.mk(FakeRPC(0)).best_out("0x" + "1" * 40, TARGET, BUY, 1, 0, 10), 0)
+
+    def test_pending_position_resolves(self):
+        t = self.mk(FakeRPC(0, bal=700))
+        tok = "0x" + "2" * 40
+        t.s["positions"][tok] = "pending:200"
+        self.assertEqual(t.position(tok), 500)
+        self.assertEqual(t.s["positions"][tok], "500")
