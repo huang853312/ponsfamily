@@ -41,6 +41,7 @@ DEFAULT_STATE = {
     "last_block": 0,
     "seen_tx": [],
     "tg_offset": 0,
+    "positions": {},
 }
 
 
@@ -231,7 +232,13 @@ class Trader:
             "gas": int(gas * 1.3) + 20000, "maxFeePerGas": gas_price * 2, "maxPriorityFeePerGas": 0, "type": 2,
         })
         raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
-        h = self.rpc.call("eth_sendRawTransaction", ["0x" + raw.hex().removeprefix("0x")])
+        raw_hex = "0x" + raw.hex().removeprefix("0x")
+        h = "0x" + signed.hash.hex().removeprefix("0x")
+        try:
+            h = self.rpc.call("eth_sendRawTransaction", [raw_hex])
+        except RuntimeError as exc:
+            if "already known" not in str(exc).lower():
+                raise
         for _ in range(60):
             rc = self.rpc.call("eth_getTransactionReceipt", [h])
             if rc:
@@ -256,18 +263,33 @@ class Trader:
             return f"⛔ 余额不足：{fmt_eth(bal)} ETH，没跟。"
         inp = tx["input"]
         t_in = word_int(inp, 2)
+        if word_int(inp, 3) <= 0 or t_in <= 0:
+            return "⛔ 对方这笔没设最小成交量（可能是诱饵交易），为安全不跟。"
         min_out = scaled_min_out(word_int(inp, 3), t_in, amt, self.s["slippage_pct"])
         data = rewrite_swap(inp, target, self.me, amt, min_out, int(time.time()) + 120)
         if self.s["dry_run"]:
             return f"🧪 模拟：会用 {fmt_eth(amt)} ETH 买 {sym}"
-        h, ok = self.send_tx(tx["to"], data, amt)
+        before = self.token_balance(token, self.me)
+        self.s["spent"]["wei"] += amt          # count first, so a crash/pending tx can't bypass the cap
+        save_state(self.s)
+        try:
+            h, ok = self.send_tx(tx["to"], data, amt)
+        except Exception:
+            self.s["spent"]["wei"] -= amt
+            raise
+        if ok is False:
+            self.s["spent"]["wei"] -= amt
         if ok:
-            self.s["spent"]["wei"] += amt
+            got = max(self.token_balance(token, self.me) - before, 0)
+            pos = self.s.setdefault("positions", {})
+            pos[token] = str(int(pos.get(token, "0")) + got)
+        save_state(self.s)
         return f"{'✅ 已跟买' if ok else '❌ 跟买失败' if ok is False else '⏳ 已发出未确认'} {fmt_eth(amt)} ETH → {sym}\n{EXPLORER}/tx/{h}"
 
     def copy_sell(self, target, tx, token, sym):
-        mine = self.token_balance(token, self.me)
-        if mine == 0:
+        pos = self.s.setdefault("positions", {})
+        mine = min(self.token_balance(token, self.me), int(pos.get(token, "0")))
+        if mine <= 0:
             return None
         inp = tx["input"]
         sold = word_int(inp, 2)
@@ -288,6 +310,11 @@ class Trader:
             if not ok:
                 return f"❌ 授权失败，没卖 {sym}\n{EXPLORER}/tx/{h}"
         h, ok = self.send_tx(router, data, 0)
+        if ok:
+            left_pos = max(int(pos.get(token, "0")) - amt, 0)
+            if left_pos: pos[token] = str(left_pos)
+            else: pos.pop(token, None)
+            save_state(self.s)
         return f"{'✅ 已跟卖' if ok else '❌ 跟卖失败' if ok is False else '⏳ 已发出未确认'} {pct} {sym}\n{EXPLORER}/tx/{h}"
 
     def handle_tx(self, h, logs):
@@ -348,6 +375,7 @@ class Trader:
             if h in self.s["seen_tx"]:
                 continue
             self.s["seen_tx"].append(h)
+            save_state(self.s)   # persist before trading so a restart never copies the same tx twice
             try:
                 self.handle_tx(h, ls)
             except Exception as exc:
