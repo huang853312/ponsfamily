@@ -246,6 +246,39 @@ class Trader:
             time.sleep(0.5)
         return h, None
 
+    def position(self, token):
+        """Tokens this bot bought. A buy still unconfirmed is stored as 'pending:<balance before>'."""
+        pos = self.s.setdefault("positions", {})
+        v = str(pos.get(token, "0"))
+        if v.startswith("pending:"):
+            got = max(self.token_balance(token, self.me) - int(v.split(":", 1)[1]), 0)
+            if got:
+                pos[token] = str(got)
+            return got
+        return int(v)
+
+    def best_out(self, to, target, inp, amt, value, hi):
+        """Largest min-out the router still accepts right now (binary search with eth_call)."""
+        def ok(mo):
+            data = rewrite_swap(inp, target, self.me, amt, mo, int(time.time()) + 120)
+            try:
+                self.rpc.call("eth_call", [{"from": self.me, "to": to, "data": data, "value": hex(value)}, "latest"])
+                return True
+            except RuntimeError:
+                return False
+        if not ok(1):
+            return 0
+        lo, hi = 1, max(hi, 2)
+        while ok(hi) and hi < 1 << 200:
+            lo, hi = hi, hi * 2
+        for _ in range(14):
+            mid = (lo + hi) // 2
+            if mid <= lo:
+                break
+            if ok(mid): lo = mid
+            else: hi = mid
+        return lo
+
     def spent_today(self):
         day = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600))  # Beijing day
         if self.s["spent"].get("day") != day:
@@ -279,16 +312,18 @@ class Trader:
             raise
         if ok is False:
             self.s["spent"]["wei"] -= amt
+        pos = self.s.setdefault("positions", {})
         if ok:
             got = max(self.token_balance(token, self.me) - before, 0)
-            pos = self.s.setdefault("positions", {})
-            pos[token] = str(int(pos.get(token, "0")) + got)
+            pos[token] = str(self.position(token) + got)
+        elif ok is None and not pos.get(token):
+            pos[token] = f"pending:{before}"
         save_state(self.s)
         return f"{'✅ 已跟买' if ok else '❌ 跟买失败' if ok is False else '⏳ 已发出未确认'} {fmt_eth(amt)} ETH → {sym}\n{EXPLORER}/tx/{h}"
 
     def copy_sell(self, target, tx, token, sym):
         pos = self.s.setdefault("positions", {})
-        mine = min(self.token_balance(token, self.me), int(pos.get(token, "0")))
+        mine = min(self.token_balance(token, self.me), self.position(token))
         if mine <= 0:
             return None
         inp = tx["input"]
@@ -298,8 +333,6 @@ class Trader:
         amt = mine if frac == 1 else int(Decimal(mine) * frac)
         if amt <= 0:
             return None
-        min_out = scaled_min_out(word_int(inp, 3), sold, amt, self.s["slippage_pct"])
-        data = rewrite_swap(inp, target, self.me, amt, min_out, int(time.time()) + 120)
         pct = f"{frac * 100:.0f}%"
         if self.s["dry_run"]:
             return f"🧪 模拟：会卖出 {pct} 的 {sym}"
@@ -309,6 +342,14 @@ class Trader:
             h, ok = self.send_tx(token, approve, 0)
             if not ok:
                 return f"❌ 授权失败，没卖 {sym}\n{EXPLORER}/tx/{h}"
+        # The target's own sell already moved the price, so quote what we can get now.
+        guess = scaled_min_out(word_int(inp, 3), sold, amt, 0)
+        quote = self.best_out(router, target, inp, amt, 0, guess)
+        if quote <= 0:
+            return f"❌ 现在卖不出去（可能是貔貅币或没流动性），请手动处理 {sym}"
+        keep = (Decimal(100) - Decimal(self.s["slippage_pct"])) / 100
+        min_out = int(Decimal(quote) * keep)
+        data = rewrite_swap(inp, target, self.me, amt, min_out, int(time.time()) + 120)
         h, ok = self.send_tx(router, data, 0)
         if ok:
             left_pos = max(int(pos.get(token, "0")) - amt, 0)
