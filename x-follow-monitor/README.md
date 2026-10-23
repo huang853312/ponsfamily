@@ -9,10 +9,12 @@ The service reads only \`/home/ubuntu/ponsfamily/x-follow-monitor/.env\`:
 - \`TELEGRAM_BOT_TOKEN\`
 - \`TELEGRAM_CHAT_ID\`
 - \`XAPI_KEY\`
-- \`X_FOLLOW_INTERVAL=1800\` (optional; minimum 300 seconds)
+- \`X_FOLLOW_INTERVAL=3600\` (optional; default 3600 to save xAPI cost; minimum 300 seconds)
 - \`X_FOLLOW_CONCURRENCY=3\` (optional)
 - \`X_FOLLOW_ERROR_COOLDOWN=21600\` (optional; repeated same-category errors are limited to one message per 6 hours)
 - \`X_FOLLOW_BILLING_PAUSE=21600\` (optional; a non-transient xAPI \`PLATFORM_HTTP_402\` pauses scans for 6 hours; \`/scan_now\` performs a manual recheck after credits/limits are adjusted)
+- \`X_FOLLOW_NEW_PAGES=3\` (optional; new-follows-only mode: each scan reads only the top page(s) until one overlaps the saved baseline, at most this many pages; usually 1 request per account. Older follows and unfollows are ignored; a new account's baseline is its first page.)
+- \`X_FOLLOW_BILLING_PAUSE_MAX=21600\` (optional; cap for the 402 probe backoff)
 - \`X_FOLLOW_MAX_PAGES=100\` (optional; maximum cursor-paginated following pages accepted per account scan)
 
 ## Duplicate and false-alert protections
