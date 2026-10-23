@@ -94,10 +94,41 @@ jobs:
           target = Path("/home/ubuntu/ponsfamily/copy-trader/.env")
           env = read(target)
           env.update({k: v for k, v in read("/tmp/copy-trader-staged.env").items() if v})
+          def sread(p):
+              import subprocess
+              r = subprocess.run(["sudo", "-n", "cat", p], capture_output=True, text=True)
+              out = {}
+              for line in (r.stdout if r.returncode == 0 else "").splitlines():
+                  line = line.strip()
+                  if line.startswith("Environment="):
+                      line = line[len("Environment="):].strip(chr(34)).strip(chr(39))
+                  if "=" in line and not line.startswith("#"):
+                      k, v = line.split("=", 1)
+                      out[k.strip().removeprefix("export ").strip()] = v.strip().strip(chr(34)).strip(chr(39))
+              return out
           if not env.get("TELEGRAM_CHAT_ID"):
-              chat = read("/home/ubuntu/ponsfamily/x-follow-monitor/.env").get("TELEGRAM_CHAT_ID")
-              if chat:
-                  env["TELEGRAM_CHAT_ID"] = chat
+              for p in ("/home/ubuntu/ponsfamily/x-follow-monitor/.env", "/home/ubuntu/ponsfamily/.env",
+                        "/home/ubuntu/.env", "/opt/robinhood-radar/.env", "/etc/robinhood-radar.env",
+                        "/opt/hyperevm-radar/.env", "/etc/systemd/system/x-follow-monitor.service"):
+                  chat = read(p).get("TELEGRAM_CHAT_ID") or sread(p).get("TELEGRAM_CHAT_ID")
+                  if chat:
+                      env["TELEGRAM_CHAT_ID"] = chat
+                      print("chat_id_from=" + p)
+                      break
+          if not env.get("TELEGRAM_CHAT_ID") and env.get("COPY_TG_BOT_TOKEN"):
+              import json, urllib.request
+              try:
+                  u = "https://api.telegram.org/bot" + env["COPY_TG_BOT_TOKEN"] + "/getUpdates"
+                  res = json.load(urllib.request.urlopen(u, timeout=20)).get("result", [])
+                  for upd in reversed(res):
+                      m = upd.get("message") or upd.get("channel_post") or upd.get("my_chat_member") or {}
+                      cid = (m.get("chat") or {}).get("id")
+                      if cid:
+                          env["TELEGRAM_CHAT_ID"] = str(cid)
+                          print("chat_id_from=new_bot_updates")
+                          break
+              except Exception as e:
+                  print("getUpdates_failed=" + type(e).__name__)
           missing = [k for k in ("COPY_TG_BOT_TOKEN", "TELEGRAM_CHAT_ID") if not env.get(k)]
           if missing:
               raise SystemExit("missing=" + ",".join(missing))
