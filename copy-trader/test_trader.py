@@ -97,3 +97,24 @@ class Commands(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Safety(unittest.TestCase):
+    def setUp(self):
+        self.t = T.Trader(None, T.json.loads(T.json.dumps(T.DEFAULT_STATE)))
+
+    def test_dryrun_needs_explicit_arg(self):
+        self.t.s["dry_run"] = True
+        self.t.command("/dryrun of")
+        self.assertTrue(self.t.s["dry_run"])
+        self.t.command("/dryrun off")
+        self.assertFalse(self.t.s["dry_run"])
+
+    def test_rejects_bad_amounts(self):
+        for bad in ("/amount -1", "/amount inf", "/amount nan", "/max 0", "/daily Infinity"):
+            self.assertIn("参数不对", self.t.command(bad))
+        a = next(iter(self.t.s["targets"]))
+        self.assertIn("参数不对", self.t.command(f"/amount {a} -0.5"))
+
+    def test_cannot_add_router(self):
+        self.assertIn("不能添加", self.t.command("/add 0x65050a9b7e5075a2ba5ced7b1b64ee66262c40dc x"))
