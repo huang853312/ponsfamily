@@ -247,7 +247,7 @@ class Trader:
         return h, None
 
     def spent_today(self):
-        day = time.strftime("%Y-%m-%d", time.gmtime())
+        day = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600))  # Beijing day
         if self.s["spent"].get("day") != day:
             self.s["spent"] = {"day": day, "wei": 0}
         return self.s["spent"]["wei"]
@@ -322,7 +322,7 @@ class Trader:
         if not tx:
             return
         target = (tx.get("from") or "").lower()
-        if target not in self.s["targets"]:
+        if target not in self.s["targets"] or target == self.me:
             return
         cfg = self.s["targets"][target]
         label = cfg.get("label") or target[:8]
@@ -416,12 +416,17 @@ class Trader:
                 return "🟢 跟单已开启。" + ("" if self.acct else "\n⚠️ 但服务器还没配置私钥，暂时只能提醒。")
             if cmd == "/off":
                 s["enabled"] = False; return "🔴 跟单已关闭，只提醒。"
-            if cmd == "/dryrun":
-                s["dry_run"] = (args[:1] or ["on"])[0].lower() in ("on", "1", "开"); return f"模拟模式：{'开' if s['dry_run'] else '关'}"
-            if cmd == "/sells":
-                s["copy_sells"] = (args[:1] or ["on"])[0].lower() in ("on", "1", "开"); return f"跟卖：{'开' if s['copy_sells'] else '关'}"
+            if cmd in ("/dryrun", "/sells"):
+                key = "dry_run" if cmd == "/dryrun" else "copy_sells"
+                arg = (args[:1] or [""])[0].lower()
+                if arg in ("on", "1", "开"): s[key] = True
+                elif arg in ("off", "0", "关"): s[key] = False
+                else: return f"用法：{cmd} on 或 {cmd} off"
+                return f"{'模拟模式' if key == 'dry_run' else '跟卖'}：{'开' if s[key] else '关'}"
             if cmd == "/add":
                 a = norm(args[0]); label = " ".join(args[1:]) or a[:8]
+                if a == self.me or a in ROUTERS:
+                    return "不能添加自己的跟单钱包或路由合约"
                 s["targets"][a] = {"enabled": True, "label": label, "amount_eth": None}
                 return f"➕ 已添加 {label}\n{a}"
             if cmd in ("/del", "/remove"):
@@ -441,20 +446,20 @@ class Trader:
                     for a, c in s["targets"].items())
             if cmd == "/amount":
                 if len(args) == 2:
-                    a = norm(args[0]); v = Decimal(args[1])
+                    a = norm(args[0]); v = Decimal(args[1]); assert v.is_finite() and v > 0
                     if a not in s["targets"]:
                         return "列表里没有这个地址"
                     s["targets"][a]["amount_eth"] = str(v); return f"{s['targets'][a]['label']} 每笔 {v} ETH"
-                v = Decimal(args[0]); assert v > 0
+                v = Decimal(args[0]); assert v.is_finite() and v > 0
                 s["amount_eth"] = str(v); return f"默认每笔 {v} ETH"
             if cmd == "/max":
-                v = Decimal(args[0]); assert v > 0; s["max_trade_eth"] = str(v); return f"单笔上限 {v} ETH"
+                v = Decimal(args[0]); assert v.is_finite() and v > 0; s["max_trade_eth"] = str(v); return f"单笔上限 {v} ETH"
             if cmd == "/daily":
-                v = Decimal(args[0]); assert v > 0; s["daily_cap_eth"] = str(v); return f"每日上限 {v} ETH"
+                v = Decimal(args[0]); assert v.is_finite() and v > 0; s["daily_cap_eth"] = str(v); return f"每日上限 {v} ETH"
             if cmd == "/slip":
                 v = Decimal(args[0]); assert 0 < v < 90; s["slippage_pct"] = str(v); return f"滑点 {v}%"
             if cmd == "/reserve":
-                v = Decimal(args[0]); assert v >= 0; s["gas_reserve_eth"] = str(v); return f"保留 {v} ETH 作 Gas"
+                v = Decimal(args[0]); assert v.is_finite() and v >= 0; s["gas_reserve_eth"] = str(v); return f"保留 {v} ETH 作 Gas"
         except (IndexError, ValueError, AssertionError, ArithmeticError):
             return "参数不对，发 /help 看用法"
         return None
