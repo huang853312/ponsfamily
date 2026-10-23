@@ -1,0 +1,20 @@
+[Unit]
+Description=Robinhood Chain copy trader (Telegram controlled)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/ponsfamily/copy-trader
+EnvironmentFile=/home/ubuntu/ponsfamily/copy-trader/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/ponsfamily/copy-trader/.venv/bin/python /home/ubuntu/ponsfamily/copy-trader/trader.py
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
