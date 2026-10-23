@@ -14,12 +14,17 @@ STATE = APP / "state.json"
 CLI = APP / "node_modules" / ".bin" / "xapi-to"
 BOT = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
-INTERVAL = max(300, int(os.getenv("X_FOLLOW_INTERVAL", "1800")))
+INTERVAL = max(300, int(os.getenv("X_FOLLOW_INTERVAL", "3600")))
 MAX_CONCURRENCY = max(1, int(os.getenv("X_FOLLOW_CONCURRENCY", "1")))
 ERROR_COOLDOWN = max(600, int(os.getenv("X_FOLLOW_ERROR_COOLDOWN", "21600")))
 BILLING_PAUSE_SECONDS = max(1800, int(os.getenv("X_FOLLOW_BILLING_PAUSE", "1800")))
 FOLLOW_SEND_INTERVAL = max(3.0, float(os.getenv("X_FOLLOW_SEND_INTERVAL", "3")))
 MAX_FOLLOWING_PAGES = max(1, int(os.getenv("X_FOLLOW_MAX_PAGES", "100")))
+# Cost control (new follows only): X lists the newest follows first, so each scan
+# reads only the top page(s) until one overlaps the saved baseline. Older follows
+# and unfollows are deliberately ignored, so the full list is never paginated.
+# A new account's baseline is its first page only.
+NEW_FOLLOW_MAX_PAGES = max(1, int(os.getenv("X_FOLLOW_NEW_PAGES", "3")))
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
 
 
@@ -217,6 +222,13 @@ def load():
                 flush=True,
             )
 
+    # New-follows-only policy (v3): drop the follow-alert backlog queued by the
+    # old full-list comparison once, so the switch does not flood Telegram.
+    if int(old.get("follow_policy_version", 0) or 0) < 3:
+        before = len(compacted)
+        compacted = [q for q in compacted if not (isinstance(q, dict) and q.get("category") == "follow")]
+        if before - len(compacted):
+            print(f"STARTUP_DROPPED_FOLLOW_BACKLOG count={before - len(compacted)} policy=new_follows_only", flush=True)
     accounts = list(dict.fromkeys(x for x in accounts if isinstance(x, str)))
     # Pre-v2 state may contain a single page only. Reconcile before alerting.
     version = int(old.get("schema_version", 0) or 0)
@@ -239,6 +251,7 @@ def load():
         "api_pause_until": api_pause_until,
         "api_pause_reason": api_pause_reason,
         "billing_policy_version": billing_policy_version,
+        "follow_policy_version": 3,
         "last_scan_at": last_scan_at,
         "last_scan_result": str(old.get("last_scan_result", "")),
         "last_scan_ok_accounts": int(old.get("last_scan_ok_accounts", 0) or 0),
@@ -538,8 +551,16 @@ def _next_cursor(data):
     return ""
 
 
-def newest_following(name, cached_uid=None):
-    """Read cursor pages to completion; reject malformed/truncated lists."""
+class PartialFollowing(dict):
+    """Top-of-list read that stopped at the saved baseline (no unfollow info)."""
+
+
+def newest_following(name, cached_uid=None, stop_at=None):
+    """Read cursor pages to completion; reject malformed/truncated lists.
+
+    With stop_at (the saved baseline), stop after the first page that overlaps it
+    and return a PartialFollowing: enough to detect new follows at minimal cost.
+    """
     uid = resolve_id(name, cached_uid)
     following, cursor, seen_cursors = {}, "", set()
     for page_number in range(1, MAX_FOLLOWING_PAGES + 1):
@@ -588,6 +609,18 @@ def newest_following(name, cached_uid=None):
         next_cursor = _next_cursor(data)
         if not rows or not next_cursor:
             return following, uid
+        if stop_at is not None and not stop_at:
+            # No baseline yet: the first page is enough; older follows are ignored.
+            return PartialFollowing(following), uid
+        if stop_at and any(
+            isinstance(row.get("screen_name"), str) and row["screen_name"].lower() in stop_at
+            for row in rows
+        ):
+            print(f"XAPI_INCREMENTAL_STOP account=@{name} pages={page_number}", flush=True)
+            return PartialFollowing(following), uid
+        if stop_at is not None and page_number >= NEW_FOLLOW_MAX_PAGES:
+            print(f"XAPI_NEW_PAGE_CAP account=@{name} pages={page_number}", flush=True)
+            return PartialFollowing(following), uid
         if next_cursor == cursor or next_cursor in seen_cursors:
             raise RuntimeError(f"@{name} 的关注列表分页游标重复；本轮名单不完整")
         seen_cursors.add(next_cursor)
@@ -598,10 +631,13 @@ def newest_following(name, cached_uid=None):
     )
 
 
-async def scan_one(name, cached_uid, sem):
+async def scan_one(name, cached_uid, sem, stop_at=None):
     async with sem:
         try:
-            current, uid = await asyncio.to_thread(newest_following, name, cached_uid)
+            if stop_at is not None:
+                current, uid = await asyncio.to_thread(newest_following, name, cached_uid, stop_at)
+            else:
+                current, uid = await asyncio.to_thread(newest_following, name, cached_uid)
             return name, current, uid, None
         except asyncio.CancelledError:
             raise
@@ -680,10 +716,76 @@ async def notification_worker(state):
             await asyncio.sleep(1)
 
 
+BILLING_PAUSE_MAX_SECONDS = max(
+    BILLING_PAUSE_SECONDS, int(os.getenv("X_FOLLOW_BILLING_PAUSE_MAX", "21600"))
+)
+
+
+def billing_pause_seconds(streak):
+    """Exponential backoff for a confirmed billing outage: 30m, 1h, 2h ... capped."""
+    return min(BILLING_PAUSE_MAX_SECONDS, BILLING_PAUSE_SECONDS * (2 ** max(0, streak)))
+
+
+async def billing_probe(state):
+    """While a global 402 outage is active, recheck with ONE account instead of all.
+
+    Returns True when the outage is still active (scan must stop here), False when
+    the probe succeeded or failed for a non-billing reason (full scan continues).
+    """
+    if state.get("api_pause_reason") != "PLATFORM_HTTP_402" or not state.get("accounts"):
+        return False
+    name = state["accounts"][0]
+    sem = asyncio.Semaphore(1)
+    _name, _current, _uid, exc = await scan_one(name, state["ids"].get(name), sem)
+    if exc is not None and "PLATFORM_HTTP_402" in str(exc):
+        streak = int(state.get("billing_pause_streak", 0) or 0) + 1
+        pause = billing_pause_seconds(streak)
+        state["billing_pause_streak"] = streak
+        state["api_pause_until"] = time.time() + pause
+        state["last_scan_at"] = time.time()
+        state["last_scan_result"] = "billing_blocked"
+        entry = state.setdefault("error_notices", {}).get("xapi:billing-limit")
+        if isinstance(entry, dict):
+            entry["count"] = int(entry.get("count", 0)) + 1
+        save(state)
+        print(
+            f"XAPI_BILLING_PROBE_STILL_BLOCKED account=@{name} streak={streak} "
+            f"next_pause_seconds={pause} alert_suppressed=true",
+            flush=True,
+        )
+        return True
+    # Recovered (or a different, non-billing failure): resume normal full scans.
+    entry = state.get("error_notices", {}).get("xapi:billing-limit")
+    was_alerted = isinstance(entry, dict) and bool(entry.get("active"))
+    state.pop("api_pause_until", None)
+    state.pop("api_pause_reason", None)
+    state.pop("billing_pause_streak", None)
+    clear_error(state, "xapi:billing-limit")
+    save(state)
+    if was_alerted:
+        queue_notification(
+            state, f"recovered:xapi-billing:{int(time.time())}",
+            "xAPI.to 计费已恢复：探测请求成功，监控恢复全量扫描。",
+            category="system",
+        )
+    print(f"XAPI_BILLING_PROBE_RECOVERED account=@{name}", flush=True)
+    return False
+
+
 async def scan_all(state):
+    if await billing_probe(state):
+        return
     sem = asyncio.Semaphore(MAX_CONCURRENCY)
+    reconcile = set(state.get("baseline_reconcile") or [])
+
+    def stop_set(name):
+        known = state.get("known", {}).get(name)
+        if not known or name in reconcile:
+            return set()  # baseline from the first page only
+        return {str(x).lower() for x in known}
+
     results = await asyncio.gather(
-        *(scan_one(name, state["ids"].get(name), sem) for name in list(state["accounts"]))
+        *(scan_one(name, state["ids"].get(name), sem, stop_set(name)) for name in list(state["accounts"]))
     )
     state["last_scan_at"] = time.time()
     state["last_scan_ok_accounts"] = sum(1 for _name, _current, _uid, exc in results if exc is None)
@@ -705,7 +807,8 @@ async def scan_all(state):
 
     if global_billing_failure:
         name, exc = billing_failures[0]
-        state["api_pause_until"] = time.time() + BILLING_PAUSE_SECONDS
+        state["billing_pause_streak"] = 0
+        state["api_pause_until"] = time.time() + billing_pause_seconds(0)
         state["api_pause_reason"] = "PLATFORM_HTTP_402"
         state["last_scan_result"] = "billing_blocked"
         # Remove stale account-level 402 alerts when a broad outage is confirmed.
@@ -724,7 +827,8 @@ async def scan_all(state):
             "xAPI.to 疑似全局计费故障："
             f"{len(billing_failures)}/{len(results)} 个账号返回 PLATFORM_HTTP_402，"
             f"已达到全局暂停阈值 {billing_threshold}。"
-            f"监控将暂停 {BILLING_PAUSE_SECONDS // 60} 分钟后自动重试；"
+            f"监控将暂停 {BILLING_PAUSE_SECONDS // 60} 分钟后用单个账号探测，"
+            "仍失败则按 30分钟→1→2→4→6小时 退避且不再重复告警，恢复后会通知；"
             "已成功取得的数据会继续处理，失败账号历史基线会保留。"
             f"首个错误账号：@{name}；上游信息：{str(exc)[:220]}",
         )
@@ -813,8 +917,15 @@ async def scan_all(state):
 
         clear_error(state, error_key)
         state["ids"][name] = uid
-        now = set(current)
-        _prune_follow_notice_keys(state, name, now)
+        partial = isinstance(current, PartialFollowing)
+        if partial and name in state["known"] and name not in state.get("baseline_reconcile", []):
+            # Incremental read: only additions are knowable; keep every saved entry.
+            now = set(state["known"][name]) | set(current)
+        else:
+            partial = False
+            now = set(current)
+            if not isinstance(current, PartialFollowing):
+                _prune_follow_notice_keys(state, name, now)
 
         # Legacy known lists may cover only the first page. Refresh a complete
         # baseline once after upgrade, without generating a notification flood.
@@ -992,8 +1103,9 @@ async def main():
                                 scan_task = None
                             safe_send("监控已停止")
                         elif cmd == "/scan_now":
+                            # Keep api_pause_reason so the manual recheck probes one
+                            # account first instead of spending a request per account.
                             state.pop("api_pause_until", None)
-                            state.pop("api_pause_reason", None)
                             print("COMMAND_RECEIVED command=/scan_now", flush=True)
                             if scan_task is not None:
                                 # The task may already be done but not yet handled below.
