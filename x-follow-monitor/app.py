@@ -337,6 +337,21 @@ def is_telegram_poll_timeout(exc):
     return "the read operation timed out" in message or "read timed out" in message
 
 
+TELEGRAM_TRANSIENT_HTTP = ("Telegram HTTP 429", "Telegram HTTP 500", "Telegram HTTP 502",
+                           "Telegram HTTP 503", "Telegram HTTP 504")
+TELEGRAM_OUTAGE_ALERT_SECONDS = max(300, int(os.getenv("X_FOLLOW_TG_OUTAGE_ALERT", "1800")))
+
+
+def is_telegram_transient(exc):
+    """Telegram-side hiccups (timeouts, 429, 5xx, dropped connections): retry silently."""
+    if is_telegram_poll_timeout(exc):
+        return True
+    if isinstance(exc, (ConnectionError, error.URLError)):
+        return True
+    message = str(exc)
+    return any(code in message for code in TELEGRAM_TRANSIENT_HTTP)
+
+
 def telegram_retry_after(exc):
     """Return Telegram's explicit retry_after for a 429 rejection, if present."""
     message = str(exc)
@@ -1015,6 +1030,7 @@ async def main():
     scan_task, next_scan_at, retry_delay = None, 0.0, 5
     scan_requested_after_current = False
     telegram_poll_timeout_streak = 0
+    telegram_outage_started = time.monotonic()
     while True:
         try:
             try:
@@ -1026,21 +1042,27 @@ async def main():
                     },
                 )
             except Exception as exc:
-                if not is_telegram_poll_timeout(exc):
+                if not is_telegram_transient(exc):
                     raise
                 telegram_poll_timeout_streak += 1
+                if telegram_poll_timeout_streak == 1:
+                    telegram_outage_started = time.monotonic()
                 print(
-                    "TELEGRAM_POLL_TIMEOUT "
-                    f"consecutive={telegram_poll_timeout_streak}; recovering_without_main_loop_failure=true",
+                    "TELEGRAM_POLL_TRANSIENT "
+                    f"consecutive={telegram_poll_timeout_streak} error={str(exc)[:160]}; "
+                    "recovering_without_main_loop_failure=true",
                     flush=True,
                 )
-                if telegram_poll_timeout_streak >= 3:
+                # Only alert if Telegram stays unreachable for a long time (default 30 min).
+                if time.monotonic() - telegram_outage_started >= TELEGRAM_OUTAGE_ALERT_SECONDS:
                     report_limited_error(
                         state,
                         "telegram-poll-timeout",
-                        "Telegram getUpdates 连续发生读取超时，机器人仍在自动重试；"
-                        "该网络超时不会中断监控主循环，也不会重复发送每次超时告警。",
+                        "Telegram 已持续较长时间无法连接（超时或 5xx），机器人仍在自动重试，X 监控扫描不受影响。",
                     )
+                retry_after = telegram_retry_after(exc)
+                await asyncio.sleep(retry_after if retry_after is not None
+                                    else min(60, 2 ** min(telegram_poll_timeout_streak, 6)))
                 result = {"result": []}
             else:
                 if telegram_poll_timeout_streak:

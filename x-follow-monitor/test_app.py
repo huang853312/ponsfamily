@@ -17,6 +17,16 @@ class MonitorTests(unittest.TestCase):
         self.assertFalse(app.is_telegram_poll_timeout(RuntimeError("Telegram HTTP 401: unauthorized")))
         self.assertFalse(app.is_telegram_poll_timeout(RuntimeError("xAPI PLATFORM_HTTP_402")))
 
+    def test_telegram_transient_detector(self):
+        bad_gw = RuntimeError('Telegram HTTP 502: {"ok":false,"error_code":502,"description":"Bad Gateway"}')
+        self.assertTrue(app.is_telegram_transient(bad_gw))
+        self.assertTrue(app.is_telegram_transient(RuntimeError("Telegram HTTP 503: x")))
+        self.assertTrue(app.is_telegram_transient(RuntimeError("Telegram HTTP 429: x")))
+        self.assertTrue(app.is_telegram_transient(ConnectionResetError("reset")))
+        self.assertTrue(app.is_telegram_transient(TimeoutError("read timed out")))
+        self.assertFalse(app.is_telegram_transient(RuntimeError("Telegram HTTP 401: unauthorized")))
+        self.assertFalse(app.is_telegram_transient(RuntimeError("Telegram HTTP 409: conflict")))
+
     def test_transient_proxy_reset_retries_then_succeeds(self):
         from subprocess import CompletedProcess
         failed = json.dumps({
