@@ -1,1 +1,3 @@
 eth-account>=0.13
+cryptography>=42
+solders>=0.21

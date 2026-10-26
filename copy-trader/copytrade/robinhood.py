@@ -1,4 +1,4 @@
-"""Robinhood Chain copy trader controlled from Telegram.
+"""Robinhood Chain / Pons router adapter (the original copy trader).
 
 Watches a list of wallets. When one of them buys or sells through an allowed
 router (default: the Pons swap router), the same route is replayed from our own
@@ -551,25 +551,144 @@ HELP = """跟单机器人命令
 /reserve 0.002  保留 Gas"""
 
 
-def main():
-    if not BOT or not CHAT:
-        raise SystemExit("Missing COPY_TG_BOT_TOKEN or TELEGRAM_CHAT_ID")
-    state = load_state()
-    trader = Trader(RPC(RPC_URL), state)
-    send("🤖 跟单机器人已启动\n" + trader.status_text() + "\n发 /help 查看命令")
-    last_tg = 0.0
-    while True:
+class RobinhoodAdapter:
+    """Engine adapter: detects leader swaps via Transfer logs and replays Pons-router routes."""
+    kind = "evm"
+    chain = "robinhood"
+
+    def __init__(self, rpc=None, http=None):
+        from . import chains as C
+        from .util import http_json
+        self.cfg = C.CHAINS["robinhood"]
+        self.rpc = rpc or RPC(self.cfg["rpc"])
+        self.http = http or http_json
+        self.t = Trader(self.rpc, json.loads(json.dumps(DEFAULT_STATE)))
+        self.t.acct, self.t.me = None, None
+
+    def explorer(self, h):
+        return f"{EXPLORER}/tx/{h}"
+
+    def native_balance(self, addr):
+        return self.t.balance(addr)
+
+    def token_balance(self, token, owner):
+        return self.t.token_balance(token, owner)
+
+    def symbol(self, token):
+        return self.t.symbol(token)
+
+    def decimals(self, token):
         try:
-            trader.poll_chain()
-            if time.time() - last_tg > 3:
-                trader.poll_telegram(); last_tg = time.time()
-            save_state(state)
-        except Exception as exc:
-            print("LOOP_ERR", exc, flush=True)
-            traceback.print_exc()
-            time.sleep(3)
-        time.sleep(POLL_SEC)
+            return self.t.erc20(token, "0x313ce567") or 18
+        except Exception:
+            return 18
 
+    def native_price(self):
+        from .market import native_price
+        return native_price("robinhood", self.http)
 
-if __name__ == "__main__":
-    sys.exit(main())
+    def poll(self, leaders, cur):
+        leaders = [a.lower() for a in leaders]
+        latest = int(self.rpc.call("eth_blockNumber", []), 16)
+        last = int(cur.get("last_block") or 0)
+        start = last + 1 if last else latest
+        if latest - start > MAX_SPAN:
+            start = latest - 200
+        cur["last_block"] = latest
+        if start > latest or not leaders:
+            return []
+        pads = ["0x" + "0" * 24 + a[2:] for a in leaders]
+        logs = []
+        for topics in ([TRANSFER, None, pads], [TRANSFER, pads]):
+            logs += self.rpc.call("eth_getLogs", [{"fromBlock": hex(start), "toBlock": hex(latest), "topics": topics}])
+        by_tx = {}
+        for l in logs:
+            by_tx.setdefault(l["transactionHash"], []).append(l)
+        events = []
+        for h, ls in by_tx.items():
+            tx = self.rpc.call("eth_getTransactionByHash", [h])
+            if not tx:
+                continue
+            target = (tx.get("from") or "").lower()
+            if target not in leaders:
+                continue
+            side, token = classify(tx, ls, target)
+            if not side:
+                continue
+            routed = (tx.get("to") or "").lower() in ROUTERS and tx["input"].lower().startswith(SWAP_SELECTOR)
+            t = target[2:]
+            if side == "buy":
+                amount = sum(int(l.get("data") or "0x0", 16) for l in ls
+                             if l["address"].lower() == token and l["topics"][2][-40:] == t)
+            else:
+                amount = word_int(tx["input"], 2) if routed else sum(
+                    int(l.get("data") or "0x0", 16) for l in ls if l["address"].lower() == token and l["topics"][1][-40:] == t)
+            blk = self.rpc.call("eth_getBlockByNumber", [tx["blockNumber"], False])
+            events.append({"chain": "robinhood", "leader": target, "tx": h, "side": side, "token": token,
+                           "amount": amount, "ts": int(blk["timestamp"], 16), "raw_tx": tx,
+                           "leader_native": int(tx.get("value") or "0x0", 16) if side == "buy" else 0,
+                           "copyable": routed, "why_not": None if routed else "不是走 Pons 路由的交易"})
+        return events
+
+    def leader_usd(self, ev):
+        p = self.native_price()
+        if not ev.get("leader_native") or not p:
+            return None
+        return ev["leader_native"] / WEI * p
+
+    def sell_fraction(self, ev):
+        return sell_fraction(ev["amount"], self.t.token_balance(ev["token"], ev["leader"]))
+
+    def can_sell(self, token):
+        return True
+
+    def _use(self, acct):
+        self.t.acct, self.t.me = acct, acct.address.lower()
+
+    def buy(self, acct, ev, token, usd, slippage_pct):
+        self._use(acct)
+        price = self.native_price()
+        if not price:
+            return {"ok": False, "msg": "拿不到 ETH 价格"}
+        amt = int(Decimal(str(usd)) / Decimal(str(price)) * WEI)
+        bal = self.t.balance(self.t.me)
+        if bal - amt < to_wei(self.cfg["gas_reserve"]):
+            return {"ok": False, "msg": f"余额不足：{fmt_eth(bal)} ETH"}
+        tx = ev["raw_tx"]
+        inp = tx["input"]
+        t_in = word_int(inp, 2)
+        if word_int(inp, 3) <= 0 or t_in <= 0:
+            return {"ok": False, "msg": "对方这笔没设最小成交量（可能是诱饵交易），为安全不跟"}
+        min_out = scaled_min_out(word_int(inp, 3), t_in, amt, slippage_pct)
+        data = rewrite_swap(inp, ev["leader"], self.t.me, amt, min_out, int(time.time()) + 120)
+        before = self.t.token_balance(token, self.t.me)
+        h, ok = self.t.send_tx(tx["to"], data, amt)
+        got = max(self.t.token_balance(token, self.t.me) - before, 0) if ok else 0
+        return {"ok": ok, "tx": h, "got": got, "via": "Pons", "spent_native": amt}
+
+    def sell(self, acct, ev, token, amount, slippage_pct):
+        self._use(acct)
+        tx = (ev or {}).get("raw_tx")
+        if not tx or not (ev or {}).get("copyable"):
+            return {"ok": False, "msg": "Robinhood 链只能复用对方的 Pons 路由卖出（止盈/止损请手动）"}
+        router, inp, target = tx["to"].lower(), tx["input"], ev["leader"]
+        if self.t.allowance(token, self.t.me, router) < amount:
+            h, ok = self.t.send_tx(token, "0x095ea7b3" + "0" * 24 + router[2:] + f"{amount:064x}", 0)
+            if not ok:
+                return {"ok": False, "tx": h, "msg": "授权失败"}
+        guess = scaled_min_out(word_int(inp, 3), max(word_int(inp, 2), 1), amount, 0)
+        quote = self.t.best_out(router, target, inp, amount, 0, guess)
+        if quote <= 0 and self.t.allowance(token, self.t.me, PERMIT2) < amount:
+            h, ok = self.t.send_tx(token, "0x095ea7b3" + "0" * 24 + PERMIT2[2:] + f"{amount:064x}", 0)
+            if ok:
+                expiry = int(time.time()) + 3600
+                p2 = ("0x87517c45" + "0" * 24 + token[2:] + "0" * 24 + router[2:]
+                      + f"{min(amount, (1 << 160) - 1):064x}" + f"{expiry:064x}")
+                self.t.send_tx(PERMIT2, p2, 0)
+            quote = self.t.best_out(router, target, inp, amount, 0, guess)
+        if quote <= 0:
+            return {"ok": False, "msg": "现在卖不出去（可能是貔貅币或没流动性）"}
+        keep = (Decimal(100) - Decimal(str(slippage_pct))) / 100
+        data = rewrite_swap(inp, target, self.t.me, amount, int(Decimal(quote) * keep), int(time.time()) + 120)
+        h, ok = self.t.send_tx(router, data, 0)
+        return {"ok": ok, "tx": h, "via": "Pons", "out": quote}

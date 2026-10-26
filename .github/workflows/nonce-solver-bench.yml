@@ -16,7 +16,7 @@ jobs:
         run: |
           nproc
           git clone -q --depth 1 https://github.com/arminbiere/kissat.git /tmp/kissat
-          cd /tmp/kissat && ./configure -q >/dev/null && make -j4 >/dev/null && ls build/kissat
+          cd /tmp/kissat && ./configure && make -j4 2>&1 | tail -3 && ls -la build/kissat
       - name: Solve (4 seeds parallel, first wins)
         run: |
           start=$(date +%s)
