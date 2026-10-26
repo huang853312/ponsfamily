@@ -1,0 +1,34 @@
+name: NONCE Solver Bench
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/nonce-solver-bench.yml','tools/nonce/bench1.cnf']
+permissions:
+  contents: read
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build kissat
+        run: |
+          nproc
+          git clone -q --depth 1 https://github.com/arminbiere/kissat.git /tmp/kissat
+          cd /tmp/kissat && ./configure -q >/dev/null && make -j4 >/dev/null && ls build/kissat
+      - name: Solve (4 seeds parallel, first wins)
+        run: |
+          start=$(date +%s)
+          for s in 1 2 3 4; do (timeout 1200 /tmp/kissat/build/kissat -q --seed=$s tools/nonce/bench1.cnf > /tmp/out$s.txt; echo "seed $s exit $? at $(( $(date +%s)-start ))s") & done
+          while true; do for s in 1 2 3 4; do if grep -q "^s SATISFIABLE" /tmp/out$s.txt 2>/dev/null; then echo "SOLVED seed $s in $(( $(date +%s)-start ))s"; exit 0; fi; done; [ $(( $(date +%s)-start )) -gt 1200 ] && { echo TIMEOUT; exit 1; }; sleep 2; done
+      - name: Server cores
+        if: always()
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          mkdir -p ~/.ssh; printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/k; chmod 600 ~/.ssh/k
+          ssh -i ~/.ssh/k -p "$SERVER_PORT" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 "$SERVER_USER@$SERVER_HOST" 'nproc; free -g | head -2; uptime'
