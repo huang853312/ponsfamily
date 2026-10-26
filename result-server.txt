@@ -1,0 +1,16 @@
+nproc 2
+               total        used        free      shared  buff/cache   available
+Mem:               1           0           0           0           0           0
+ 03:59:56 up 42 days,  5:59,  2 users,  load average: 0.10, 0.09, 0.03
+/usr/bin/gcc
+/usr/bin/cc
+/usr/bin/make
+/usr/bin/git
+ws.c: In function ‘main’:
+ws.c:15:35: warning: ignoring return value of ‘fscanf’ declared with attribute ‘warn_unused_result’ [-Wunused-result]
+   15 |  for(i=0;i<M;i++)for(j=0;j<3;j++){fscanf(f,"%d",&cl[i][j]);int l=cl[i][j];oc[idx(l)]++;if(l>0)pc[l]++;else ngc[-l]++;}
+      |                                   ^~~~~~~~~~~~~~~~~~~~~~~~
+ws_built
+-rwxrwxr-x 1 ubuntu ubuntu 566856 Oct 27 04:00 kissat/build/kissat
+-rwxrwxr-x 1 ubuntu ubuntu  16920 Oct 27 03:59 ws
+TIMEOUT 600s with 1 workers
