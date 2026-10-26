@@ -1,0 +1,55 @@
+name: NONCE Solver Server
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/nonce-solver-server.yml']
+permissions:
+  contents: write
+jobs:
+  solve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run on server (nice 19, leaves 1 core free)
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT }}
+        run: |
+          mkdir -p ~/.ssh; printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/k; chmod 600 ~/.ssh/k
+          O="-i $HOME/.ssh/k -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 -o ServerAliveInterval=30"
+          ssh $O -p "$SERVER_PORT" "$SERVER_USER@$SERVER_HOST" 'mkdir -p ~/nonce-solver'
+          scp $O -P "$SERVER_PORT" tools/nonce/bench1.cnf tools/nonce/ws.c "$SERVER_USER@$SERVER_HOST:nonce-solver/"
+          ssh $O -p "$SERVER_PORT" "$SERVER_USER@$SERVER_HOST" 'bash -s' > /tmp/result.txt 2>&1 <<'SH' || true
+          cd ~/nonce-solver
+          echo "nproc $(nproc)"; free -g | head -2; uptime; which gcc cc make git
+          grep -v '^[cp]' bench1.cnf | sed 's/ 0$//' > cnf.txt
+          (command -v gcc >/dev/null && gcc -O3 -o ws ws.c) && echo ws_built
+          if [ ! -x kissat/build/kissat ]; then git clone -q --depth 1 https://github.com/arminbiere/kissat.git && (cd kissat && ./configure >/dev/null && make -j2 >/dev/null 2>&1); fi
+          ls -la kissat/build/kissat ws 2>&1
+          P=$(( $(nproc) - 1 )); [ $P -lt 1 ] && P=1
+          start=$(date +%s)
+          for s in $(seq 1 $P); do
+            if [ $((s % 2)) -eq 1 ] && [ -x kissat/build/kissat ]; then (nice -n 19 timeout 600 kissat/build/kissat -q --seed=$s bench1.cnf > out$s.txt) &
+            elif [ -x ws ]; then (nice -n 19 timeout 600 ./ws $s 595 > out$s.txt 2>/dev/null) &
+            fi
+          done
+          while true; do
+            for f in out*.txt; do if grep -q -e "^s SATISFIABLE" -e "^SAT " $f 2>/dev/null; then echo "SOLVED $f in $(( $(date +%s)-start ))s"; grep -e "^SAT " $f | head -c 1600; pkill -f "kissat/build/kissat" ; pkill -f "./ws "; break 2; fi; done
+            [ $(( $(date +%s)-start )) -gt 605 ] && { echo "TIMEOUT 600s with $P workers"; grep -h FAIL out*.txt; break; }
+            sleep 3
+          done
+          rm -f out*.txt
+          SH
+          cat /tmp/result.txt
+      - name: Save result to branch nonce-results
+        if: always()
+        run: |
+          git config user.name hark; git config user.email hark@users.noreply.github.com
+          cp /tmp/result.txt /tmp/r.txt 2>/dev/null || echo "no result" > /tmp/r.txt
+          git fetch -q origin nonce-results && git checkout -q nonce-results || git checkout -q --orphan nonce-results
+          git rm -rq --cached . >/dev/null 2>&1 || true
+          cp /tmp/r.txt result-server.txt; git add result-server.txt; git commit -qm "server run $GITHUB_RUN_ID"; git push -q origin HEAD:nonce-results
