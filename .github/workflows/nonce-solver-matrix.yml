@@ -1,0 +1,50 @@
+name: NONCE Solver Matrix
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/nonce-solver-matrix.yml','tools/nonce/live.cnf']
+permissions:
+  contents: write
+concurrency:
+  group: nonce-matrix
+  cancel-in-progress: true
+jobs:
+  solve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Solve
+        run: |
+          F=tools/nonce/live.cnf; [ -f $F ] || F=tools/nonce/bench1.cnf
+          git clone -q --depth 1 https://github.com/arminbiere/kissat.git /tmp/kissat && (cd /tmp/kissat && ./configure >/dev/null && make -j4 >/dev/null 2>&1)
+          grep -v '^[cp]' $F | sed 's/ 0$//' > cnf.txt; gcc -O3 -o ws tools/nonce/ws.c 2>/dev/null
+          start=$(date +%s); S=${{ matrix.shard }}
+          for k in 1 2 3 4; do seed=$((S*10+k))
+            if [ $k -le 3 ]; then (timeout 540 /tmp/kissat/build/kissat -q --seed=$seed $F > out$k.txt) &
+            else (timeout 540 ./ws $seed 535 > out$k.txt 2>/dev/null) & fi
+          done
+          while true; do
+            for k in 1 2 3 4; do f=out$k.txt
+              if grep -q -e "^s SATISFIABLE" -e "^SAT " $f 2>/dev/null; then
+                echo "SOLVED shard $S worker $k in $(( $(date +%s)-start ))s"
+                if [ $k -le 3 ]; then grep '^v' $f | tr ' ' '\n' | grep -v '^v$' | grep -v '^0$' | awk '{printf "%s", ($1>0?"1":"0")}' > sol.txt; else grep '^SAT ' $f | cut -d' ' -f2 | tr -d '\n' > sol.txt; fi
+                wc -c sol.txt; echo "solved=1" >> $GITHUB_ENV; break 2; fi
+            done
+            [ $(( $(date +%s)-start )) -gt 545 ] && { echo TIMEOUT; break; }; sleep 2
+          done
+      - name: Push solution
+        if: env.solved == '1'
+        run: |
+          cp sol.txt /tmp/sol.txt; echo "${{ matrix.shard }} $(date -u +%T) $(sha256sum tools/nonce/live.cnf 2>/dev/null || sha256sum tools/nonce/bench1.cnf)" > /tmp/meta.txt
+          git config user.name hark; git config user.email hark@users.noreply.github.com
+          for i in 1 2 3 4 5; do
+            git fetch -q origin nonce-results && git checkout -q -f nonce-results || git checkout -q --orphan nonce-results
+            cp /tmp/sol.txt solution.txt; cp /tmp/meta.txt solution-meta.txt; git add solution.txt solution-meta.txt
+            git commit -qm "solution shard ${{ matrix.shard }}" && git push -q origin HEAD:nonce-results && break; sleep 3
+          done
