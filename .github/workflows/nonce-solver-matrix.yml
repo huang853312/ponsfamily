@@ -37,7 +37,7 @@ jobs:
           grep -v '^[cp]' live.cnf | sed 's/ 0$//' > cnf.txt
           start=$(date +%s); S=${{ matrix.shard }}
           for k in 1 2 3 4; do seed=$((S*10+k))
-            if [ $k -le 3 ]; then (timeout $T /tmp/kissat/build/kissat -q --seed=$seed live.cnf > out$k.txt) &
+            if [ $k -le 3 ]; then CF=""; [ $k -le 2 ] && CF="--sat"; (timeout $T /tmp/kissat/build/kissat -q $CF --seed=$seed live.cnf > out$k.txt) &
             else (timeout $T /tmp/ws $seed $((T-2)) > out$k.txt 2>/dev/null) & fi
           done
           while true; do
