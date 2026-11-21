@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 from config import load_settings
 from database import EventStore
@@ -22,17 +23,15 @@ def format_event(chain: str, item: dict) -> str:
 
 def main():
     settings = load_settings()
+    os.makedirs("logs", exist_ok=True)
     logging.basicConfig(
         level=getattr(logging, settings.log_level, logging.INFO),
         format="%(asctime)s %(levelname)s %(message)s",
         handlers=[logging.StreamHandler(), logging.FileHandler("logs/monitor.log", encoding="utf-8")],
     )
-    if not settings.rpc_urls:
-        raise SystemExit("RPC_URLS is empty; configure at least one chain RPC endpoint")
-
     store = EventStore()
     notifier = None
-    if settings.event_filters:
+    if any(v.get("addresses") or v.get("topics") for v in settings.event_filters.values()):
         notifier = TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id)
 
     scanners = {}
@@ -43,6 +42,9 @@ def main():
             settings.event_filters.get(chain, {}),
             {"confirmations": settings.default_confirmations, "max_range": settings.max_block_range},
         )
+
+    if not scanners:
+        logging.warning("No RPC_URLS configured. Service will remain idle until chain endpoints are configured.")
 
     logging.info("multi-chain event monitor started; chains=%s interval=%ss; trading=disabled",
                  list(scanners), settings.poll_interval)
