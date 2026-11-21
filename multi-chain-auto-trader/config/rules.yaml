@@ -1,0 +1,36 @@
+global:
+  strategy_mode: independent
+  single_order_limit_usd: 100
+  daily_limit_usd: 500
+  max_slippage_bps: 300
+  min_pool_liquidity_usd: 1000
+  max_gas_cost_usd: 5
+  max_price_impact_bps: 300
+  require_buy_simulation: true
+  require_sell_simulation: true
+  reject_unknown_token_permissions: true
+  reject_unverified_router: true
+rules:
+  A:
+    enabled: true
+    type: token_created
+    requires: [verified_chain, verified_factory, verified_event_abi, tradable_pool, security_checks]
+  B:
+    enabled: true
+    type: dex_pool_created
+    requires: [verified_chain, verified_dex_factory, verified_event_abi, liquidity_at_least_global_minimum, security_checks]
+  C:
+    enabled: false
+    type: wallet_buy_follow
+    wallets: []
+    requires: [verified_wallet, verified_buy_detection, security_checks]
+  D:
+    enabled: true
+    type: composite_and
+    operator: AND
+    requires: [verified_chain, verified_dex_factory, verified_event_abi, liquidity_at_least_global_minimum, configured_wallet_allowlist, verified_buy_detection, security_checks]
+  E:
+    enabled: true
+    type: custom_event
+    events: []
+    requires: [verified_chain, verified_contract, verified_event_abi, explicit_token_extraction, security_checks]
