@@ -1,0 +1,16 @@
+[Unit]
+Description=Independent Python Event Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/event-monitor
+EnvironmentFile=/etc/event-monitor.env
+ExecStart=/opt/event-monitor/.venv/bin/python /opt/event-monitor/main.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
