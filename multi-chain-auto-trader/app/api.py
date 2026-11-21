@@ -3,6 +3,7 @@ from fastapi import FastAPI, Header, HTTPException
 from .settings import Settings, load_yaml, validate_settings
 from .database import Database
 from .engine import TradingEngine
+from .notify import notify
 
 settings = Settings.from_env()
 validate_settings(settings)
@@ -27,7 +28,9 @@ def health():
 @app.post("/signals")
 def receive_signal(payload: dict, authorization: str | None = Header(default=None)):
     authorize(authorization)
-    return engine.handle(payload)
+    result = engine.handle(payload)
+    notify("Auto Trader signal: " + str(result))
+    return result
 
 @app.post("/kill")
 def kill(authorization: str | None = Header(default=None)):
@@ -35,6 +38,7 @@ def kill(authorization: str | None = Header(default=None)):
     os.makedirs("/var/lib/multi-chain-auto-trader", exist_ok=True)
     with open("/var/lib/multi-chain-auto-trader/KILL_SWITCH", "w", encoding="utf-8") as f:
         f.write("STOP")
+    notify("⛔ Auto Trader emergency stop engaged. New orders are blocked.")
     return {"status": "kill_switch_engaged"}
 
 @app.post("/resume")
@@ -43,4 +47,5 @@ def resume(authorization: str | None = Header(default=None)):
     path = "/var/lib/multi-chain-auto-trader/KILL_SWITCH"
     if os.path.exists(path):
         os.remove(path)
+    notify("Auto Trader kill switch cleared. Trading remains subject to all safety gates.")
     return {"status": "kill_switch_cleared"}
