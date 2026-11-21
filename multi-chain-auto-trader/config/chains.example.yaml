@@ -1,0 +1,10 @@
+# Copy to chains.yaml on VPS; populate only from verified official sources.
+chains:
+  example_evm:
+    enabled: false
+    chain_id: 0
+    rpc_url_env: RPC_EXAMPLE_EVM
+    native_symbol: ETH
+    explorer_tx_base: ''
+    dex_adapters: []
+    factories: []
