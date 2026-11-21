@@ -28,10 +28,16 @@ if ! sudo test -f /etc/multi-chain-auto-trader.env; then
     'MAX_SLIPPAGE_BPS=300' \
     'MIN_POOL_LIQUIDITY_USD=1000' \
     'MAX_GAS_COST_USD=5' \
-    'MAX_PRICE_IMPACT_BPS=300' | sudo tee /etc/multi-chain-auto-trader.env >/dev/null
+    'MAX_PRICE_IMPACT_BPS=300' \
+    'TRADER_TELEGRAM_BOT_TOKEN=' \
+    'TRADER_TELEGRAM_CHAT_ID=' | sudo tee /etc/multi-chain-auto-trader.env >/dev/null
   sudo chown root:trader /etc/multi-chain-auto-trader.env
   sudo chmod 0640 /etc/multi-chain-auto-trader.env
 fi
+if ! sudo grep -q '^TRADER_TELEGRAM_BOT_TOKEN=' /etc/multi-chain-auto-trader.env; then echo 'TRADER_TELEGRAM_BOT_TOKEN=' | sudo tee -a /etc/multi-chain-auto-trader.env >/dev/null; fi
+if ! sudo grep -q '^TRADER_TELEGRAM_CHAT_ID=' /etc/multi-chain-auto-trader.env; then echo 'TRADER_TELEGRAM_CHAT_ID=' | sudo tee -a /etc/multi-chain-auto-trader.env >/dev/null; fi
+sudo chown root:trader /etc/multi-chain-auto-trader.env
+sudo chmod 0640 /etc/multi-chain-auto-trader.env
 if ! sudo test -f "$APP/config/chains.yaml"; then
   sudo cp "$APP/config/chains.example.yaml" "$APP/config/chains.yaml"
   sudo chown trader:trader "$APP/config/chains.yaml"
