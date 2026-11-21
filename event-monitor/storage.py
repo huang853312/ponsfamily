@@ -1,6 +1,7 @@
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Iterator
 
 
 class EventStore:
@@ -11,13 +12,21 @@ class EventStore:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
-    def _connect(self):
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.database_path, timeout=20)
-        connection.execute("PRAGMA journal_mode=WAL")
-        return connection
+        try:
+            connection.execute("PRAGMA journal_mode=WAL")
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def _initialize(self):
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS events (
@@ -32,14 +41,14 @@ class EventStore:
             )
 
     def enqueue(self, event_id: str, payload: str) -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute(
                 "INSERT OR IGNORE INTO events(event_id, payload) VALUES (?, ?)",
                 (event_id, payload),
             )
 
     def pending(self, limit: int = 100) -> list[tuple[str, str]]:
-        with self._connect() as connection:
+        with self._connection() as connection:
             rows = connection.execute(
                 "SELECT event_id, payload FROM events "
                 "WHERE status = 'pending' ORDER BY created_at LIMIT ?",
@@ -48,14 +57,14 @@ class EventStore:
         return rows
 
     def mark_attempt(self, event_id: str) -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute(
                 "UPDATE events SET attempts = attempts + 1 WHERE event_id = ?",
                 (event_id,),
             )
 
     def mark_sent(self, event_id: str) -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute(
                 "UPDATE events SET status = 'sent', sent_at = CURRENT_TIMESTAMP "
                 "WHERE event_id = ?",
