@@ -14,7 +14,7 @@ class ChainScanner:
         self.max_range = defaults["max_range"]
 
     def scan_once(self):
-        # No address/topic means no event scan. This avoids accidental full-chain log scans.
+        # Never issue an unfiltered eth_getLogs request.
         if not self.event_filter.get("addresses") and not self.event_filter.get("topics"):
             logging.info("[%s] event filters not configured; scanner is idle", self.name)
             return
@@ -27,7 +27,6 @@ class ChainScanner:
         cursor = self.store.get_cursor(self.name)
         if cursor is None:
             if self.start_block is None:
-                # Safe default: begin at the current confirmed head, not from genesis.
                 self.store.set_cursor(self.name, safe_head)
                 logging.info("[%s] initialized at confirmed block %s; no historical backfill", self.name, safe_head)
                 return
@@ -41,7 +40,5 @@ class ChainScanner:
         logs = self.rpc.get_logs(next_block, end_block, self.event_filter)
         inserted = self.store.enqueue_logs(self.name, logs)
         self.store.set_cursor(self.name, end_block)
-        logging.info(
-            "[%s] scanned blocks %s-%s; received=%s new=%s",
-            self.name, next_block, end_block, len(logs), inserted
-        )
+        logging.info("[%s] scanned blocks %s-%s; received=%s new=%s",
+                     self.name, next_block, end_block, len(logs), inserted)
