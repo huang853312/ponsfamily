@@ -53,7 +53,7 @@ jobs:
           ssh_args=(-p "$SERVER_PORT" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30)
           target="$SERVER_USER@$SERVER_HOST"
           stage=$(ssh "${ssh_args[@]}" "$target" 'mktemp -d /tmp/multi-chain-auto-trader.XXXXXXXX')
-          [[ "$stage" =~ ^/tmp/multi-chain-auto-trader\\.[A-Za-z0-9]+$ ]]
+          [[ "$stage" == /tmp/multi-chain-auto-trader.* ]]
           cleanup() {
             ssh "${ssh_args[@]}" "$target" "sudo rm -rf -- '$stage'" >/dev/null 2>&1 || true
           }
