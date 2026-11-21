@@ -1,0 +1,39 @@
+name: Test Multi-Chain Auto Trader
+
+on:
+  push:
+    branches:
+      - feature/multi-chain-auto-trader
+    paths:
+      - 'multi-chain-auto-trader/**'
+      - '.github/workflows/test-multi-chain-auto-trader.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'multi-chain-auto-trader/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/multi-chain-auto-trader
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        working-directory: multi-chain-auto-trader
+        run: python -m pip install -r requirements.txt
+      - name: Compile and test
+        working-directory: multi-chain-auto-trader
+        run: |
+          python -m compileall -q app tests
+          pytest -q
+          bash -n deploy.sh
