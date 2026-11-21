@@ -1,0 +1,18 @@
+[Unit]
+Description=Independent Multi-Chain Contract Event Monitor
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/multi-chain-event-monitor
+EnvironmentFile=/opt/multi-chain-event-monitor/.env
+ExecStart=/opt/multi-chain-event-monitor/.venv/bin/python /opt/multi-chain-event-monitor/main.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
