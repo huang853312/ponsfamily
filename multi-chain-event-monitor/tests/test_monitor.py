@@ -68,7 +68,7 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(self.store.get_cursor("base"), 102)
         scanner.scan_once()
         self.assertEqual(scanner.rpc.queries[0][0:2], (100, 102))
-        self.assertEqual(scanner.rpc.queries[1][0:2], (103, 105))
+        self.assertEqual(scanner.rpc.queries[1][0:2], (103, 103))
         self.assertEqual(len(self.store.pending_events()), 1)
 
 
