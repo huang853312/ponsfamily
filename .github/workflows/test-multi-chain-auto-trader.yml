@@ -35,5 +35,5 @@ jobs:
         working-directory: multi-chain-auto-trader
         run: |
           python -m compileall -q app tests
-          pytest -q
+          PYTHONPATH=. pytest -q
           bash -n deploy.sh
